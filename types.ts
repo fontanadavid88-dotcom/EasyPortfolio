@@ -69,6 +69,7 @@ export enum RebalanceStrategy {
 }
 
 export interface AppSettings {
+  id?: number;
   baseCurrency: Currency;
   eodhdApiKey: string;
   googleSheetUrl: string;

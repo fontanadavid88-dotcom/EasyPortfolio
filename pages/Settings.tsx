@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { db } from '../db';
 import { syncPrices } from '../services/priceService';
-import { AssetType, Currency } from '../types';
+import { Currency } from '../types';
 
 export const Settings: React.FC = () => {
   const [config, setConfig] = useState({
@@ -10,7 +10,6 @@ export const Settings: React.FC = () => {
     baseCurrency: Currency.CHF
   });
   const [loading, setLoading] = useState(false);
-  const [newAsset, setNewAsset] = useState({ ticker: '', name: '', type: AssetType.Stock, target: 0 });
 
   useEffect(() => {
     db.settings.toCollection().first().then(s => {
@@ -33,19 +32,6 @@ export const Settings: React.FC = () => {
     } finally {
         setLoading(false);
     }
-  };
-
-  const handleAddAsset = async (e: React.FormEvent) => {
-    e.preventDefault();
-    await db.instruments.add({
-        ticker: newAsset.ticker.toUpperCase(),
-        name: newAsset.name,
-        type: newAsset.type,
-        currency: Currency.USD, // Default, editable later
-        targetAllocation: Number(newAsset.target)
-    });
-    setNewAsset({ ticker: '', name: '', type: AssetType.Stock, target: 0 });
-    alert('Asset aggiunto al database');
   };
 
   return (
@@ -93,43 +79,6 @@ export const Settings: React.FC = () => {
                 </button>
             </div>
         </div>
-      </div>
-
-      <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-        <h2 className="text-xl font-bold mb-6 flex items-center gap-2">
-            <span className="material-symbols-outlined text-blue-600">add_circle</span>
-            Aggiungi Asset / Strumento
-        </h2>
-        <form onSubmit={handleAddAsset} className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <input 
-                placeholder="Ticker (es. AAPL)" required 
-                value={newAsset.ticker}
-                onChange={e => setNewAsset({...newAsset, ticker: e.target.value})}
-                className="border border-gray-300 p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none uppercase"
-            />
-            <input 
-                placeholder="Nome Strumento" required 
-                value={newAsset.name}
-                onChange={e => setNewAsset({...newAsset, name: e.target.value})}
-                className="border border-gray-300 p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
-            />
-             <select 
-                value={newAsset.type}
-                onChange={e => setNewAsset({...newAsset, type: e.target.value as AssetType})}
-                className="border border-gray-300 p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
-            >
-                {Object.values(AssetType).map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-            <input 
-                type="number" placeholder="Target %" 
-                value={newAsset.target}
-                onChange={e => setNewAsset({...newAsset, target: parseFloat(e.target.value)})}
-                className="border border-gray-300 p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
-            />
-            <button type="submit" className="col-span-1 md:col-span-2 bg-gray-900 text-white py-3 rounded-lg font-medium hover:bg-gray-800 transition">
-                Aggiungi al Database
-            </button>
-        </form>
       </div>
     </div>
   );

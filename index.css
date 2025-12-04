@@ -32,6 +32,9 @@ body {
   -moz-osx-font-smoothing: grayscale;
   /* Support for IE */
   font-feature-settings: 'liga';
+  
+  /* Ensure variable font axes are set correctly */
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
 }
 
 /* Animations */
