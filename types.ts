@@ -74,3 +74,33 @@ export interface AppSettings {
   eodhdApiKey: string;
   googleSheetUrl: string;
 }
+
+// --- NEW ANALYTICS TYPES ---
+
+export interface PortfolioPosition {
+  ticker: string;
+  name: string;
+  assetType: AssetType;
+  currency: Currency;
+  quantity: number;
+  currentPrice: number;
+  currentValueCHF: number; // Unified base currency value (assuming CHF for simplicity or converted)
+  targetPct: number;
+  currentPct: number;
+}
+
+export interface PortfolioState {
+  positions: PortfolioPosition[];
+  totalValue: number;
+  investedCapital: number;
+  balance: number;
+  balancePct: number;
+}
+
+export interface PerformancePoint {
+  date: string;
+  value: number;
+  invested: number;
+  monthlyReturnPct: number;
+  cumulativeReturnPct: number;
+}

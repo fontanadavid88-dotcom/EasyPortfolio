@@ -12,7 +12,7 @@ const NavItem = ({ to, icon, label, collapsed }: { to: string, icon: string, lab
       )
     }
   >
-    <span className="material-symbols-outlined text-[24px]">{icon}</span>
+    <span className="material-symbols-outlined">{icon}</span>
     {!collapsed && <span className="text-sm tracking-wide">{label}</span>}
   </NavLink>
 );
@@ -40,7 +40,6 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
         <nav className="flex-1 py-4 overflow-y-auto">
           <NavItem to="/" icon="dashboard" label="Dashboard" collapsed={!isSidebarOpen} />
           <NavItem to="/transactions" icon="receipt_long" label="Transazioni" collapsed={!isSidebarOpen} />
-          <NavItem to="/portfolio" icon="pie_chart" label="Portafoglio" collapsed={!isSidebarOpen} />
           <NavItem to="/rebalance" icon="balance" label="Ribilanciamento" collapsed={!isSidebarOpen} />
           <NavItem to="/macro" icon="speed" label="Macro Indicator" collapsed={!isSidebarOpen} />
           <div className="my-2 border-t border-gray-100 mx-4"></div>
@@ -50,7 +49,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
         {/* User / Footer Area */}
         {isSidebarOpen && (
           <div className="p-4 text-xs text-gray-400 text-center">
-            v1.0.0 • Offline
+            v1.3.0 • Offline
           </div>
         )}
       </aside>
@@ -71,7 +70,6 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
           </button>
           
           <div className="flex items-center gap-3">
-             {/* Add top bar actions here if needed */}
              <div className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-sm">
                 EP
              </div>
@@ -80,7 +78,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 
         {/* Page Content */}
         <main className="flex-1 overflow-y-auto p-4 md:p-8">
-          <div className="max-w-5xl mx-auto w-full animate-fade-in">
+          <div className="max-w-6xl mx-auto w-full animate-fade-in">
             {children}
           </div>
         </main>

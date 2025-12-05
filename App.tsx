@@ -8,14 +8,6 @@ import { Macro } from './pages/Macro';
 import { Settings } from './pages/Settings';
 import { initSettings, seedDatabase } from './db';
 
-// Placeholder for Portfolio detailed view
-const Portfolio = () => (
-    <div className="p-8 text-center text-gray-500">
-        <span className="material-symbols-outlined text-4xl mb-2">construction</span>
-        <p>Analisi Dettagliata Portafoglio in arrivo...</p>
-    </div>
-);
-
 const App: React.FC = () => {
   const [initialized, setInitialized] = useState(false);
 
@@ -48,7 +40,6 @@ const App: React.FC = () => {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/transactions" element={<Transactions />} />
-          <Route path="/portfolio" element={<Portfolio />} />
           <Route path="/rebalance" element={<Rebalance />} />
           <Route path="/macro" element={<Macro />} />
           <Route path="/settings" element={<Settings />} />

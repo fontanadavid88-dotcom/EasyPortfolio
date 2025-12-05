@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { db } from '../db';
+import { db, seedDatabase } from '../db';
 import { syncPrices } from '../services/priceService';
 import { Currency } from '../types';
 
@@ -32,6 +32,13 @@ export const Settings: React.FC = () => {
     } finally {
         setLoading(false);
     }
+  };
+
+  const handleReset = async () => {
+      if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione è irreversibile. Vuoi procedere?')) {
+          await db.delete();
+          window.location.reload(); // Dexie will recreate DB on reload due to db.ts logic
+      }
   };
 
   return (
@@ -79,6 +86,24 @@ export const Settings: React.FC = () => {
                 </button>
             </div>
         </div>
+      </div>
+
+      {/* DANGER ZONE */}
+      <div className="bg-red-50 p-6 rounded-2xl shadow-sm border border-red-100">
+          <h2 className="text-lg font-bold text-red-700 mb-2 flex items-center gap-2">
+              <span className="material-symbols-outlined">warning</span>
+              Zona Pericolo
+          </h2>
+          <p className="text-sm text-red-600 mb-4">
+              Se l'applicazione non visualizza i dati corretti o hai conflitti con versioni precedenti, puoi resettare il database. 
+              Questo cancellerà tutto e ricaricherà i dati demo.
+          </p>
+          <button 
+            onClick={handleReset}
+            className="bg-red-600 text-white px-5 py-2.5 rounded-lg text-sm font-medium hover:bg-red-700 transition shadow-sm"
+          >
+              Resetta Database e Ricarica
+          </button>
       </div>
     </div>
   );
