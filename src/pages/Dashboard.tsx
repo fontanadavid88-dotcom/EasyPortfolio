@@ -1,304 +1,500 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { db } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { calculatePortfolioState, calculateHistoricalPerformance } from '../services/financeUtils';
-import { AssetType } from '../types';
-import { COLORS } from '../constants';
-import { PieChart, Pie, Cell, ResponsiveContainer, LineChart, Line, Tooltip, XAxis, YAxis, CartesianGrid, Legend, ComposedChart, Bar } from 'recharts';
+import { calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics } from '../services/financeUtils';
+import { 
+  PRIMARY_BLUE, 
+  ACCENT_ORANGE, 
+  POSITIVE_GREEN, 
+  NEGATIVE_RED, 
+  PIE_COLORS, 
+  NEUTRAL_TEXT, 
+  NEUTRAL_MUTED, 
+  BORDER_COLOR,
+} from '../constants';
+import { 
+  PieChart, Pie, Cell, ResponsiveContainer, LineChart, Line, Tooltip, XAxis, YAxis, CartesianGrid, 
+  AreaChart, Area, BarChart, Bar, ReferenceLine 
+} from 'recharts';
+import { format, subMonths, getYear } from 'date-fns';
+import clsx from 'clsx';
 
-// Simple Sparkline Component
-const Sparkline = ({ data, color }: { data: any[], color: string }) => (
-  <div className="h-8 w-24">
-    <ResponsiveContainer width="100%" height="100%">
-      <LineChart data={data}>
-        <Line type="monotone" dataKey="pct" stroke={color} strokeWidth={2} dot={false} isAnimationActive={false} />
-      </LineChart>
-    </ResponsiveContainer>
+// --- STYLED SUB-COMPONENTS ---
+
+// 1. KPI Card Style (Glass Effect)
+const KPICard = ({ title, value, subValue, highlight = false, alert = false }: { title: string, value: string, subValue?: string, highlight?: boolean, alert?: boolean }) => (
+  <div className="bg-panel backdrop-blur-sm p-6 rounded-xl border border-panel-border shadow-card flex flex-col justify-between h-36 transition-all hover:translate-y-[-2px] hover:shadow-lg hover:border-primary/30 relative overflow-hidden group">
+    {/* Decorative gradient blob */}
+    <div className="absolute -right-6 -top-6 w-20 h-20 bg-primary/5 rounded-full blur-xl group-hover:bg-primary/10 transition-colors"></div>
+    
+    <div className="flex justify-between items-start relative z-10">
+      <span className="text-[11px] font-bold text-panel-muted uppercase tracking-widest">{title}</span>
+      {(highlight || alert) && (
+        <span className={clsx("w-2 h-2 rounded-full shadow-[0_0_8px_currentColor]", highlight ? "bg-secondary text-secondary" : "bg-negative text-negative")}></span>
+      )}
+    </div>
+    
+    <div className="mt-auto relative z-10">
+      <div 
+        className={clsx("text-2xl font-bold tracking-tight mb-1", alert ? "text-negative" : "text-panel-text")}
+      >
+        {value}
+      </div>
+      {subValue && (
+        <div className="text-xs font-medium text-panel-muted flex items-center gap-1">
+          {subValue}
+        </div>
+      )}
+    </div>
   </div>
 );
+
+// 2. Stacked Allocation Bar (100% Stacked Single Bar)
+const StackedAllocation: React.FC<{ data: { label: string, value: number, color: string }[] }> = ({ data }) => {
+  if (!data.length) return <div className="text-xs text-panel-muted italic">Nessun dato disponibile</div>;
+
+  return (
+    <div className="w-full flex flex-col h-full">
+      {/* The Single 100% Stacked Bar */}
+      <div className="h-8 w-full flex rounded-lg overflow-hidden bg-gray-100 border border-panel-border shadow-inner">
+        {data.map((d) => (
+          <div 
+            key={d.label}
+            style={{ width: `${d.value}%`, backgroundColor: d.color }}
+            className="h-full relative group transition-all duration-700 ease-in-out hover:brightness-110"
+            title={`${d.label}: ${d.value.toFixed(1)}%`}
+          >
+             {/* Tooltip on hover usually handled by title or custom CSS, keeping it simple */}
+          </div>
+        ))}
+      </div>
+
+      {/* Legend */}
+      <div className="mt-5 grid grid-cols-2 gap-x-4 gap-y-3">
+        {data.map((d) => (
+          <div key={d.label} className="flex items-center justify-between text-xs group p-1.5 rounded hover:bg-gray-50 transition-colors">
+            <div className="flex items-center gap-2 overflow-hidden">
+              <div className="w-2.5 h-2.5 rounded-full flex-shrink-0 shadow-sm" style={{ backgroundColor: d.color }}></div>
+              <span className="font-semibold text-panel-text truncate group-hover:text-primary transition-colors">{d.label}</span>
+            </div>
+            <span className="text-panel-muted font-bold flex-shrink-0">{d.value.toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// 3. Filter Button Style
+const FilterButton: React.FC<{ active: boolean, label: string, onClick: () => void }> = ({ active, label, onClick }) => (
+  <button
+    onClick={onClick}
+    className={clsx(
+      "px-4 py-1.5 rounded-md text-xs font-bold transition-all border backdrop-blur-sm",
+      active 
+        ? "bg-secondary text-white border-secondary shadow-md shadow-secondary/20" 
+        : "bg-white/5 text-shell-muted border-white/10 hover:border-white/30 hover:text-white"
+    )}
+  >
+    {label}
+  </button>
+);
+
+// --- MAIN DASHBOARD COMPONENT ---
 
 export const Dashboard: React.FC = () => {
   const transactions = useLiveQuery(() => db.transactions.toArray());
   const prices = useLiveQuery(() => db.prices.toArray());
   const instruments = useLiveQuery(() => db.instruments.toArray());
 
+  const [timeRange, setTimeRange] = useState<'3M' | '6M' | '1Y' | '5Y' | '10Y' | 'YTD' | 'MAX'>('MAX');
+  const [metric, setMetric] = useState<'PERF' | 'TWRR' | 'MWRR'>('PERF');
+
   const state = useMemo(() => {
     if (!transactions || !prices || !instruments) return null;
     return calculatePortfolioState(transactions, instruments, prices);
   }, [transactions, prices, instruments]);
 
-  const trends = useMemo(() => {
+  const rawTrends = useMemo(() => {
     if (!transactions || !prices || !instruments) return null;
-    return calculateHistoricalPerformance(transactions, instruments, prices);
+    return calculateHistoricalPerformance(transactions, instruments, prices, 120); 
   }, [transactions, prices, instruments]);
+
+  const analytics = useMemo(() => {
+    if (!rawTrends) return null;
+    return calculateAnalytics(rawTrends.history);
+  }, [rawTrends]);
+
+  const instrumentAllocationData = useMemo(() => {
+    if (!state) return [];
+    return state.positions
+      .map(p => ({
+        name: p.ticker,
+        fullName: p.name,
+        value: p.currentValueCHF,
+        pct: p.currentPct
+      }))
+      .filter(d => d.value > 0)
+      .sort((a, b) => b.value - a.value);
+  }, [state]);
+
+  const startDate = useMemo(() => {
+    const now = new Date();
+    switch (timeRange) {
+      case '3M': return subMonths(now, 3);
+      case '6M': return subMonths(now, 6);
+      case '1Y': return subMonths(now, 12);
+      case '5Y': return subMonths(now, 60);
+      case '10Y': return subMonths(now, 120);
+      case 'YTD': return new Date(now.getFullYear(), 0, 1);
+      default: return new Date(0); 
+    }
+  }, [timeRange]);
+
+  const chartData = useMemo(() => {
+    if (!rawTrends) return [];
+    const data = [...rawTrends.history];
+    return data
+      .filter(d => new Date(d.date) >= startDate)
+      .map(d => ({
+        ...d,
+        displayDate: format(new Date(d.date), 'MMM yy'),
+        metricValue: metric === 'PERF' ? d.value : 
+                     metric === 'TWRR' ? d.cumulativeReturnPct : 
+                     (d.invested > 0 ? ((d.value - d.invested) / d.invested) * 100 : 0)
+      }));
+  }, [rawTrends, startDate, metric]);
+
+  const drawdownData = useMemo(() => {
+    if (!analytics || !rawTrends) return [];
+    return analytics.drawdownSeries
+      .filter(d => new Date(d.date) >= startDate)
+      .map(d => ({
+        ...d,
+        displayDate: format(new Date(d.date), 'MMM yy')
+      }));
+  }, [analytics, rawTrends, startDate]);
+
+  const filteredAnnualReturns = useMemo(() => {
+    if (!analytics) return [];
+    const startYear = getYear(startDate);
+    if (timeRange === 'MAX') return analytics.annualReturns;
+    return analytics.annualReturns.filter(d => d.year >= startYear);
+  }, [analytics, startDate, timeRange]);
 
   const assetAllocationData = useMemo(() => {
     if (!state) return [];
     const groups: Record<string, number> = {};
-    state.positions.forEach(p => {
-        groups[p.assetType] = (groups[p.assetType] || 0) + p.currentValueCHF;
-    });
-    return Object.entries(groups).map(([name, value]) => ({
-        name,
+    state.positions.forEach(p => groups[p.assetType] = (groups[p.assetType] || 0) + p.currentPct);
+    
+    return Object.entries(groups)
+      .sort((a,b) => b[1] - a[1])
+      .map(([label, value], idx) => ({
+        label,
         value,
-        pct: state.totalValue > 0 ? (value / state.totalValue) * 100 : 0
-    })).filter(d => d.value > 0).sort((a,b) => b.value - a.value);
+        color: PIE_COLORS[idx % PIE_COLORS.length]
+      }));
   }, [state]);
 
-  const gapHierarchy = useMemo(() => {
+  const currencyAllocationData = useMemo(() => {
     if (!state) return [];
-
-    const classMap: Record<string, {
-      current: number;
-      target: number;
-      instruments: { name: string; ticker: string; current: number; target: number; diff: number }[];
-    }> = {};
-
-    Object.values(AssetType).forEach(t => {
-      classMap[t] = { current: 0, target: 0, instruments: [] };
-    });
-
-    state.positions.forEach(p => {
-      if (!classMap[p.assetType]) return;
-
-      classMap[p.assetType].current += p.currentPct;
-      classMap[p.assetType].target += p.targetPct;
-      classMap[p.assetType].instruments.push({
-        name: p.name,
-        ticker: p.ticker,
-        current: p.currentPct,
-        target: p.targetPct,
-        diff: p.currentPct - p.targetPct
-      });
-    });
-
-    return Object.entries(classMap)
-      .filter(([_, d]) => d.current > 0 || d.target > 0)
-      .map(([name, d]) => ({
-        name,
-        current: d.current,
-        target: d.target,
-        diff: d.current - d.target,
-        instruments: d.instruments.sort((a, b) => b.current - a.current)
-      }))
-      .sort((a, b) => b.current - a.current);
-
+    const groups: Record<string, number> = {};
+    state.positions.forEach(p => groups[p.currency] = (groups[p.currency] || 0) + p.currentPct);
+    
+    return Object.entries(groups)
+      .sort((a,b) => b[1] - a[1])
+      .map(([label, value], idx) => ({
+        label,
+        value,
+        color: PIE_COLORS[(idx + 2) % PIE_COLORS.length]
+      }));
   }, [state]);
 
-  const getHeatmapZone = (diff: number) => {
-    if (diff <= -5) return { label: 'Sottopesato grave', className: 'bg-blue-700 text-white' };
-    if (diff < -1) return { label: 'Sottopesato lieve', className: 'bg-blue-200 text-blue-900' };
-    if (diff <= 1) return { label: 'Neutro', className: 'bg-gray-100 text-gray-700' };
-    if (diff < 5) return { label: 'Sovrappesato lieve', className: 'bg-amber-200 text-amber-900' };
-    return { label: 'Sovrappesato grave', className: 'bg-red-500 text-white' };
-  };
-
-  if (!transactions) return (
-      <div className="flex flex-col items-center justify-center h-96 text-gray-400">
-          <span className="material-symbols-outlined text-4xl mb-2 animate-pulse">sync</span>
-          <p>Caricamento dati...</p>
-      </div>
-  );
-
+  if (!transactions) return <div className="p-10 text-center text-shell-muted animate-pulse">Sincronizzazione dati...</div>;
   if (transactions.length === 0) return (
-    <div className="flex flex-col items-center justify-center h-96 text-gray-400 bg-white rounded-2xl border border-dashed border-gray-200">
-        <span className="material-symbols-outlined text-5xl mb-4 opacity-30">add_chart</span>
-        <h3 className="text-lg font-bold text-gray-600">Nessun dato disponibile</h3>
-        <p className="mb-4 text-sm">Aggiungi la tua prima transazione per vedere le analisi.</p>
+    <div className="flex flex-col items-center justify-center h-96 bg-panel backdrop-blur-sm rounded-xl border border-dashed border-panel-border shadow-card">
+       <span className="material-symbols-outlined text-4xl text-panel-muted mb-2 opacity-50">add_chart</span>
+       <p className="text-panel-text font-medium">Nessun dato.</p>
+       <p className="text-sm text-panel-muted">Aggiungi transazioni per iniziare.</p>
     </div>
   );
-
-  if (!state || !trends) return null;
+  if (!state || !rawTrends || !analytics) return null;
 
   return (
-    <div className="space-y-6 pb-20 animate-fade-in">
+    <div className="space-y-8 pb-20 animate-fade-in">
       
-      {/* KPI Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Valore Totale</p>
-            <p className="text-2xl font-bold text-gray-900 mt-1">CHF {state.totalValue.toLocaleString('it-CH', { maximumFractionDigits: 0 })}</p>
-        </div>
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Capitale Investito</p>
-             <p className="text-2xl font-bold text-gray-900 mt-1">CHF {state.investedCapital.toLocaleString('it-CH', { maximumFractionDigits: 0 })}</p>
-        </div>
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Bilancio</p>
-             <div className="flex items-baseline gap-2 mt-1">
-                 <span className={`text-2xl font-bold ${state.balance >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                     {state.balance >= 0 ? '+' : ''}{state.balance.toLocaleString('it-CH', { maximumFractionDigits: 0 })}
-                 </span>
-                 <span className={`text-sm font-bold ${state.balance >= 0 ? 'text-green-600' : 'text-red-600'} bg-opacity-10 px-2 py-0.5 rounded-full ${state.balance >= 0 ? 'bg-green-100' : 'bg-red-100'}`}>
-                     {state.balancePct.toFixed(2)}%
-                 </span>
-             </div>
-        </div>
-      </div>
-
-      {/* Charts Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col">
-              <h3 className="text-gray-800 font-bold mb-4">Composizione Portafoglio</h3>
-              <div className="flex-1 min-h-[300px]">
-                  <ResponsiveContainer width="100%" height="100%">
-                      <PieChart>
-                          <Pie
-                              data={assetAllocationData}
-                              cx="50%"
-                              cy="50%"
-                              innerRadius={60}
-                              outerRadius={100}
-                              paddingAngle={5}
-                              dataKey="value"
-                          >
-                              {assetAllocationData.map((entry, index) => (
-                                  <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                              ))}
-                          </Pie>
-                          <Tooltip formatter={(value: number) => `CHF ${value.toLocaleString()}`} />
-                          <Legend />
-                      </PieChart>
-                  </ResponsiveContainer>
-              </div>
-          </div>
-
-          <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 flex flex-col">
-              <h3 className="text-gray-800 font-bold mb-4">Performance Storica</h3>
-              <div className="flex-1 min-h-[300px]">
-                  <ResponsiveContainer width="100%" height="100%">
-                      <ComposedChart data={trends.history}>
-                          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                          <XAxis dataKey="date" tick={{fontSize: 12, fill: '#94a3b8'}} axisLine={false} tickLine={false} />
-                          <YAxis yAxisId="left" tick={{fontSize: 12, fill: '#94a3b8'}} axisLine={false} tickLine={false} unit="%" />
-                          <YAxis yAxisId="right" orientation="right" hide />
-                          <Tooltip />
-                          <Legend />
-                          <Bar yAxisId="left" dataKey="monthlyReturnPct" name="Mensile %" fill="#cbd5e1" radius={[4, 4, 0, 0]} barSize={20} />
-                          <Line yAxisId="left" type="monotone" dataKey="cumulativeReturnPct" name="Cumulativo %" stroke="#0ea5e9" strokeWidth={3} dot={false} />
-                      </ComposedChart>
-                  </ResponsiveContainer>
-              </div>
-          </div>
-      </div>
-
-      {/* Trends & Gap Analysis Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* ROW 1: Pie + KPI Grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         
-        {/* Asset Class Trends */}
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-            <h3 className="text-gray-800 font-bold mb-4">Asset Class nel tempo</h3>
-            <div className="space-y-4">
-                {(Object.entries(trends.assetHistory) as [string, {date: string, pct: number}[]][])
-                    .filter(([_, h]) => h.length > 0 && h[h.length-1].pct > 1)
-                    .map(([name, history], idx) => (
-                    <div key={name} className="flex items-center justify-between">
-                        <span className="text-sm font-medium text-gray-600 w-24 truncate">{name}</span>
-                        <Sparkline data={history} color={COLORS[idx % COLORS.length]} />
-                        <span className="text-sm font-bold text-gray-800 w-12 text-right">
-                            {history[history.length-1].pct.toFixed(0)}%
-                        </span>
-                    </div>
-                ))}
+        {/* LEFT: Instrument Allocation Pie */}
+        <div className="lg:col-span-4 bg-panel backdrop-blur-sm p-6 rounded-xl border border-panel-border shadow-card flex flex-col h-full relative overflow-hidden">
+          <div className="absolute top-0 right-0 w-32 h-32 bg-primary/5 rounded-bl-full pointer-events-none"></div>
+          
+          <h3 className="text-xs font-bold text-panel-muted uppercase tracking-widest mb-6 flex items-center gap-2 relative z-10">
+             <span className="material-symbols-outlined text-[18px] text-primary">pie_chart</span> Composizione
+          </h3>
+          <div className="flex-1 min-h-[240px] relative">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie
+                  data={instrumentAllocationData}
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={70}
+                  outerRadius={90}
+                  paddingAngle={4}
+                  dataKey="value"
+                  stroke="none"
+                >
+                  {instrumentAllocationData.map((entry, index) => (
+                    <Cell 
+                      key={`cell-${index}`} 
+                      fill={PIE_COLORS[index % PIE_COLORS.length]} 
+                    />
+                  ))}
+                </Pie>
+                <Tooltip 
+                  formatter={(value: number) => `CHF ${value.toLocaleString()}`} 
+                  contentStyle={{ borderRadius: '8px', border: `1px solid ${BORDER_COLOR}`, boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)', color: NEUTRAL_TEXT }}
+                  itemStyle={{ color: NEUTRAL_TEXT, fontWeight: 600, fontSize: '13px' }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            {/* Center Total */}
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none flex-col">
+                <div className="text-[10px] text-panel-muted font-bold uppercase tracking-widest">Totale</div>
+                <div className="text-xl font-bold text-primary">{(state.totalValue / 1000).toFixed(1)}k</div>
             </div>
-        </div>
-
-        {/* Gap Analysis Heatmap */}
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-            <h3 className="text-gray-800 font-bold mb-4">Analisi Scostamenti</h3>
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                  <thead>
-                      <tr className="text-gray-400 text-xs border-b border-gray-100 text-left">
-                          <th className="py-2">Asset Class / Strumento</th>
-                          <th className="py-2 text-right">Target</th>
-                          <th className="py-2 text-right">Attuale</th>
-                          <th className="py-2 text-right">Diff</th>
-                          <th className="py-2 text-center">Status</th>
-                      </tr>
-                  </thead>
-                  <tbody>
-                      {gapHierarchy.map(group => {
-                        const zone = getHeatmapZone(group.diff);
-                        return (
-                          <React.Fragment key={group.name}>
-                            <tr className="border-b border-gray-100 bg-gray-50">
-                              <td className="py-3 font-bold text-gray-800">{group.name}</td>
-                              <td className="py-3 text-right text-gray-500">{group.target.toFixed(1)}%</td>
-                              <td className="py-3 text-right font-bold text-gray-800">{group.current.toFixed(1)}%</td>
-                              <td className="py-3 text-right">
-                                  <span className="px-2 py-1 rounded text-xs font-bold bg-white border border-gray-100">
-                                      {group.diff > 0 ? '+' : ''}{group.diff.toFixed(1)}%
-                                  </span>
-                              </td>
-                              <td className="py-3">
-                                  <div className={`flex items-center justify-center px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wide ${zone.className}`}>
-                                      {zone.label}
-                                  </div>
-                              </td>
-                            </tr>
-                            {group.instruments.map(inst => {
-                              const instZone = getHeatmapZone(inst.diff);
-                              return (
-                                <tr key={inst.ticker} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/50">
-                                  <td className="py-2 pl-6 text-gray-700">
-                                      <div className="flex items-center gap-2">
-                                          <div className="w-1.5 h-1.5 bg-gray-300 rounded-full"></div>
-                                          <div className="flex flex-col">
-                                              <span className="font-medium leading-tight">{inst.name}</span>
-                                              <span className="text-[10px] uppercase text-gray-400">{inst.ticker}</span>
-                                          </div>
-                                      </div>
-                                  </td>
-                                  <td className="py-2 text-right text-gray-500">{inst.target.toFixed(1)}%</td>
-                                  <td className="py-2 text-right font-semibold text-gray-800">{inst.current.toFixed(1)}%</td>
-                                  <td className="py-2 text-right">
-                                      <span className="text-[11px] text-gray-500">
-                                          {inst.diff > 0 ? '+' : ''}{inst.diff.toFixed(1)}%
-                                      </span>
-                                  </td>
-                                  <td className="py-2 text-center">
-                                      <div className={`inline-block w-24 py-1 rounded text-[9px] font-bold ${instZone.className} bg-opacity-80`}>
-                                          {instZone.label}
-                                      </div>
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </React.Fragment>
-                        );
-                      })}
-                      {gapHierarchy.length === 0 && (
-                          <tr><td colSpan={5} className="text-center py-4 text-gray-400 text-xs">Nessun target impostato o dati insufficienti.</td></tr>
-                      )}
-                  </tbody>
-              </table>
-            </div>
-        </div>
-      </div>
-
-      {/* Currency Trends */}
-      <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-          <h3 className="text-gray-800 font-bold mb-4">Esposizione Valute nel tempo</h3>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
-             {(Object.entries(trends.currencyHistory) as [string, {date: string, pct: number}[]][])
-                .filter(([_, h]) => h.length > 0 && h[h.length-1].pct > 0.5)
-                .map(([name, history]) => (
-                <div key={name} className="flex flex-col gap-2">
-                    <div className="flex justify-between items-baseline">
-                        <span className="text-xs font-bold uppercase text-gray-500">{name}</span>
-                        <span className="text-sm font-bold">{history[history.length-1].pct.toFixed(0)}%</span>
-                    </div>
-                    <div className="h-12 w-full">
-                        <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={history}>
-                                <Line type="monotone" dataKey="pct" stroke="#64748b" strokeWidth={1.5} dot={false} isAnimationActive={false} />
-                            </LineChart>
-                        </ResponsiveContainer>
-                    </div>
-                </div>
+          </div>
+          {/* Legend */}
+          <div className="mt-4 border-t border-panel-border pt-4 max-h-48 overflow-y-auto pr-2 space-y-3 custom-scrollbar">
+             {instrumentAllocationData.map((d, idx) => (
+               <div key={d.name} className="flex items-center justify-between text-xs group">
+                 <div className="flex items-center gap-2.5">
+                   <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: PIE_COLORS[idx % PIE_COLORS.length] }}></div>
+                   <span className="font-semibold text-panel-text truncate max-w-[120px] group-hover:text-primary transition-colors" title={d.fullName}>{d.name}</span>
+                 </div>
+                 <span className="font-bold text-panel-muted">{d.pct.toFixed(1)}%</span>
+               </div>
              ))}
           </div>
+        </div>
+
+        {/* CENTER/RIGHT: KPI Grid */}
+        <div className="lg:col-span-8 grid grid-cols-2 md:grid-cols-3 gap-6 content-start">
+          <KPICard 
+            title="Capitale Iniziale" 
+            value={`CHF ${(state.investedCapital/1000).toFixed(1)}k`} 
+            subValue="Investito Netto"
+          />
+          <KPICard 
+            title="Capitale Finale" 
+            value={`CHF ${(state.totalValue/1000).toFixed(1)}k`} 
+            subValue="Valore Attuale"
+            highlight
+          />
+          <KPICard 
+            title="Rendimento Annuo" 
+            value={`${analytics.annualizedReturn.toFixed(2)}%`} 
+            subValue="CAGR (Pesato)"
+            highlight
+          />
+          <KPICard 
+            title="Deviazione Std" 
+            value={`${analytics.stdDev.toFixed(2)}%`} 
+            subValue="Volatilità 1Y"
+          />
+          <KPICard 
+            title="Sharpe Ratio" 
+            value={analytics.sharpeRatio.toFixed(2)} 
+          />
+          <KPICard 
+            title="Drawdown Max" 
+            value={`${analytics.maxDrawdown.toFixed(2)}%`} 
+            subValue="Dal picco max"
+            alert
+          />
+        </div>
+      </div>
+
+      {/* FILTER BAR */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 py-2 sticky top-20 bg-shell/90 backdrop-blur z-10 border-b border-white/5 pb-4">
+        <h2 className="text-sm font-bold text-shell-text uppercase tracking-widest hidden md:block">
+            Analisi Temporale
+        </h2>
+        <div className="flex flex-col sm:flex-row gap-4 w-full md:w-auto">
+            {/* Metric Toggle */}
+            <div className="flex gap-2">
+              {(['PERF', 'TWRR', 'MWRR'] as const).map(m => (
+                <FilterButton 
+                    key={m} 
+                    active={metric === m} 
+                    label={m === 'PERF' ? 'Valore' : m} 
+                    onClick={() => setMetric(m)} 
+                />
+              ))}
+            </div>
+
+            {/* Separator */}
+            <div className="hidden sm:block w-px bg-white/10 mx-2"></div>
+
+            {/* Time Toggle */}
+            <div className="flex gap-2 overflow-x-auto pb-1 sm:pb-0">
+              {(['3M', '6M', '1Y', '5Y', 'YTD', 'MAX'] as const).map(t => (
+                <FilterButton 
+                    key={t} 
+                    active={timeRange === t} 
+                    label={t} 
+                    onClick={() => setTimeRange(t)} 
+                />
+              ))}
+            </div>
+        </div>
+      </div>
+
+      {/* ROW 2: Performance Chart */}
+      <div className="bg-panel backdrop-blur-sm p-6 rounded-xl border border-panel-border shadow-card">
+        <h3 className="text-xs font-bold text-panel-muted uppercase tracking-widest mb-6 flex items-center gap-2">
+           <span className="material-symbols-outlined text-[18px] text-primary">show_chart</span> Andamento Portafoglio
+        </h3>
+
+        <div className="h-[400px] w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={chartData} margin={{ top: 10, right: 0, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={BORDER_COLOR} opacity={0.5} />
+              <XAxis 
+                dataKey="displayDate" 
+                tick={{fontSize: 11, fill: NEUTRAL_MUTED}} 
+                axisLine={false} 
+                tickLine={false} 
+                minTickGap={50}
+                dy={10}
+              />
+              <YAxis 
+                tick={{fontSize: 11, fill: NEUTRAL_MUTED}} 
+                axisLine={false} 
+                tickLine={false}
+                domain={['auto', 'auto']}
+                unit={metric === 'PERF' ? '' : '%'}
+                dx={-10}
+              />
+              <Tooltip 
+                contentStyle={{ borderRadius: '8px', border: `1px solid ${BORDER_COLOR}`, padding: '12px', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)' }}
+                formatter={(val: number) => [
+                  <span className="font-bold text-neutral-text">{metric === 'PERF' ? `CHF ${val.toLocaleString()}` : `${val.toFixed(2)}%`}</span>, 
+                  <span className="text-xs uppercase text-panel-muted">{metric === 'PERF' ? 'Valore' : metric}</span>
+                ]}
+                labelStyle={{ color: NEUTRAL_MUTED, fontSize: '12px', marginBottom: '8px' }}
+              />
+              <Line 
+                type="monotone" 
+                dataKey="metricValue" 
+                stroke={PRIMARY_BLUE} 
+                strokeWidth={3} 
+                dot={false} 
+                activeDot={{ r: 6, strokeWidth: 0, fill: ACCENT_ORANGE }}
+                animationDuration={800}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* ROW 3: Annual Returns & Drawdowns */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        
+        {/* Annual Returns */}
+        <div className="bg-panel backdrop-blur-sm p-6 rounded-xl border border-panel-border shadow-card">
+           <h3 className="text-xs font-bold text-panel-muted uppercase tracking-widest mb-6 flex items-center gap-2">
+              <span className="material-symbols-outlined text-[18px]">bar_chart</span> Ritorni Annuali
+           </h3>
+           <div className="h-72 w-full">
+             <ResponsiveContainer width="100%" height="100%">
+               <BarChart data={filteredAnnualReturns}>
+                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={BORDER_COLOR} opacity={0.5} />
+                 <XAxis dataKey="year" tick={{fontSize: 11, fill: NEUTRAL_MUTED}} axisLine={false} tickLine={false} dy={10} />
+                 <Tooltip 
+                    cursor={{fill: '#f3f4f6'}}
+                    contentStyle={{ borderRadius: '8px', border: `1px solid ${BORDER_COLOR}`, boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)' }}
+                    formatter={(val: number) => [`${val.toFixed(2)}%`, 'Ritorno']}
+                 />
+                 <ReferenceLine y={0} stroke={BORDER_COLOR} />
+                 <Bar dataKey="returnPct" radius={[4, 4, 0, 0]}>
+                    {filteredAnnualReturns.map((entry, index) => (
+                      <Cell 
+                        key={`cell-${index}`} 
+                        fill={entry.returnPct >= 0 ? POSITIVE_GREEN : NEGATIVE_RED} 
+                      />
+                    ))}
+                 </Bar>
+               </BarChart>
+             </ResponsiveContainer>
+           </div>
+        </div>
+
+        {/* Drawdowns */}
+        <div className="bg-panel backdrop-blur-sm p-6 rounded-xl border border-panel-border shadow-card">
+           <h3 className="text-xs font-bold text-panel-muted uppercase tracking-widest mb-6 flex items-center gap-2">
+              <span className="material-symbols-outlined text-[18px] text-negative">trending_down</span> Drawdowns
+           </h3>
+           <div className="h-72 w-full">
+             <ResponsiveContainer width="100%" height="100%">
+               <AreaChart data={drawdownData}>
+                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={BORDER_COLOR} opacity={0.5} />
+                 <XAxis 
+                   dataKey="displayDate" 
+                   tick={{fontSize: 11, fill: NEUTRAL_MUTED}} 
+                   axisLine={false} 
+                   tickLine={false} 
+                   minTickGap={50}
+                   dy={10}
+                 />
+                 <YAxis 
+                   tick={{fontSize: 11, fill: NEUTRAL_MUTED}} 
+                   axisLine={false} 
+                   tickLine={false} 
+                   unit="%"
+                   dx={-10}
+                 />
+                 <Tooltip 
+                    contentStyle={{ borderRadius: '8px', border: `1px solid ${BORDER_COLOR}`, boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)' }}
+                    formatter={(val: number) => [`${val.toFixed(2)}%`, 'Drawdown']}
+                 />
+                 <defs>
+                    <linearGradient id="colorDrawdown" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={NEGATIVE_RED} stopOpacity={0.1}/>
+                      <stop offset="95%" stopColor={NEGATIVE_RED} stopOpacity={0}/>
+                    </linearGradient>
+                 </defs>
+                 <Area 
+                   type="stepAfter" 
+                   dataKey="depth" 
+                   stroke={NEGATIVE_RED}
+                   fill="url(#colorDrawdown)" 
+                   strokeWidth={2}
+                   animationDuration={800}
+                 />
+               </AreaChart>
+             </ResponsiveContainer>
+           </div>
+        </div>
+      </div>
+
+      {/* ROW 4: Stacked Allocation Bars (100% Single Bar) */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="bg-panel backdrop-blur-sm p-6 rounded-xl border border-panel-border shadow-card flex flex-col">
+           <h3 className="text-xs font-bold text-panel-muted uppercase tracking-widest mb-6 border-b border-panel-border pb-3 flex items-center gap-2">
+              <span className="material-symbols-outlined text-[18px]">donut_small</span> Allocazione Asset Class
+           </h3>
+           <StackedAllocation data={assetAllocationData} />
+        </div>
+
+        <div className="bg-panel backdrop-blur-sm p-6 rounded-xl border border-panel-border shadow-card flex flex-col">
+           <h3 className="text-xs font-bold text-panel-muted uppercase tracking-widest mb-6 border-b border-panel-border pb-3 flex items-center gap-2">
+              <span className="material-symbols-outlined text-[18px]">currency_exchange</span> Esposizione Valutaria
+           </h3>
+           <StackedAllocation data={currencyAllocationData} />
+        </div>
       </div>
 
     </div>

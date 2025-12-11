@@ -1,5 +1,5 @@
 import { Transaction, TransactionType, Instrument, PricePoint, PortfolioState, PortfolioPosition, PerformancePoint, AssetType, Currency } from '../types';
-import { format, startOfMonth, endOfMonth, eachMonthOfInterval, subMonths, isValid } from 'date-fns';
+import { format, startOfMonth, endOfMonth, eachMonthOfInterval, subMonths, isValid, getYear, isSameYear, startOfYear } from 'date-fns';
 
 // Helper sicuro per gestire date che potrebbero essere stringhe o oggetti Date
 const toDate = (dateInput: string | Date | number): Date => {
@@ -113,7 +113,7 @@ export const calculateHistoricalPerformance = (
   transactions: Transaction[],
   instruments: Instrument[],
   prices: PricePoint[],
-  monthsBack: number = 12
+  monthsBack: number = 60 // Increased default history
 ): { 
   history: PerformancePoint[], 
   assetHistory: Record<string, {date: string, pct: number}[]>,
@@ -121,7 +121,11 @@ export const calculateHistoricalPerformance = (
 } => {
   
   const end = new Date();
-  const start = subMonths(startOfMonth(end), monthsBack);
+  // Ensure we go back enough to cover request, but at least to first transaction
+  const firstTx = transactions.length > 0 ? transactions[transactions.length-1].date : new Date();
+  let start = subMonths(startOfMonth(end), monthsBack);
+  if (firstTx < start) start = startOfMonth(firstTx);
+
   const months = eachMonthOfInterval({ start, end });
 
   const history: PerformancePoint[] = [];
@@ -158,6 +162,9 @@ export const calculateHistoricalPerformance = (
        
        if (t.type === TransactionType.Buy) investedAtDate += (qty * price) + fees;
        if (t.type === TransactionType.Sell) investedAtDate -= ((qty * price) - fees);
+       // Simple deposit/withdrawal handling for invested capital
+       if (t.type === TransactionType.Deposit) investedAtDate += (t.quantity || 0);
+       if (t.type === TransactionType.Withdrawal) investedAtDate -= (t.quantity || 0);
     });
 
     // 2. Calculate Value at this date
@@ -179,20 +186,21 @@ export const calculateHistoricalPerformance = (
     });
 
     // 3. Performance Metrics
-    const performancePct = investedAtDate > 0 ? ((totalValueAtDate / investedAtDate) - 1) * 100 : 0;
+    const cumulativeReturnPct = investedAtDate > 0 ? ((totalValueAtDate / investedAtDate) - 1) * 100 : 0;
     
     // Approximate monthly return
     let monthlyReturn = 0;
     if (idx > 0 && history[idx-1].value > 0) {
+        // Simple return vs previous month value (approx, ignoring intra-month cashflows for MVP)
         monthlyReturn = ((totalValueAtDate / history[idx-1].value) - 1) * 100;
     }
 
     history.push({
-      date: format(date, 'MMM yy'),
+      date: format(date, 'yyyy-MM-dd'), // Changed to ISO for easier parsing later
       value: totalValueAtDate,
       invested: investedAtDate,
       monthlyReturnPct: monthlyReturn,
-      cumulativeReturnPct: performancePct
+      cumulativeReturnPct: cumulativeReturnPct
     });
 
     // 4. Record Asset/Currency Allocation
@@ -210,6 +218,87 @@ export const calculateHistoricalPerformance = (
   });
 
   return { history, assetHistory, currencyHistory };
+};
+
+// --- NEW ANALYTICS HELPERS ---
+
+export interface PortfolioAnalytics {
+  annualReturns: { year: number; returnPct: number }[];
+  maxDrawdown: number;
+  drawdownSeries: { date: string; depth: number }[];
+  annualizedReturn: number;
+  stdDev: number;
+  sharpeRatio: number;
+}
+
+export const calculateAnalytics = (history: PerformancePoint[]): PortfolioAnalytics => {
+  if (history.length < 2) {
+    return {
+      annualReturns: [],
+      maxDrawdown: 0,
+      drawdownSeries: [],
+      annualizedReturn: 0,
+      stdDev: 0,
+      sharpeRatio: 0
+    };
+  }
+
+  // 1. Annual Returns
+  const annualReturnsMap: Record<number, number> = {};
+  // Group by year to calculate rough annual return based on Value change (simplified)
+  // Ideally, link monthly returns: (1+r1)*(1+r2)... -1
+  const returnsByYear: Record<number, number[]> = {};
+  
+  history.forEach(p => {
+    const y = getYear(new Date(p.date));
+    if (!returnsByYear[y]) returnsByYear[y] = [];
+    returnsByYear[y].push(p.monthlyReturnPct / 100);
+  });
+
+  const annualReturns = Object.entries(returnsByYear).map(([year, montlyReturns]) => {
+    const compound = montlyReturns.reduce((acc, r) => acc * (1 + r), 1) - 1;
+    return { year: parseInt(year), returnPct: compound * 100 };
+  });
+
+  // 2. Drawdowns
+  let maxPeak = -Infinity;
+  let maxDrawdown = 0;
+  const drawdownSeries = history.map(p => {
+    if (p.value > maxPeak) maxPeak = p.value;
+    const depth = maxPeak > 0 ? (p.value / maxPeak) - 1 : 0;
+    if (depth < maxDrawdown) maxDrawdown = depth;
+    return { date: p.date, depth: depth * 100 }; // in %
+  });
+
+  // 3. KPI: CAGR (Annualized Return)
+  // (End / Start)^(12/months) - 1
+  const startVal = history.find(h => h.value > 0)?.value || 1;
+  const endVal = history[history.length - 1].value;
+  const monthsCount = history.filter(h => h.value > 0).length;
+  const years = monthsCount / 12;
+  const annualizedReturn = years > 0 && startVal > 0 
+    ? (Math.pow(endVal / startVal, 1 / years) - 1) * 100 
+    : 0;
+
+  // 4. KPI: StdDev (of monthly returns) * sqrt(12)
+  const returns = history.map(h => h.monthlyReturnPct);
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
+  const stdDevMonthly = Math.sqrt(variance);
+  const stdDevAnnualized = stdDevMonthly * Math.sqrt(12);
+
+  // 5. KPI: Sharpe (assume Rf = 2% for simplicity)
+  const rf = 2; 
+  const sharpeRatio = stdDevAnnualized > 0 ? (annualizedReturn - rf) / stdDevAnnualized : 0;
+
+  return {
+    annualReturns,
+    maxDrawdown: maxDrawdown * 100,
+    drawdownSeries,
+    annualizedReturn,
+    stdDev: stdDevAnnualized,
+    sharpeRatio
+  };
 };
 
 export const calculateRebalancing = (

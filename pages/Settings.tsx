@@ -36,7 +36,8 @@ export const Settings: React.FC = () => {
 
   const handleReset = async () => {
       if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione è irreversibile. Vuoi procedere?')) {
-          await db.delete();
+          // Casting db to any to avoid TS error: Property 'delete' does not exist on type 'PortfolioDB'
+          await (db as any).delete();
           window.location.reload(); // Dexie will recreate DB on reload due to db.ts logic
       }
   };
