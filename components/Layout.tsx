@@ -7,13 +7,19 @@ const NavItem = ({ to, icon, label, collapsed }: { to: string, icon: string, lab
     to={to}
     className={({ isActive }) =>
       clsx(
-        "flex items-center gap-4 px-4 py-3 mx-2 rounded-full transition-colors mb-1",
-        isActive ? "bg-blue-100 text-blue-800 font-medium" : "text-gray-600 hover:bg-gray-100"
+        "flex items-center gap-4 px-4 py-3 mx-3 rounded-lg transition-all duration-200 mb-1.5 group border border-transparent whitespace-nowrap overflow-hidden",
+        isActive 
+          ? "bg-secondary/10 border-secondary/20 text-white shadow-[0_0_15px_rgba(249,115,22,0.2)]" 
+          : "text-shell-muted hover:bg-white/5 hover:text-white"
       )
     }
   >
-    <span className="material-symbols-outlined">{icon}</span>
-    {!collapsed && <span className="text-sm tracking-wide">{label}</span>}
+    {({ isActive }) => (
+      <>
+        <span className={clsx("material-symbols-outlined transition-colors text-[22px]", isActive ? "text-secondary" : "text-shell-muted group-hover:text-white")}>{icon}</span>
+        {!collapsed && <span className="text-sm tracking-wide font-medium">{label}</span>}
+      </>
+    )}
   </NavLink>
 );
 
@@ -21,64 +27,92 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
   const [isSidebarOpen, setSidebarOpen] = useState(true);
 
   return (
-    <div className="flex h-screen bg-[#f8f9fa] text-gray-900 font-sans overflow-hidden">
+    <div className="flex min-h-screen w-full bg-transparent text-shell-text font-sans">
       
-      {/* Sidebar - Desktop & Mobile Drawer */}
+      {/* Sidebar - Fixed */}
       <aside 
         className={clsx(
-          "fixed inset-y-0 left-0 z-20 bg-white border-r border-gray-200 transition-all duration-300 ease-in-out flex flex-col",
-          isSidebarOpen ? "w-64 translate-x-0" : "w-20 -translate-x-full md:translate-x-0 md:w-20"
+          "fixed inset-y-0 left-0 z-40 bg-shell-elevated border-r border-shell-border transition-all duration-300 ease-in-out flex flex-col shadow-2xl",
+          isSidebarOpen ? "w-64" : "w-20 -translate-x-full md:translate-x-0 md:w-20"
         )}
       >
         {/* Logo Area */}
-        <div className="h-16 flex items-center px-6 border-b border-gray-100">
-          <span className="material-symbols-outlined text-blue-600 text-3xl mr-2">monitoring</span>
-          {isSidebarOpen && <span className="font-bold text-xl text-gray-700 tracking-tight">EasyPortfolio</span>}
+        <div className="h-20 flex-shrink-0 flex items-center px-6 border-b border-shell-border mb-4">
+          <div className="w-10 h-10 flex-shrink-0 rounded-xl bg-gradient-to-br from-primary to-primary-dark flex items-center justify-center mr-3 shadow-lg shadow-primary/20 border border-white/10">
+            <span className="material-symbols-outlined text-white text-[24px]">account_balance_wallet</span>
+          </div>
+          {isSidebarOpen && (
+            <div className="overflow-hidden">
+              <span className="font-bold text-lg text-white tracking-wide block leading-none truncate">EasyPortfolio</span>
+              <span className="text-[10px] text-shell-muted uppercase tracking-widest truncate">Finance Tracker</span>
+            </div>
+          )}
         </div>
 
         {/* Navigation Links */}
-        <nav className="flex-1 py-4 overflow-y-auto">
+        <nav className="flex-1 py-2 overflow-y-auto space-y-1 custom-scrollbar">
+          <div className="px-6 mb-3 text-[10px] font-bold text-shell-muted uppercase tracking-widest opacity-60 truncate">
+            {isSidebarOpen ? 'Menu Principale' : '...'}
+          </div>
           <NavItem to="/" icon="dashboard" label="Dashboard" collapsed={!isSidebarOpen} />
           <NavItem to="/transactions" icon="receipt_long" label="Transazioni" collapsed={!isSidebarOpen} />
           <NavItem to="/rebalance" icon="balance" label="Ribilanciamento" collapsed={!isSidebarOpen} />
-          <NavItem to="/macro" icon="speed" label="Macro Indicator" collapsed={!isSidebarOpen} />
-          <div className="my-2 border-t border-gray-100 mx-4"></div>
+          <NavItem to="/macro" icon="speed" label="Macro View" collapsed={!isSidebarOpen} />
+          
+          <div className="my-6 border-t border-shell-border mx-6"></div>
+          
+          <div className="px-6 mb-3 text-[10px] font-bold text-shell-muted uppercase tracking-widest opacity-60 truncate">
+            {isSidebarOpen ? 'Configurazione' : '...'}
+          </div>
           <NavItem to="/settings" icon="settings" label="Impostazioni" collapsed={!isSidebarOpen} />
         </nav>
 
-        {/* User / Footer Area */}
+        {/* Footer Area */}
         {isSidebarOpen && (
-          <div className="p-4 text-xs text-gray-400 text-center">
-            v1.3.0 • Offline
+          <div className="p-4 bg-black/20 text-xs text-shell-muted text-center border-t border-shell-border flex-shrink-0">
+            <div className="flex items-center justify-center gap-1.5 mb-1">
+              <span className="w-1.5 h-1.5 bg-positive rounded-full animate-pulse"></span>
+              <span className="font-medium">Online Mode</span>
+            </div>
+            v1.6.0 • Dark Theme
           </div>
         )}
       </aside>
 
       {/* Main Content Wrapper */}
       <div className={clsx(
-        "flex-1 flex flex-col transition-all duration-300 h-full",
+        "flex-1 flex flex-col min-h-screen transition-all duration-300 w-full",
         isSidebarOpen ? "md:ml-64" : "md:ml-20"
       )}>
         
-        {/* Top App Bar */}
-        <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-4 sticky top-0 z-10 shadow-sm">
+        {/* Top Header - Sticky */}
+        <header className="h-20 bg-shell-elevated/80 backdrop-blur-md border-b border-shell-border flex items-center justify-between px-8 sticky top-0 z-30">
           <button 
             onClick={() => setSidebarOpen(!isSidebarOpen)}
-            className="p-2 rounded-full hover:bg-gray-100 text-gray-600 focus:outline-none"
+            className="p-2 -ml-2 rounded-lg hover:bg-white/5 text-shell-muted hover:text-white transition-colors focus:outline-none"
           >
-            <span className="material-symbols-outlined">menu</span>
+            <span className="material-symbols-outlined">menu_open</span>
           </button>
           
-          <div className="flex items-center gap-3">
-             <div className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-sm">
-                EP
+          <div className="flex items-center gap-5">
+             <div className="text-right hidden sm:block">
+                <div className="text-[10px] font-bold text-shell-muted uppercase tracking-widest">Portafoglio Attivo</div>
+                <div className="text-sm font-bold text-white flex items-center justify-end gap-1">
+                  My Personal Wealth <span className="material-symbols-outlined text-sm text-secondary">verified</span>
+                </div>
+             </div>
+             <div className="w-10 h-10 rounded-full bg-shell-elevated border border-shell-border text-primary font-bold flex items-center justify-center shadow-lg shadow-black/20">
+                MP
              </div>
           </div>
         </header>
 
         {/* Page Content */}
-        <main className="flex-1 overflow-y-auto p-4 md:p-8">
-          <div className="max-w-6xl mx-auto w-full animate-fade-in">
+        <main className="flex-1 p-6 md:p-10 relative">
+          {/* Subtle background glow effect (behind content) */}
+          <div className="fixed top-20 left-0 w-full h-96 bg-primary/5 rounded-full blur-3xl -translate-y-1/2 pointer-events-none -z-10"></div>
+          
+          <div className="max-w-7xl mx-auto w-full animate-fade-in relative z-10">
             {children}
           </div>
         </main>
@@ -87,7 +121,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       {/* Mobile Overlay */}
       {isSidebarOpen && (
         <div 
-          className="md:hidden fixed inset-0 bg-black/50 z-10"
+          className="md:hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-50"
           onClick={() => setSidebarOpen(false)}
         />
       )}
