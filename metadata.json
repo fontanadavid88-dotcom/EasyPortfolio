@@ -1,0 +1,5 @@
+{
+  "name": "EasyPortfolio",
+  "description": "A privacy-focused, offline-first PWA for portfolio tracking, analysis, and rebalancing with custom macroeconomic indicators.",
+  "requestFramePermissions": []
+}
