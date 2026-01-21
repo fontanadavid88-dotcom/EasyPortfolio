@@ -1,11 +1,19 @@
-import { Transaction, TransactionType, Instrument, PricePoint, PortfolioState, PortfolioPosition, PerformancePoint, AssetType, Currency, AssetClass } from '../types';
-import { format, startOfMonth, endOfMonth, eachMonthOfInterval, subMonths, isValid, getYear, eachDayOfInterval, differenceInCalendarDays } from 'date-fns';
+import { Transaction, TransactionType, Instrument, PricePoint, PortfolioState, PortfolioPosition, PerformancePoint, AssetType, Currency, AssetClass, RegionKey } from '../types';
+import { format, startOfMonth, endOfMonth, eachMonthOfInterval, isValid, getYear, eachDayOfInterval, differenceInCalendarDays } from 'date-fns';
 
 // Helper sicuro per gestire date che potrebbero essere stringhe o oggetti Date
-const toDate = (dateInput: string | Date | number): Date => {
+const toDateSafe = (dateInput: string | Date | number): Date => {
   if (dateInput instanceof Date) return dateInput;
   if (typeof dateInput === 'string') return new Date(dateInput);
   return new Date(dateInput);
+};
+
+const toDateString = (dateInput: string | Date | number): string => {
+  if (typeof dateInput === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateInput)) {
+    const [y, m, d] = dateInput.split('-').map(Number);
+    return format(new Date(y, m - 1, d), 'yyyy-MM-dd');
+  }
+  return format(toDateSafe(dateInput), 'yyyy-MM-dd');
 };
 
 // Helper sicuro per divisioni
@@ -21,11 +29,14 @@ const ASSET_CLASS_LABELS: Record<AssetClass, string> = {
   [AssetClass.ETF_BOND]: 'ETF Obbligazionari',
   [AssetClass.ETC]: 'ETC',
   [AssetClass.CRYPTO]: 'Cripto',
-  [AssetClass.CASH]: 'Liquidità',
+  [AssetClass.CASH]: 'Liquidita',
   [AssetClass.OTHER]: 'Altro'
 };
 
 export const getAssetClassLabel = (ac: AssetClass): string => ASSET_CLASS_LABELS[ac] || ac;
+export const getCanonicalTicker = (instrument: Instrument): string => {
+  return instrument.preferredListing?.symbol || instrument.ticker;
+};
 const REGION_LABELS: Record<RegionKey, string> = {
   CH: 'Svizzera',
   NA: 'Nord America',
@@ -34,7 +45,8 @@ const REGION_LABELS: Record<RegionKey, string> = {
   OC: 'Oceania',
   LATAM: 'America Latina',
   AF: 'Africa',
-  UNASSIGNED: 'Non definito'
+  UNASSIGNED: 'Non definito',
+  OTHER: 'Altri'
 };
 export const getRegionLabel = (rk: RegionKey) => REGION_LABELS[rk] || rk;
 
@@ -85,12 +97,54 @@ const getPriceAtDate = (ticker: string, dateStr: string, prices: PricePoint[]): 
   return relevantPrices.length > 0 ? relevantPrices[0].close : 0;
 };
 
+export const getLatestPricePoint = (
+  ticker: string,
+  dateStr: string,
+  prices: PricePoint[]
+): PricePoint | null => {
+  let latest: PricePoint | null = null;
+  prices.forEach(p => {
+    if (p.ticker !== ticker) return;
+    if (p.date > dateStr) return;
+    if (!latest || p.date > latest.date) latest = p;
+  });
+  return latest;
+};
+
+export const getValuationDateForHoldings = (
+  transactions: Transaction[],
+  prices: PricePoint[],
+  instruments?: Instrument[]
+): string | undefined => {
+  const holdings = calculateHoldings(transactions);
+  let minLastDate: string | undefined;
+  let fallbackLastDate: string | undefined;
+  const canonicalByTicker = instruments
+    ? new Map(instruments.map(inst => [inst.ticker, getCanonicalTicker(inst)]))
+    : null;
+  prices.forEach(p => {
+    if (!fallbackLastDate || p.date > fallbackLastDate) fallbackLastDate = p.date;
+  });
+  holdings.forEach((qty, ticker) => {
+    if (qty <= 0.000001) return;
+    const priceTicker = canonicalByTicker?.get(ticker) || ticker;
+    let lastDate: string | undefined;
+    prices.forEach(p => {
+      if (p.ticker !== priceTicker) return;
+      if (!lastDate || p.date > lastDate) lastDate = p.date;
+    });
+    if (!lastDate) return;
+    if (!minLastDate || lastDate < minLastDate) minLastDate = lastDate;
+  });
+  return minLastDate || fallbackLastDate;
+};
+
 // Build a lookup of transactions by ticker (sorted desc by date)
 const buildTxPriceMap = (transactions: Transaction[]) => {
   const map = new Map<string, { dateStr: string, price: number }[]>();
   transactions.forEach(t => {
     if (!t.instrumentTicker) return;
-    const dateStr = format(toDate(t.date), 'yyyy-MM-dd');
+    const dateStr = toDateString(t.date);
     const arr = map.get(t.instrumentTicker) || [];
     arr.push({ dateStr, price: t.price });
     map.set(t.instrumentTicker, arr);
@@ -103,20 +157,22 @@ const getPriceWithFallback = (
   ticker: string,
   dateStr: string,
   prices: PricePoint[],
-  txPriceMap: Map<string, { dateStr: string, price: number }[]>
+  txPriceMap: Map<string, { dateStr: string, price: number }[]>,
+  txTicker?: string
 ): number => {
   const price = getPriceAtDate(ticker, dateStr, prices);
   if (price > 0) return price;
-  const txArr = txPriceMap.get(ticker);
+  const fallbackTicker = txTicker || ticker;
+  const txArr = txPriceMap.get(fallbackTicker);
   if (!txArr || txArr.length === 0) return 0;
   const latest = txArr.find(tx => tx.dateStr <= dateStr);
   return latest ? latest.price : 0;
 };
 
-const cleanNumber = (value: unknown, fallback = 0) =>
+export const cleanNumber = (value: unknown, fallback = 0) =>
   Number.isFinite(Number(value)) ? Number(value) : fallback;
 
-const computeTWRRFromNav = (history: PerformancePoint[], externalFlows: { date: string; amount: number }[]) => {
+export const computeTWRRFromNav = (history: PerformancePoint[], externalFlows: { date: string; amount: number }[]) => {
   if (history.length === 0) return history;
   const flowByDate = new Map<string, number>();
   externalFlows.forEach(f => flowByDate.set(f.date, (flowByDate.get(f.date) || 0) + f.amount));
@@ -125,16 +181,16 @@ const computeTWRRFromNav = (history: PerformancePoint[], externalFlows: { date: 
   let prevNav = history[0].value;
 
   return history.map((point, idx) => {
-    if (idx === 0) return { ...point, cumulativeTWRRIndex: 1, cumulativeReturnPct: 0 };
+    if (idx === 0) return { ...point, cumulativeTWRRIndex: 1, cumulativeReturnPct: 0, monthlyReturnPct: 0 };
     const cf = flowByDate.get(point.date) || 0;
     const r = prevNav > 0 ? ((point.value - cf - prevNav) / prevNav) : 0;
     twrrIndex = twrrIndex * (1 + r);
     prevNav = point.value;
-    return { ...point, cumulativeTWRRIndex: twrrIndex, cumulativeReturnPct: (twrrIndex - 1) * 100 };
+    return { ...point, cumulativeTWRRIndex: twrrIndex, cumulativeReturnPct: (twrrIndex - 1) * 100, monthlyReturnPct: r * 100 };
   });
 };
 
-const computeXIRR = (cashflows: { date: string; amount: number }[], guess = 0.1): number | null => {
+export const computeXIRR = (cashflows: { date: string; amount: number }[], guess = 0.1): number | null => {
   if (cashflows.length === 0) return null;
   const toDays = (d: string) => new Date(d).getTime();
   const t0 = toDays(cashflows[0].date);
@@ -215,7 +271,8 @@ export const calculatePortfolioState = (
     const qty = holdingsMap.get(inst.ticker) || 0;
     // Handle floating point dust
     if (qty > 0.000001) {
-      const currentPrice = getPriceWithFallback(inst.ticker, todayStr, prices, txPriceMap);
+      const priceTicker = getCanonicalTicker(inst);
+      const currentPrice = getPriceWithFallback(priceTicker, todayStr, prices, txPriceMap, inst.ticker);
       // NOTE: Here we assume Price is in Base Currency or converted. 
       // For MVP, if currency matches app base currency, use as is. 
       // A full Forex implementation would convert here.
@@ -255,6 +312,309 @@ export const calculatePortfolioState = (
 
 export type Granularity = 'monthly' | 'daily';
 
+type Cashflow = { date: string; amount: number };
+export type NavDetailPoint = {
+  date: string;
+  navBaseCcy: number;
+  holdingsValue: number;
+  cashBalance: number;
+  externalFlow: number;
+  internalFlow: number;
+  fxUsed: Record<string, number>;
+  missingPriceTickers: string[];
+  missingFxPairs: string[];
+};
+
+const sumCashflowsByDate = (cashflows: Cashflow[]) => {
+  const map = new Map<string, number>();
+  cashflows.forEach(cf => {
+    map.set(cf.date, (map.get(cf.date) || 0) + cf.amount);
+  });
+  return Array.from(map.entries())
+    .map(([date, amount]) => ({ date, amount }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+};
+
+export const getPortfolioDateBounds = (
+  transactions: Transaction[],
+  prices: PricePoint[],
+  instruments?: Instrument[]
+): { firstTransactionDate?: string; firstPriceDate?: string; lastPriceDate?: string; effectiveStartDate?: string } => {
+  let firstTransactionDate: string | undefined;
+  transactions.forEach(t => {
+    const dateStr = toDateString(t.date);
+    if (!firstTransactionDate || dateStr < firstTransactionDate) firstTransactionDate = dateStr;
+  });
+
+  let lastPriceDate: string | undefined;
+  let firstPriceDate: string | undefined;
+  const tickerSet = instruments && instruments.length > 0
+    ? new Set(instruments.map(i => getCanonicalTicker(i)))
+    : null;
+
+  prices.forEach(p => {
+    if (tickerSet && !tickerSet.has(p.ticker)) return;
+    const dateStr = p.date;
+    if (!lastPriceDate || dateStr > lastPriceDate) lastPriceDate = dateStr;
+    if (firstTransactionDate && dateStr >= firstTransactionDate) {
+      if (!firstPriceDate || dateStr < firstPriceDate) firstPriceDate = dateStr;
+    }
+  });
+
+  const effectiveStartDate = firstTransactionDate ? (firstPriceDate || firstTransactionDate) : undefined;
+
+  return {
+    firstTransactionDate,
+    firstPriceDate,
+    lastPriceDate,
+    effectiveStartDate
+  };
+};
+
+export const buildNavSeriesDetailed = (
+  transactions: Transaction[],
+  instruments: Instrument[],
+  prices: PricePoint[],
+  granularity: Granularity = 'daily',
+  fromDate?: string,
+  endDate?: string
+): NavDetailPoint[] => {
+  if (!transactions.length) return [];
+
+  const bounds = getPortfolioDateBounds(transactions, prices, instruments);
+  if (!bounds.effectiveStartDate) return [];
+
+  const startDateStr = fromDate && fromDate > bounds.effectiveStartDate
+    ? toDateString(fromDate)
+    : bounds.effectiveStartDate;
+  const today = new Date();
+  const lastPriceDate = bounds.lastPriceDate ? toDateSafe(bounds.lastPriceDate) : null;
+  const endDateStr = toDateString(endDate || (lastPriceDate && lastPriceDate <= today ? bounds.lastPriceDate! : today));
+  const startDateObj = toDateSafe(startDateStr);
+  const endDateObj = toDateSafe(endDateStr);
+
+  const startDate = granularity === 'monthly' ? startOfMonth(startDateObj) : startDateObj;
+  const rangeEndDate = endDateObj < startDate ? startDate : endDateObj;
+
+  const txPriceMap = buildTxPriceMap(transactions);
+  const uniqueInstruments = Array.from(
+    new Map(instruments.map(inst => [inst.ticker, inst])).values()
+  );
+  const canonicalByTicker = new Map(uniqueInstruments.map(inst => [inst.ticker, getCanonicalTicker(inst)]));
+  const dateIndex = granularity === 'monthly'
+    ? eachMonthOfInterval({ start: startDate, end: rangeEndDate }).map(d => format(endOfMonth(d), 'yyyy-MM-dd'))
+    : eachDayOfInterval({ start: startDate, end: rangeEndDate }).map(d => format(d, 'yyyy-MM-dd'));
+
+  const priceMap = new Map<string, PricePoint[]>();
+  prices
+    .filter(p => !!p?.date && !!p?.ticker)
+    .slice()
+    .sort((a, b) => (a.date || '').localeCompare(b.date || ''))
+    .forEach(p => {
+      const arr = priceMap.get(p.ticker) || [];
+      arr.push(p);
+      priceMap.set(p.ticker, arr);
+    });
+
+  const trackCash = transactions.some(t => t.type === TransactionType.Deposit || t.type === TransactionType.Withdrawal);
+  const runningQty = new Map<string, number>();
+  const pricePtr = new Map<string, number>();
+  const lastClose = new Map<string, number>();
+  let cashRunning = 0;
+
+  const applyTransactionToRunning = (t: Transaction) => {
+    const qty = t.quantity || 0;
+    const price = t.price || 0;
+    const fees = t.fees || 0;
+
+    if (t.instrumentTicker) {
+      const current = runningQty.get(t.instrumentTicker) || 0;
+      if (t.type === TransactionType.Buy) runningQty.set(t.instrumentTicker, current + qty);
+      else if (t.type === TransactionType.Sell) runningQty.set(t.instrumentTicker, current - qty);
+    }
+
+    if (trackCash) {
+      if (t.type === TransactionType.Buy) cashRunning -= (qty * price) + fees;
+      if (t.type === TransactionType.Sell) cashRunning += (qty * price) - fees;
+      if (t.type === TransactionType.Deposit) cashRunning += (t.quantity || 0);
+      if (t.type === TransactionType.Withdrawal) cashRunning -= (t.quantity || 0);
+      if (t.type === TransactionType.Dividend) cashRunning += (t.quantity || 0);
+      if (t.type === TransactionType.Fee) cashRunning -= fees;
+    }
+  };
+
+  const rangeStartStr = format(startDate, 'yyyy-MM-dd');
+  transactions.forEach(t => {
+    const tDateStr = toDateString(t.date);
+    if (tDateStr < rangeStartStr) applyTransactionToRunning(t);
+  });
+
+  const hasExternal = transactions.some(t => t.type === TransactionType.Deposit || t.type === TransactionType.Withdrawal);
+
+  return dateIndex.map(dateStr => {
+    let externalFlow = 0;
+    let internalFlow = 0;
+
+    transactions.forEach(t => {
+      const tDateStr = toDateString(t.date);
+      if (tDateStr !== dateStr) return;
+      const qty = t.quantity || 0;
+      const price = t.price || 0;
+      const fees = t.fees || 0;
+
+      if (hasExternal) {
+        if (t.type === TransactionType.Deposit) externalFlow += qty;
+        if (t.type === TransactionType.Withdrawal) externalFlow -= qty;
+        if (t.type === TransactionType.Buy) internalFlow -= (qty * price) + fees;
+        if (t.type === TransactionType.Sell) internalFlow += (qty * price) - fees;
+      } else {
+        if (!t.instrumentTicker) return;
+        if (t.type === TransactionType.Buy) externalFlow += (qty * price) + fees;
+        if (t.type === TransactionType.Sell) externalFlow -= (qty * price) - fees;
+      }
+
+      applyTransactionToRunning(t);
+    });
+
+    let holdingsValue = 0;
+    const missingPriceTickers: string[] = [];
+
+    uniqueInstruments.forEach(instr => {
+      const ticker = instr.ticker;
+      const priceTicker = canonicalByTicker.get(ticker) || ticker;
+      const qty = runningQty.get(ticker) || 0;
+      if (qty <= 0.000001) return;
+
+      const pArr = priceMap.get(priceTicker) || [];
+      const pIdx = pricePtr.get(priceTicker) || 0;
+      let i = pIdx;
+      while (i < pArr.length && pArr[i].date <= dateStr) {
+        lastClose.set(priceTicker, pArr[i].close);
+        i++;
+      }
+      pricePtr.set(priceTicker, i);
+      let price = lastClose.get(priceTicker);
+      if (price === undefined) {
+        const txArr = txPriceMap.get(ticker);
+        const latestTx = txArr?.find(tx => tx.dateStr <= dateStr);
+        price = latestTx ? latestTx.price : undefined;
+      }
+      if (price === undefined) {
+        missingPriceTickers.push(priceTicker);
+        return;
+      }
+      holdingsValue += qty * price;
+    });
+
+    const navBaseCcy = holdingsValue + (trackCash ? cashRunning : 0);
+
+    return {
+      date: dateStr,
+      navBaseCcy,
+      holdingsValue,
+      cashBalance: trackCash ? cashRunning : 0,
+      externalFlow,
+      internalFlow,
+      fxUsed: {},
+      missingPriceTickers,
+      missingFxPairs: []
+    };
+  });
+};
+
+const buildExternalFlows = (transactions: Transaction[], granularity: Granularity): Cashflow[] => {
+  const flows: Cashflow[] = [];
+  const hasExternal = transactions.some(t => t.type === TransactionType.Deposit || t.type === TransactionType.Withdrawal);
+  transactions.forEach(t => {
+    const baseDate = toDateSafe(t.date);
+    const dateStr = granularity === 'monthly'
+      ? format(endOfMonth(baseDate), 'yyyy-MM-dd')
+      : format(baseDate, 'yyyy-MM-dd');
+
+    if (hasExternal) {
+      if (t.type !== TransactionType.Deposit && t.type !== TransactionType.Withdrawal) return;
+      const amount = t.type === TransactionType.Deposit ? (t.quantity || 0) : -(t.quantity || 0);
+      flows.push({ date: dateStr, amount });
+      return;
+    }
+
+    if (!t.instrumentTicker) return;
+    const qty = t.quantity || 0;
+    const price = t.price || 0;
+    const fees = t.fees || 0;
+    if (t.type === TransactionType.Buy) {
+      flows.push({ date: dateStr, amount: (qty * price) + fees });
+    }
+    if (t.type === TransactionType.Sell) {
+      flows.push({ date: dateStr, amount: -((qty * price) - fees) });
+    }
+  });
+  return sumCashflowsByDate(flows);
+};
+
+const buildMwrrCashflows = (transactions: Transaction[]): Cashflow[] => {
+  const hasExternal = transactions.some(t => t.type === TransactionType.Deposit || t.type === TransactionType.Withdrawal);
+  const cashflows: Cashflow[] = [];
+
+  transactions.forEach(t => {
+    const dateStr = toDateString(t.date);
+    const qty = t.quantity || 0;
+    const price = t.price || 0;
+    const fees = t.fees || 0;
+
+    if (t.type === TransactionType.Deposit) cashflows.push({ date: dateStr, amount: -qty });
+    if (t.type === TransactionType.Withdrawal) cashflows.push({ date: dateStr, amount: qty });
+    if (t.type === TransactionType.Dividend) cashflows.push({ date: dateStr, amount: qty });
+    if (t.type === TransactionType.Fee) cashflows.push({ date: dateStr, amount: -(fees || qty) });
+
+    if (!hasExternal && t.instrumentTicker) {
+      if (t.type === TransactionType.Buy) cashflows.push({ date: dateStr, amount: -((qty * price) + fees) });
+      if (t.type === TransactionType.Sell) cashflows.push({ date: dateStr, amount: (qty * price) - fees });
+    }
+  });
+
+  return sumCashflowsByDate(cashflows);
+};
+
+export const computeMwrrSeries = (
+  history: PerformancePoint[],
+  transactions: Transaction[]
+): { date: string; mwrrPct: number }[] => {
+  if (history.length === 0) return [];
+
+  const startDate = history[0].date;
+  const endDate = history[history.length - 1].date;
+  const cashflowsAll = buildMwrrCashflows(transactions);
+  const hasBeforeStart = cashflowsAll.some(cf => cf.date < startDate);
+  const cashflowsInRange = cashflowsAll.filter(cf => cf.date >= startDate && cf.date <= endDate);
+
+  const startValue = history[0].value || 0;
+  const startNetFlow = cashflowsInRange
+    .filter(cf => cf.date === startDate)
+    .reduce((sum, cf) => sum + cf.amount, 0);
+  const initialAmount = startValue - startNetFlow;
+  const initialFlow = hasBeforeStart && initialAmount > 0
+    ? { date: startDate, amount: -initialAmount }
+    : null;
+
+  const flowsSorted = [...cashflowsInRange].sort((a, b) => a.date.localeCompare(b.date));
+  const activeFlows: Cashflow[] = initialFlow ? [initialFlow] : [];
+  let flowIdx = 0;
+
+  return history.map(point => {
+    while (flowIdx < flowsSorted.length && flowsSorted[flowIdx].date <= point.date) {
+      activeFlows.push(flowsSorted[flowIdx]);
+      flowIdx += 1;
+    }
+    if (point.date === startDate) {
+      return { date: point.date, mwrrPct: 0 };
+    }
+    const irrFlows = [...activeFlows, { date: point.date, amount: point.value }];
+    const rate = computeXIRR(irrFlows);
+    return { date: point.date, mwrrPct: rate !== null ? rate * 100 : 0 };
+  });
+};
+
 export const calculateHistoricalPerformance = (
   transactions: Transaction[],
   instruments: Instrument[],
@@ -270,11 +630,8 @@ export const calculateHistoricalPerformance = (
   const uniqueInstruments = Array.from(
     new Map(instruments.map(inst => [inst.ticker, inst])).values()
   );
-
-  const end = new Date();
-  const firstTx = transactions.length > 0 ? transactions[transactions.length - 1].date : new Date();
-  let start = subMonths(startOfMonth(end), monthsBack);
-  if (firstTx < start) start = startOfMonth(firstTx);
+  const canonicalByTicker = new Map(uniqueInstruments.map(inst => [inst.ticker, getCanonicalTicker(inst)]));
+  void monthsBack;
 
   const history: PerformancePoint[] = [];
   const assetHistory: Record<string, { date: string, pct: number }[]> = {};
@@ -284,6 +641,27 @@ export const calculateHistoricalPerformance = (
   Object.values(AssetType).forEach(t => assetHistory[t] = []);
   Object.values(Currency).forEach(c => currencyHistory[c] = []);
 
+  if (transactions.length === 0) {
+    return { history, assetHistory, currencyHistory };
+  }
+
+  const bounds = getPortfolioDateBounds(transactions, prices, instruments);
+  if (!bounds.effectiveStartDate) {
+    return { history, assetHistory, currencyHistory };
+  }
+
+  const today = new Date();
+  const lastPriceDate = bounds.lastPriceDate ? toDateSafe(bounds.lastPriceDate) : null;
+  let end = lastPriceDate && lastPriceDate <= today ? lastPriceDate : today;
+  let start = toDateSafe(bounds.effectiveStartDate);
+  if (granularity === 'monthly') {
+    start = startOfMonth(start);
+  }
+  if (end < start) end = start;
+
+  const externalFlows = buildExternalFlows(transactions, granularity);
+  const trackCash = transactions.some(t => t.type === TransactionType.Deposit || t.type === TransactionType.Withdrawal);
+
   if (granularity === 'monthly') {
     const months = eachMonthOfInterval({ start, end });
 
@@ -291,12 +669,13 @@ export const calculateHistoricalPerformance = (
       const dateStr = format(endOfMonth(date), 'yyyy-MM-dd');
 
       const txUntilNow = transactions.filter(t => {
-        const d = toDate(t.date);
+        const d = toDateSafe(t.date);
         return isValid(d) && format(d, 'yyyy-MM-dd') <= dateStr;
       });
 
       const holdingsMap = new Map<string, number>();
       let investedAtDate = 0;
+      let cashAtDate = 0;
 
       txUntilNow.forEach(t => {
         const qty = t.quantity || 0;
@@ -313,6 +692,15 @@ export const calculateHistoricalPerformance = (
         if (t.type === TransactionType.Sell) investedAtDate -= ((qty * price) - fees);
         if (t.type === TransactionType.Deposit) investedAtDate += (t.quantity || 0);
         if (t.type === TransactionType.Withdrawal) investedAtDate -= (t.quantity || 0);
+
+        if (trackCash) {
+          if (t.type === TransactionType.Buy) cashAtDate -= (qty * price) + fees;
+          if (t.type === TransactionType.Sell) cashAtDate += (qty * price) - fees;
+          if (t.type === TransactionType.Deposit) cashAtDate += (t.quantity || 0);
+          if (t.type === TransactionType.Withdrawal) cashAtDate -= (t.quantity || 0);
+          if (t.type === TransactionType.Dividend) cashAtDate += (t.quantity || 0);
+          if (t.type === TransactionType.Fee) cashAtDate -= (fees || 0);
+        }
       });
 
       let totalValueAtDate = 0;
@@ -321,7 +709,9 @@ export const calculateHistoricalPerformance = (
 
       holdingsMap.forEach((qty, ticker) => {
         if (qty <= 0.000001) return;
-        const price = getPriceWithFallback(ticker, dateStr, prices, txPriceMap);
+        const priceTicker = canonicalByTicker.get(ticker) || ticker;
+        const price = getPriceWithFallback(priceTicker, dateStr, prices, txPriceMap, ticker);
+        if (price <= 0) return;
         const val = qty * price;
         totalValueAtDate += val;
 
@@ -332,22 +722,23 @@ export const calculateHistoricalPerformance = (
         }
       });
 
-      const cumulativeReturnPct = investedAtDate > 0 ? ((totalValueAtDate / investedAtDate) - 1) * 100 : 0;
+      const navValue = totalValueAtDate + (trackCash ? cashAtDate : 0);
+      const cumulativeReturnPct = investedAtDate > 0 ? ((navValue / investedAtDate) - 1) * 100 : 0;
 
       let periodReturn = 0;
       if (idx > 0 && history[idx - 1].value > 0) {
-        periodReturn = ((totalValueAtDate / history[idx - 1].value) - 1) * 100;
+        periodReturn = ((navValue / history[idx - 1].value) - 1) * 100;
       }
 
       const prevTWRRIndex = idx > 0 ? (history[idx - 1].cumulativeTWRRIndex || 1) : 1;
       const currentTWRRIndex = prevTWRRIndex * (1 + (periodReturn / 100));
 
-    history.push({
-      date: format(date, 'yyyy-MM-dd'),
-      value: totalValueAtDate,
-      invested: investedAtDate,
-      monthlyReturnPct: periodReturn,
-      cumulativeReturnPct: cumulativeReturnPct,
+      history.push({
+        date: dateStr,
+        value: navValue,
+        invested: investedAtDate,
+        monthlyReturnPct: periodReturn,
+        cumulativeReturnPct: cumulativeReturnPct,
         cumulativeTWRRIndex: currentTWRRIndex
       });
 
@@ -364,7 +755,8 @@ export const calculateHistoricalPerformance = (
 
     });
 
-    return { history, assetHistory, currencyHistory };
+    const twrrHistory = computeTWRRFromNav(history, externalFlows);
+    return { history: twrrHistory, assetHistory, currencyHistory };
   }
 
   // DAILY PATH
@@ -375,7 +767,7 @@ export const calculateHistoricalPerformance = (
   const txByTicker = new Map<string, Transaction[]>();
   transactions
     .slice()
-    .sort((a, b) => toDate(a.date).getTime() - toDate(b.date).getTime())
+    .sort((a, b) => toDateSafe(a.date).getTime() - toDateSafe(b.date).getTime())
     .forEach(t => {
       if (!t.instrumentTicker) return;
       const arr = txByTicker.get(t.instrumentTicker) || [];
@@ -396,54 +788,58 @@ export const calculateHistoricalPerformance = (
     });
 
   const runningQty = new Map<string, number>();
-  const txPtr = new Map<string, number>();
   const pricePtr = new Map<string, number>();
   const lastClose = new Map<string, number>();
   let investedRunning = 0;
   let cashRunning = 0;
+  const startDateStr = format(start, 'yyyy-MM-dd');
 
-  // Precompute cashflows esterni (Deposit/Withdrawal) per TWRR/MWRR
-  const externalFlows: { date: string; amount: number }[] = [];
+  const applyTransactionToRunning = (t: Transaction) => {
+    const qty = t.quantity || 0;
+    const price = t.price || 0;
+    const fees = t.fees || 0;
+
+    if (t.instrumentTicker) {
+      const current = runningQty.get(t.instrumentTicker) || 0;
+      if (t.type === TransactionType.Buy) runningQty.set(t.instrumentTicker, current + qty);
+      else if (t.type === TransactionType.Sell) runningQty.set(t.instrumentTicker, current - qty);
+    }
+
+    if (t.type === TransactionType.Buy) {
+      investedRunning += (qty * price) + fees;
+      if (trackCash) cashRunning -= (qty * price) + fees;
+    }
+    if (t.type === TransactionType.Sell) {
+      investedRunning -= ((qty * price) - fees);
+      if (trackCash) cashRunning += (qty * price) - fees;
+    }
+    if (t.type === TransactionType.Deposit) {
+      investedRunning += (t.quantity || 0);
+      if (trackCash) cashRunning += (t.quantity || 0);
+    }
+    if (t.type === TransactionType.Withdrawal) {
+      investedRunning -= (t.quantity || 0);
+      if (trackCash) cashRunning -= (t.quantity || 0);
+    }
+    if (t.type === TransactionType.Dividend) {
+      if (trackCash) cashRunning += (t.quantity || 0);
+    }
+    if (t.type === TransactionType.Fee) {
+      if (trackCash) cashRunning -= fees;
+    }
+  };
+
   transactions.forEach(t => {
-    const d = format(toDate(t.date), 'yyyy-MM-dd');
-    if (t.type === TransactionType.Deposit) externalFlows.push({ date: d, amount: t.quantity || 0 });
-    if (t.type === TransactionType.Withdrawal) externalFlows.push({ date: d, amount: -(t.quantity || 0) });
+    const tDateStr = toDateString(t.date);
+    if (tDateStr < startDateStr) applyTransactionToRunning(t);
   });
 
   dateIndex.forEach((dateStr, idx) => {
     // apply transactions for the day (all tickers)
     transactions.forEach(t => {
-      const tDateStr = format(toDate(t.date), 'yyyy-MM-dd');
+      const tDateStr = toDateString(t.date);
       if (tDateStr !== dateStr) return;
-      const qty = t.quantity || 0;
-      const price = t.price || 0;
-      const fees = t.fees || 0;
-
-      if (t.instrumentTicker) {
-        const current = runningQty.get(t.instrumentTicker) || 0;
-        if (t.type === TransactionType.Buy) runningQty.set(t.instrumentTicker, current + qty);
-        else if (t.type === TransactionType.Sell) runningQty.set(t.instrumentTicker, current - qty);
-      }
-
-      if (t.type === TransactionType.Buy) {
-        investedRunning += (qty * price) + fees;
-        cashRunning -= (qty * price) + fees;
-      }
-      if (t.type === TransactionType.Sell) {
-        investedRunning -= ((qty * price) - fees);
-        cashRunning += (qty * price) - fees;
-      }
-      if (t.type === TransactionType.Deposit) {
-        investedRunning += (t.quantity || 0);
-        cashRunning += (t.quantity || 0);
-      }
-      if (t.type === TransactionType.Withdrawal) {
-        investedRunning -= (t.quantity || 0);
-        cashRunning -= (t.quantity || 0);
-      }
-      if (t.type === TransactionType.Fee) {
-        cashRunning -= fees;
-      }
+      applyTransactionToRunning(t);
     });
 
     let totalValueAtDate = 0;
@@ -452,25 +848,32 @@ export const calculateHistoricalPerformance = (
 
     uniqueInstruments.forEach(instr => {
       const ticker = instr.ticker;
+      const priceTicker = canonicalByTicker.get(ticker) || ticker;
       const qty = runningQty.get(ticker) || 0;
       if (qty <= 0.000001) return;
 
-      const pArr = priceMap.get(ticker) || [];
-      const pIdx = pricePtr.get(ticker) || 0;
+      const pArr = priceMap.get(priceTicker) || [];
+      const pIdx = pricePtr.get(priceTicker) || 0;
       let i = pIdx;
       while (i < pArr.length && pArr[i].date <= dateStr) {
-        lastClose.set(ticker, pArr[i].close);
+        lastClose.set(priceTicker, pArr[i].close);
         i++;
       }
-      pricePtr.set(ticker, i);
-      const price = lastClose.get(ticker) ?? 0;
+      pricePtr.set(priceTicker, i);
+      let price = lastClose.get(priceTicker);
+      if (price === undefined) {
+        const txArr = txPriceMap.get(ticker);
+        const latestTx = txArr?.find(tx => tx.dateStr <= dateStr);
+        price = latestTx ? latestTx.price : 0;
+      }
+      if (price <= 0) return;
       const val = qty * price;
       totalValueAtDate += val;
       assetValues[instr.type] = (assetValues[instr.type] || 0) + val;
       currencyValues[instr.currency] = (currencyValues[instr.currency] || 0) + val;
     });
 
-    const nav = totalValueAtDate + cashRunning;
+    const nav = totalValueAtDate + (trackCash ? cashRunning : 0);
 
     let periodReturn = 0;
     if (idx > 0 && history[idx - 1].value > 0) {
@@ -501,7 +904,8 @@ export const calculateHistoricalPerformance = (
     });
   });
 
-  return { history, assetHistory, currencyHistory };
+  const twrrHistory = computeTWRRFromNav(history, externalFlows);
+  return { history: twrrHistory, assetHistory, currencyHistory };
 };
 
 // --- NEW ANALYTICS HELPERS ---
@@ -527,37 +931,41 @@ export const calculateAnalytics = (history: PerformancePoint[], granularity: Gra
     };
   }
 
-  // 1. Annual Returns
-  const returnsByYear: Record<number, number[]> = {};
+  const getIndex = (p: PerformancePoint) => p.cumulativeTWRRIndex && p.cumulativeTWRRIndex > 0
+    ? p.cumulativeTWRRIndex
+    : (p.value > 0 ? p.value : 0);
 
-  if (granularity === 'daily') {
-    // group by year using start/end value
-    const byYearValue: Record<number, { start?: number; end?: number }> = {};
-    history.forEach(p => {
-      const y = getYear(new Date(p.date));
-      if (!byYearValue[y]) byYearValue[y] = {};
-      if (byYearValue[y].start === undefined) byYearValue[y].start = p.value;
-      byYearValue[y].end = p.value;
-    });
-    Object.entries(byYearValue).forEach(([y, v]) => {
-      if (v.start && v.end) {
-        const ret = v.start > 0 ? (v.end / v.start) - 1 : 0;
-        returnsByYear[+y] = [ret];
+  const buildPeriodReturns = (points: PerformancePoint[]) => {
+    const returns: number[] = [];
+    for (let i = 1; i < points.length; i++) {
+      const prevIdx = getIndex(points[i - 1]);
+      const currIdx = getIndex(points[i]);
+      if (prevIdx > 0 && currIdx > 0) {
+        returns.push((currIdx / prevIdx) - 1);
       }
-    });
-  } else {
-    history.forEach(p => {
-      const y = getYear(new Date(p.date));
-      if (!returnsByYear[y]) returnsByYear[y] = [];
-      returnsByYear[y].push(p.monthlyReturnPct / 100);
-    });
-  }
+    }
+    return returns;
+  };
 
-  const annualReturns = Object.entries(returnsByYear).map(([year, returns]) => {
-    if (returns.length === 0) return { year: parseInt(year), returnPct: 0 };
-    const compound = returns.reduce((acc, r) => acc * (1 + r), 1) - 1;
-    return { year: parseInt(year), returnPct: compound * 100 };
+  // 1. Annual Returns (calendar-year performance)
+  const yearlyRanges: Record<number, { start: PerformancePoint; end: PerformancePoint }> = {};
+  history.forEach(point => {
+    const year = getYear(new Date(point.date));
+    if (!yearlyRanges[year]) {
+      yearlyRanges[year] = { start: point, end: point };
+    } else {
+      yearlyRanges[year].end = point;
+    }
   });
+
+  const annualReturns = Object.entries(yearlyRanges)
+    .map(([year, range]) => {
+      const startIdx = getIndex(range.start);
+      const endIdx = getIndex(range.end);
+      const returnPct = startIdx > 0 ? ((endIdx / startIdx) - 1) * 100 : 0;
+      return { year: parseInt(year, 10), returnPct };
+    })
+    .sort((a, b) => a.year - b.year);
 
   // 2. Drawdowns
   let maxPeak = -Infinity;
@@ -570,7 +978,7 @@ export const calculateAnalytics = (history: PerformancePoint[], granularity: Gra
   });
 
   const lastPoint = history[history.length - 1];
-  const firstPoint = history.find(h => h.value > 0) || history[0];
+  const firstPoint = history.find(h => getIndex(h) > 0) || history[0];
 
   if (!lastPoint || !firstPoint) {
     return {
@@ -586,38 +994,38 @@ export const calculateAnalytics = (history: PerformancePoint[], granularity: Gra
   let annualizedReturn = 0;
   let stdDevAnnualized = 0;
   let sharpeRatio = 0;
+  const startIndex = getIndex(firstPoint);
+  const endIndex = getIndex(lastPoint);
 
   if (granularity === 'daily') {
-    const returns = history
-      .map((p, i) => i === 0 ? null : (history[i - 1].value > 0 ? (p.value / history[i - 1].value) - 1 : null))
-      .filter((r): r is number => r !== null);
+    const returns = buildPeriodReturns(history);
     const mean = returns.reduce((a, b) => a + b, 0) / (returns.length || 1);
     const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (returns.length || 1);
     const stdDaily = Math.sqrt(variance);
     stdDevAnnualized = stdDaily * Math.sqrt(252);
 
     const days = differenceInCalendarDays(new Date(lastPoint.date), new Date(firstPoint.date)) || 1;
-    annualizedReturn = firstPoint.value > 0
-      ? (Math.pow(lastPoint.value / firstPoint.value, 365.25 / days) - 1) * 100
+    annualizedReturn = startIndex > 0
+      ? Math.pow(endIndex / startIndex, 365.25 / days) - 1
       : 0;
 
     const rf = 0.02;
-    sharpeRatio = stdDevAnnualized > 0 ? ((mean * 252 * 100) - (rf * 100)) / stdDevAnnualized : 0;
+    sharpeRatio = stdDevAnnualized > 0 ? ((mean * 252) - rf) / stdDevAnnualized : 0;
   } else {
     const monthsCount = history.filter(h => h.value > 0).length;
-    const totalTWRRGrowth = lastPoint.cumulativeTWRRIndex || 1;
+    const totalTWRRGrowth = startIndex > 0 ? (endIndex / startIndex) : 1;
     const years = monthsCount / 12;
     annualizedReturn = years > 0
-      ? (Math.pow(totalTWRRGrowth, 1 / years) - 1) * 100
+      ? Math.pow(totalTWRRGrowth, 1 / years) - 1
       : 0;
 
-    const returns = history.map(h => h.monthlyReturnPct);
+    const returns = buildPeriodReturns(history);
     const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
     const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
     const stdDevMonthly = Math.sqrt(variance);
     stdDevAnnualized = stdDevMonthly * Math.sqrt(12);
 
-    const rf = 2;
+    const rf = 0.02;
     sharpeRatio = stdDevAnnualized > 0 ? (annualizedReturn - rf) / stdDevAnnualized : 0;
   }
 
@@ -625,10 +1033,21 @@ export const calculateAnalytics = (history: PerformancePoint[], granularity: Gra
     annualReturns,
     maxDrawdown: maxDrawdown * 100,
     drawdownSeries,
-    annualizedReturn,
-    stdDev: stdDevAnnualized,
+    annualizedReturn: annualizedReturn * 100,
+    stdDev: stdDevAnnualized * 100,
     sharpeRatio
   };
+};
+
+export const downsampleHistoryToMonthly = (history: PerformancePoint[]): PerformancePoint[] => {
+  if (!history.length) return [];
+  const sorted = [...history].sort((a, b) => a.date.localeCompare(b.date));
+  const map = new Map<string, PerformancePoint>();
+  sorted.forEach(point => {
+    const key = point.date.slice(0, 7);
+    map.set(key, point);
+  });
+  return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
 };
 
 export const calculateRebalancing = (
@@ -685,7 +1104,7 @@ const regionFallbackFromISIN = (isin?: string): RegionKey | null => {
   const prefix = isin.slice(0, 2).toUpperCase();
   if (prefix === 'CH') return 'CH';
   if (prefix === 'US') return 'NA';
-  if (prefix === 'GB') return 'EU'; // UK -> Europa per semplicità
+  if (prefix === 'GB') return 'EU'; // UK -> Europa per semplicita
   if (['IE', 'LU', 'FR', 'DE', 'NL', 'ES', 'IT', 'BE', 'DK', 'SE', 'FI', 'NO', 'PT', 'AT'].includes(prefix)) return 'EU';
   if (['JP', 'CN', 'HK', 'KR', 'SG', 'IN', 'TW'].includes(prefix)) return 'AS';
   if (['AU', 'NZ'].includes(prefix)) return 'OC';
@@ -746,7 +1165,37 @@ export const calculateRegionExposure = (
     pct: totalValue > 0 ? (value / totalValue) * 100 : 0
   })).sort((a, b) => b.value - a.value);
 
-  return entries;
+  const unassigned = entries.find(e => e.region === 'UNASSIGNED');
+  const explicitOther = entries.find(e => e.region === 'OTHER');
+  const assigned = entries.filter(e => e.region !== 'UNASSIGNED' && e.region !== 'OTHER');
+
+  const maxItems = 8;
+  const minPct = 2;
+  const major: typeof assigned = [];
+  const minor: typeof assigned = [];
+
+  assigned.forEach((entry, idx) => {
+    if (entry.pct < minPct || idx >= maxItems) minor.push(entry);
+    else major.push(entry);
+  });
+
+  if (explicitOther) minor.push(explicitOther);
+
+  const minorValue = minor.reduce((sum, item) => sum + item.value, 0);
+  if (minorValue > 0) {
+    major.push({
+      region: 'OTHER',
+      label: getRegionLabel('OTHER'),
+      value: minorValue,
+      pct: totalValue > 0 ? (minorValue / totalValue) * 100 : 0
+    });
+  }
+
+  if (unassigned) {
+    major.push(unassigned);
+  }
+
+  return major;
 };
 
 export const calculateAllocationByAssetClass = (
@@ -782,3 +1231,5 @@ export const calculateAllocationByAssetClass = (
   }
   return major;
 };
+
+

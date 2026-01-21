@@ -1,5 +1,5 @@
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { Rnd } from 'react-rnd';
 import { format } from 'date-fns';
@@ -26,10 +26,10 @@ import {
   calculateHistoricalPerformance,
   calculatePortfolioState,
   calculateAllocationByAssetClass,
-  calculateRegionExposure
+  calculateRegionExposure,
+  computeMwrrSeries
 } from '../services/financeUtils';
 import { MACRO_ZONES, COLORS, CARD_BG, CARD_TEXT, PRIMARY_BLUE, ACCENT_ORANGE } from '../constants';
-import { useElementSize } from '../hooks/useElementSize';
 import '../report.css';
 import {
   ReportLayout,
@@ -43,8 +43,7 @@ import {
 import { PortfolioPosition } from '../types';
 
 const MM_PER_PX = 25.4 / 96;
-const mmToPx = (mm: number) => mm / MM_PER_PX;
-const pxToMm = (px: number) => px * MM_PER_PX;
+const BASE_PX_PER_MM = 1 / MM_PER_PX;
 const STORAGE_KEY_BASE = 'investi.report.layout.v1';
 
 type LayoutName = 'a' | 'b';
@@ -126,7 +125,13 @@ export const Report: React.FC = () => {
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
   const [textDraft, setTextDraft] = useState('');
   const [selectedWidget, setSelectedWidget] = useState<{ pageId: string; widgetId: string } | null>(null);
-  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const draggingIdRef = useRef<string | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const [pxPerMm, setPxPerMm] = useState(BASE_PX_PER_MM);
+  const [canvasScale, setCanvasScale] = useState(1);
+
+  const dims = getCanvasSize(layout.page);
+  const { canvasW: canvasWmm, canvasH: canvasHmm, pageW: pageWmm, pageH: pageHmm, orientation } = dims;
 
 
   const [snapEnabled, setSnapEnabled] = useState(true);
@@ -206,13 +211,19 @@ export const Report: React.FC = () => {
     }));
   }, [rawTrends]);
 
+  const mwrrSeries = useMemo(() => {
+    if (!rawTrends || !transactions) return [];
+    return computeMwrrSeries(rawTrends.history, transactions);
+  }, [rawTrends, transactions]);
+
   const mwrrData = useMemo(() => {
     if (!rawTrends) return [];
+    const map = new Map(mwrrSeries.map((point: { date: string; mwrrPct: number }) => [point.date, point.mwrrPct]));
     return rawTrends.history.map(h => ({
       displayDate: format(new Date(h.date), 'MMM yy'),
-      mwrr: h.invested > 0 ? ((h.value - h.invested) / h.invested) * 100 : 0
+      mwrr: map.get(h.date) ?? 0
     }));
-  }, [rawTrends]);
+  }, [rawTrends, mwrrSeries]);
 
   const twrrHasData = twrrData.length > 0 && twrrData.some(d => Number.isFinite(d.twrr));
   const mwrrHasData = mwrrData.length > 0 && mwrrData.some(d => Number.isFinite(d.mwrr));
@@ -311,7 +322,47 @@ export const Report: React.FC = () => {
     };
   }, []);
 
-  const { canvasW, canvasH, pageW, pageH, orientation } = useMemo(() => getCanvasSize(layout.page), [layout.page]);
+  // Observed drag offset/jitter when canvas is scaled/zoomed; derive px-per-mm and scale from the live canvas size.
+  useLayoutEffect(() => {
+    const el = canvasRef.current;
+    if (!el || canvasWmm <= 0) return;
+
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      const clientWidth = el.clientWidth;
+      if (!Number.isFinite(rect.width) || rect.width <= 0 || !Number.isFinite(clientWidth) || clientWidth <= 0) {
+        return;
+      }
+
+      const nextScale = rect.width / clientWidth;
+      const nextPxPerMm = clientWidth / canvasWmm;
+
+      if (draggingIdRef.current) return;
+
+      if (Number.isFinite(nextPxPerMm) && nextPxPerMm > 0) {
+        setPxPerMm(prev => (Math.abs(prev - nextPxPerMm) > 0.0001 ? nextPxPerMm : prev));
+      }
+
+      if (Number.isFinite(nextScale) && nextScale > 0) {
+        setCanvasScale(prev => (Math.abs(prev - nextScale) > 0.0001 ? nextScale : prev));
+      }
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    window.addEventListener('resize', measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [canvasWmm, activePageId, orientation, designer]);
+
+  const safePxPerMm = Number.isFinite(pxPerMm) && pxPerMm > 0 ? pxPerMm : BASE_PX_PER_MM;
+  const safeCanvasScale = Number.isFinite(canvasScale) && canvasScale > 0 ? canvasScale : 1;
+  const mmToPx = (mm: number) => mm * safePxPerMm;
+  const pxToMm = (px: number) => px / safePxPerMm;
+
   const marginMm = layout.page.marginMm ?? 8;
   const headerMm = layout.page.headerMm ?? 14;
   const footerMm = layout.page.footerMm ?? 10;
@@ -320,8 +371,8 @@ export const Report: React.FC = () => {
   const clampToCanvasMm = (xMm: number, yMm: number, widget: Widget, size?: { w: number; h: number }) => {
     const width = size?.w ?? widget.w;
     const height = size?.h ?? widget.h;
-    const maxX = Math.max(0, canvasW - width);
-    const maxY = Math.max(0, canvasH - height);
+    const maxX = Math.max(0, canvasWmm - width);
+    const maxY = Math.max(0, canvasHmm - height);
     return {
       x: Math.max(0, Math.min(xMm, maxX)),
       y: Math.max(0, Math.min(yMm, maxY))
@@ -425,8 +476,8 @@ export const Report: React.FC = () => {
     const clone: Widget = {
       ...widget,
       id: `${widget.id}-${Date.now()}`,
-      x: Math.min(widget.x + 5, canvasW - widget.w),
-      y: Math.min(widget.y + 5, canvasH - widget.h)
+      x: Math.min(widget.x + 5, canvasWmm - widget.w),
+      y: Math.min(widget.y + 5, canvasHmm - widget.h)
     };
     applyLayout({
       ...layout,
@@ -752,8 +803,8 @@ export const Report: React.FC = () => {
   type WidgetCardProps = {
     widget: Widget;
     pageId: string;
-    canvasW: number;
-    canvasH: number;
+    canvasWmm: number;
+    canvasHmm: number;
     isEditable: boolean;
     isSelected: boolean;
     isEditing?: boolean;
@@ -764,40 +815,62 @@ export const Report: React.FC = () => {
   const WidgetCard: React.FC<WidgetCardProps> = ({
     widget,
     pageId,
-    canvasW,
-    canvasH,
+    canvasWmm,
+    canvasHmm,
     isEditable,
     isSelected,
     isEditing = false,
     onSelect,
     onDoubleClick
   }) => {
+    const isDev = import.meta.env.DEV;
     // Local state for controlled Rnd to ensure smooth drag/resize without full layout re-renders
-    const [localDim, setLocalDim] = useState({
+    const [localDim, setLocalDim] = useState(() => ({
       x: mmToPx(widget.x),
       y: mmToPx(widget.y),
       width: mmToPx(widget.w),
       height: mmToPx(widget.h)
-    });
-
+    }));
+    const rafRef = useRef<number | null>(null);
+    const lastDragLogRef = useRef(0);
     // Sync local state when widget props change (e.g. undo/redo or external update)
     useEffect(() => {
+      if (draggingIdRef.current === widget.id) return;
       setLocalDim({
         x: mmToPx(widget.x),
         y: mmToPx(widget.y),
         width: mmToPx(widget.w),
         height: mmToPx(widget.h)
       });
-    }, [widget.x, widget.y, widget.w, widget.h]);
+    }, [widget.x, widget.y, widget.w, widget.h, pxPerMm, widget.id]);
+    useEffect(() => {
+      return () => {
+        if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      };
+    }, []);
 
-    const snapPx = Math.max(1, mmToPx(snapStepMm));
-    const grid: [number, number] = snapEnabled ? [snapPx, snapPx] : [1, 1];
+    const setLocalDimRaf = (next: (prev: typeof localDim) => typeof localDim) => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(() => {
+        setLocalDim(prev => next(prev));
+      });
+    };
+
+    const snapStep = Math.max(1, snapStepMm);
+    const snapMmValue = (value: number) =>
+      snapEnabled ? Math.round(value / snapStep) * snapStep : value;
     const isText = widget.type === 'text';
     const widgetType = normalizeWidgetType(
       typeof widget.props?.widgetType === 'string' ? widget.props.widgetType : widget.id
     );
 
-    const showOut = widget.x < 0 || widget.y < 0 || widget.x + widget.w > canvasW || widget.y + widget.h > canvasH;
+    const showOut = widget.x < 0 || widget.y < 0 || widget.x + widget.w > canvasWmm || widget.y + widget.h > canvasHmm;
+    const posPx = {
+      x: localDim.x,
+      y: localDim.y,
+      width: localDim.width,
+      height: localDim.height
+    };
 
     const handleSelect = () => {
       onSelect?.();
@@ -809,10 +882,33 @@ export const Report: React.FC = () => {
         style={{ width: '100%', height: '100%' }}
         onClick={handleSelect}
         onDoubleClick={onDoubleClick}
-        onContextMenu={isEditable ? (event: React.MouseEvent) => event.preventDefault() : undefined}
+        onContextMenu={isEditable ? (event: React.MouseEvent<HTMLDivElement>) => event.preventDefault() : undefined}
         title={isEditable ? 'Trascina con tasto sinistro' : undefined}
       >
         {renderBadgeWarning(showOut)}
+
+        {isEditable && !widget.locked && !isEditing && (
+          <div
+            className="widget-drag-handle no-print"
+            style={{
+              cursor: 'move',
+              userSelect: 'none',
+              fontSize: 12,
+              padding: '4px 6px',
+              opacity: 0.85,
+              borderBottom: '1px solid #e2e8f0',
+              background: '#f8fafc'
+            }}
+            title="Trascina"
+            onMouseDown={(event: React.MouseEvent<HTMLDivElement>) => {
+              if (isDev) {
+                console.log('[Report] HANDLE_DOWN', widget.id, event.button);
+              }
+            }}
+          >
+            {widget.type ?? 'widget'}
+          </div>
+        )}
 
         {isEditable && (
           <button
@@ -829,7 +925,7 @@ export const Report: React.FC = () => {
             x
           </button>
         )}
-        <div className="card-inner">
+        <div className="card-inner no-drag">
           {!isText && <h3>{titleMap[widgetType] ?? widget.id.toUpperCase()}</h3>}
           <WidgetContent widget={widget} />
         </div>
@@ -849,28 +945,44 @@ export const Report: React.FC = () => {
         data-widget-id={widget.id}
         enableResizing={isEditable && !widget.locked && !isEditing}
         disableDragging={!isEditable || widget.locked || isEditing}
-        bounds="parent" // Ensure drag stays within parent container
-        cancel=".no-drag, button, .widget-remove"
-        onContextMenu={isEditable ? (event: React.MouseEvent) => event.preventDefault() : undefined}
+        bounds="parent" // Keep bounds tied to the local canvas wrapper
+        scale={safeCanvasScale}
+        dragHandleClassName="widget-drag-handle"
+        cancel=".no-drag, button, .widget-remove, input, textarea, select, option, a, .widget-controls"
+        onContextMenu={isEditable ? (event: MouseEvent) => event.preventDefault() : undefined}
+        onMouseDown={(event: MouseEvent) => {
+          if (isDev) {
+            console.log('[Report] RND_DOWN', widget.id, event.button);
+          }
+        }}
 
         onDragStart={(event: any) => {
           if ('button' in event && event.button !== 0) return;
-          setDraggingId(widget.id);
-          handleSelect();
+          draggingIdRef.current = widget.id;
+          if (isDev) {
+            console.log('[Report] DRAG_START', widget.id);
+          }
         }}
 
-        onDrag={(e, d) => {
-          setLocalDim(prev => ({ ...prev, x: d.x, y: d.y }));
+        onDrag={(_e, d) => {
+          setLocalDimRaf(prev => ({ ...prev, x: d.x, y: d.y }));
+          if (isDev) {
+            const now = Date.now();
+            if (now - lastDragLogRef.current > 200) {
+              lastDragLogRef.current = now;
+              console.log('[Report] DRAG', widget.id, d.x, d.y);
+            }
+          }
         }}
 
         onDragStop={(event: any, data) => {
           if ('button' in event && event.button !== 0) return;
 
-          const nextX = pxToMm(data.x);
-          const nextY = pxToMm(data.y);
+          const nextX = snapMmValue(pxToMm(data.x));
+          const nextY = snapMmValue(pxToMm(data.y));
           // Use current localDim for size to be safe
-          const currentW_mm = pxToMm(localDim.width);
-          const currentH_mm = pxToMm(localDim.height);
+          const currentW_mm = snapMmValue(pxToMm(localDim.width));
+          const currentH_mm = snapMmValue(pxToMm(localDim.height));
 
           const clamped = clampToCanvasMm(nextX, nextY, widget, { w: currentW_mm, h: currentH_mm });
 
@@ -882,28 +994,29 @@ export const Report: React.FC = () => {
           }));
 
           updateWidget(pageId, widget.id, w => ({ ...w, x: clamped.x, y: clamped.y }), { immediate: true });
-          setDraggingId(null);
+          handleSelect();
+          draggingIdRef.current = null;
         }}
 
         onResizeStart={() => {
-          setDraggingId(widget.id);
+          draggingIdRef.current = widget.id;
         }}
 
-        onResize={(e, dir, ref, delta, position) => {
-          setLocalDim({
+        onResize={(_e, _dir, ref, _delta, position) => {
+          setLocalDimRaf(() => ({
             x: position.x,
             y: position.y,
             width: ref.offsetWidth,
             height: ref.offsetHeight
-          });
+          }));
         }}
 
         onResizeStop={(_e, _dir, refEl, _delta, position) => {
-          setDraggingId(null);
-          const nextW = pxToMm(refEl.offsetWidth);
-          const nextH = pxToMm(refEl.offsetHeight);
-          const nextX = pxToMm(position.x);
-          const nextY = pxToMm(position.y);
+          draggingIdRef.current = null;
+          const nextW = Math.max(widget.minW ?? 25, snapMmValue(pxToMm(refEl.offsetWidth)));
+          const nextH = Math.max(widget.minH ?? 20, snapMmValue(pxToMm(refEl.offsetHeight)));
+          const nextX = snapMmValue(pxToMm(position.x));
+          const nextY = snapMmValue(pxToMm(position.y));
           const clamped = clampToCanvasMm(nextX, nextY, widget, { w: nextW, h: nextH });
 
           updateWidget(
@@ -912,14 +1025,15 @@ export const Report: React.FC = () => {
             w => ({ ...w, x: clamped.x, y: clamped.y, w: nextW, h: nextH }),
             { immediate: true }
           );
+          handleSelect();
         }}
-        dragGrid={grid}
-        resizeGrid={grid}
         minWidth={mmToPx(widget.minW ?? 25)}
         minHeight={mmToPx(widget.minH ?? 20)}
         style={{
           zIndex: isSelected ? 8 : widget.type === 'text' ? 6 : 5,
-          cursor: 'grab'
+          cursor: 'grab',
+          ['--rnd-x' as unknown as string]: `${posPx.x}px`,
+          ['--rnd-y' as unknown as string]: `${posPx.y}px`
         }}
       >
         {card}
@@ -971,8 +1085,8 @@ export const Report: React.FC = () => {
 
   const nudgeSelected = (dx: number, dy: number) => {
     if (!selectedInfo) return;
-    const nextX = Math.max(0, Math.min(selectedInfo.x + dx, canvasW - selectedInfo.w));
-    const nextY = Math.max(0, Math.min(selectedInfo.y + dy, canvasH - selectedInfo.h));
+    const nextX = Math.max(0, Math.min(selectedInfo.x + dx, canvasWmm - selectedInfo.w));
+    const nextY = Math.max(0, Math.min(selectedInfo.y + dy, canvasHmm - selectedInfo.h));
     updateSelectedWidget(w => ({ ...w, x: nextX, y: nextY }));
   };
 
@@ -981,11 +1095,11 @@ export const Report: React.FC = () => {
     let nextX = selectedInfo.x;
     let nextY = selectedInfo.y;
     if (mode === 'left') nextX = 0;
-    if (mode === 'center') nextX = (canvasW - selectedInfo.w) / 2;
-    if (mode === 'right') nextX = canvasW - selectedInfo.w;
+    if (mode === 'center') nextX = (canvasWmm - selectedInfo.w) / 2;
+    if (mode === 'right') nextX = canvasWmm - selectedInfo.w;
     if (mode === 'top') nextY = 0;
-    if (mode === 'middle') nextY = (canvasH - selectedInfo.h) / 2;
-    if (mode === 'bottom') nextY = canvasH - selectedInfo.h;
+    if (mode === 'middle') nextY = (canvasHmm - selectedInfo.h) / 2;
+    if (mode === 'bottom') nextY = canvasHmm - selectedInfo.h;
     updateSelectedWidget(w => ({ ...w, x: nextX, y: nextY }));
   };
 
@@ -1089,7 +1203,7 @@ export const Report: React.FC = () => {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [designer, selectedWidget, selectedInfo, canvasW, canvasH, layout]);
+  }, [designer, selectedWidget, selectedInfo, canvasWmm, canvasHmm, layout]);
 
   const formatFooterRight = (pageNumber: number, pages: number) =>
     reportSettings.footerRightTemplate
@@ -1194,21 +1308,22 @@ export const Report: React.FC = () => {
         key={page.id}
         style={{
           padding: `${marginMm}mm`,
-          width: `${pageW}mm`,
-          minHeight: `${pageH}mm`
+          width: `${pageWmm}mm`,
+          minHeight: `${pageHmm}mm`
         }}
       >
         {renderHeader(pageNumber, totalPages)}
 
         <div
           className="pdf-canvas"
+          ref={isActivePage ? canvasRef : undefined}
           style={{
-            width: `${canvasW}mm`,
-            height: `${canvasH}mm`,
+            width: `${canvasWmm}mm`,
+            height: `${canvasHmm}mm`,
             marginTop: `${headerGapMm}mm`,
             position: 'relative'
           }}
-          onContextMenu={designer ? (event) => event.preventDefault() : undefined}
+          onContextMenu={designer ? (event: React.MouseEvent<HTMLDivElement>) => event.preventDefault() : undefined}
         >
           {isActivePage && <div className="designer-overlay" />}
 
@@ -1259,8 +1374,8 @@ export const Report: React.FC = () => {
                   <WidgetCard
                     widget={widget}
                     pageId={page.id}
-                    canvasW={canvasW}
-                    canvasH={canvasH}
+                    canvasWmm={canvasWmm}
+                    canvasHmm={canvasHmm}
                     isEditable={isEditablePage}
                     isSelected={isSelected}
                     isEditing={editing}
@@ -1287,8 +1402,8 @@ export const Report: React.FC = () => {
                 <WidgetCard
                   widget={widget}
                   pageId={page.id}
-                  canvasW={canvasW}
-                  canvasH={canvasH}
+                  canvasWmm={canvasWmm}
+                  canvasHmm={canvasHmm}
                   isEditable={false}
                   isSelected={isSelected}
                   onSelect={() => { setSelectedWidget({ pageId: page.id, widgetId: widget.id }); setActivePageId(page.id); }}
@@ -1315,16 +1430,16 @@ export const Report: React.FC = () => {
         key={`positions-${index}`}
         style={{
           padding: `${marginMm}mm`,
-          width: `${pageW}mm`,
-          minHeight: `${pageH}mm`
+          width: `${pageWmm}mm`,
+          minHeight: `${pageHmm}mm`
         }}
       >
         {renderHeader(pageNumber, totalPages)}
         <div
           className="pdf-canvas"
           style={{
-            width: `${canvasW}mm`,
-            height: `${canvasH}mm`,
+            width: `${canvasWmm}mm`,
+            height: `${canvasHmm}mm`,
             marginTop: `${headerGapMm}mm`,
             position: 'relative'
           }}
@@ -1553,3 +1668,6 @@ export const Report: React.FC = () => {
     </div>
   );
 };
+
+
+

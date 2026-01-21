@@ -1,31 +1,72 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { TransactionType, Currency, Transaction, AssetType, AssetClass } from '../types';
-import {
-    PRIMARY_BLUE,
-    ACCENT_ORANGE,
-    POSITIVE_GREEN,
-    NEGATIVE_RED,
-    NEUTRAL_TEXT,
-    NEUTRAL_MUTED,
-    CARD_BG,
-    BORDER_COLOR,
-    PAGE_BG
-} from '../constants';
+import { TransactionType, Currency, Transaction, AssetType, AssetClass, Instrument, RegionKey } from '../types';
 import clsx from 'clsx';
+import { getAssetClassLabel, inferAssetClass } from '../services/financeUtils';
 
 interface GroupedAsset {
     ticker: string;
     transactions: Transaction[];
     quantity: number;
     avgPrice: number;
+    invested: number;
     currentPrice: number;
     currentValue: number;
     currency: Currency;
     pnl: number;
     pnlPercent: number;
 }
+
+const ASSET_TYPE_LABELS: Record<AssetType, string> = {
+    [AssetType.Stock]: 'Azioni',
+    [AssetType.Bond]: 'Obbligazioni',
+    [AssetType.ETF]: 'ETF',
+    [AssetType.Crypto]: 'Cripto',
+    [AssetType.Cash]: 'Liquidita',
+    [AssetType.Commodity]: 'Oro'
+};
+
+const TRANSACTION_TYPE_LABELS: Record<TransactionType, string> = {
+    [TransactionType.Buy]: 'Acquisto',
+    [TransactionType.Sell]: 'Vendita',
+    [TransactionType.Dividend]: 'Dividendo',
+    [TransactionType.Deposit]: 'Versamento',
+    [TransactionType.Withdrawal]: 'Prelievo',
+    [TransactionType.Fee]: 'Commissione'
+};
+
+const REGION_OPTIONS: { key: RegionKey; label: string }[] = [
+    { key: 'CH', label: 'Svizzera' },
+    { key: 'NA', label: 'Nord America' },
+    { key: 'EU', label: 'Europa' },
+    { key: 'AS', label: 'Asia' },
+    { key: 'OC', label: 'Oceania' },
+    { key: 'LATAM', label: 'America Latina' },
+    { key: 'AF', label: 'Africa' },
+    { key: 'UNASSIGNED', label: 'Non definito' }
+];
+
+const getAssetTypeLabel = (type?: AssetType) => (type ? ASSET_TYPE_LABELS[type] || type : 'N/D');
+const getTransactionTypeLabel = (type?: TransactionType) => (type ? TRANSACTION_TYPE_LABELS[type] || type : 'N/D');
+const isRegionKey = (value?: string): value is RegionKey => {
+    return !!value && REGION_OPTIONS.some(opt => opt.key === value);
+};
+const getPrimaryRegionInfo = (alloc?: Partial<Record<RegionKey, number>>) => {
+    if (!alloc) return { key: '' as RegionKey | '', count: 0 };
+    let topKey: RegionKey | '' = '';
+    let topPct = -Infinity;
+    let count = 0;
+    (Object.entries(alloc) as [RegionKey, number][]).forEach(([key, pct]) => {
+        if (pct === undefined || pct === null) return;
+        count += 1;
+        if (pct > topPct) {
+            topPct = pct;
+            topKey = key;
+        }
+    });
+    return { key: topKey, count };
+};
 
 export const Transactions: React.FC = () => {
     const currentPortfolioId = getCurrentPortfolioId();
@@ -40,6 +81,11 @@ export const Transactions: React.FC = () => {
     );
     const prices = useLiveQuery(
         () => db.prices.where('portfolioId').equals(currentPortfolioId).toArray(),
+        [currentPortfolioId],
+        []
+    );
+    const instruments = useLiveQuery(
+        () => db.instruments.where('portfolioId').equals(currentPortfolioId).toArray(),
         [currentPortfolioId],
         []
     );
@@ -79,6 +125,19 @@ export const Transactions: React.FC = () => {
         fees: 0,
         currency: Currency.CHF
     });
+
+    // -- Edit Asset Modal State --
+    const [isEditAssetModalOpen, setEditAssetModalOpen] = useState(false);
+    const [editingAsset, setEditingAsset] = useState<Instrument | null>(null);
+    const [editAssetForm, setEditAssetForm] = useState({
+        name: '',
+        type: AssetType.Stock,
+        assetClass: AssetClass.STOCK,
+        currency: Currency.CHF,
+        sector: '',
+        region: '' as RegionKey | ''
+    });
+    const [editAssetInitialRegion, setEditAssetInitialRegion] = useState<RegionKey | ''>('');
 
     // -- Helpers for Asset Search --
     useEffect(() => {
@@ -147,6 +206,10 @@ export const Transactions: React.FC = () => {
         };
     }, []);
 
+    const instrumentByTicker = useMemo(() => {
+        return new Map((instruments || []).map(inst => [inst.ticker, inst]));
+    }, [instruments]);
+
     // -- Grouping Logic --
     const groupedAssets = useMemo(() => {
         if (!transactions) return [];
@@ -163,6 +226,7 @@ export const Transactions: React.FC = () => {
                     transactions: [],
                     quantity: 0,
                     avgPrice: 0,
+                    invested: 0,
                     currentPrice: 0,
                     currentValue: 0,
                     currency: t.currency,
@@ -177,8 +241,10 @@ export const Transactions: React.FC = () => {
                 const newQty = groups[ticker].quantity + t.quantity;
                 groups[ticker].avgPrice = newQty > 0 ? totalValue / newQty : 0;
                 groups[ticker].quantity = newQty;
+                groups[ticker].invested += (t.quantity * t.price) + (t.fees || 0);
             } else if (t.type === TransactionType.Sell) {
                 groups[ticker].quantity -= t.quantity;
+                groups[ticker].invested -= (t.quantity * t.price) - (t.fees || 0);
             }
         });
 
@@ -199,6 +265,61 @@ export const Transactions: React.FC = () => {
     }, [transactions, prices]);
 
     // -- Handlers --
+    const handleOpenEditAsset = (instrument: Instrument) => {
+        const inferredClass = instrument.assetClass || inferAssetClass(instrument);
+        const regionInfo = getPrimaryRegionInfo(instrument.regionAllocation);
+        const regionValue = regionInfo.count > 1
+            ? ''
+            : (regionInfo.key || (isRegionKey(instrument.region) ? instrument.region : ''));
+        const initialRegion = regionInfo.count === 0 && regionValue ? '' : regionValue;
+        setEditingAsset(instrument);
+        setEditAssetForm({
+            name: instrument.name || instrument.ticker,
+            type: instrument.type || AssetType.Stock,
+            assetClass: inferredClass,
+            currency: instrument.currency || Currency.CHF,
+            sector: instrument.sector || '',
+            region: regionValue
+        });
+        setEditAssetInitialRegion(initialRegion);
+        setEditAssetModalOpen(true);
+    };
+
+    const handleCloseEditAsset = () => {
+        setEditAssetModalOpen(false);
+        setEditingAsset(null);
+        setEditAssetInitialRegion('');
+    };
+
+    const handleSaveAssetMeta = async (e: React.FormEvent<HTMLFormElement>) => {
+        e.preventDefault();
+        if (!editingAsset) return;
+        const payload: Partial<Instrument> = {
+            name: editAssetForm.name.trim(),
+            type: editAssetForm.type,
+            assetClass: editAssetForm.assetClass,
+            currency: editAssetForm.currency,
+            sector: editAssetForm.sector.trim() || undefined
+        };
+
+        const regionChanged = editAssetForm.region !== editAssetInitialRegion;
+        if (regionChanged) {
+            const regionValue = editAssetForm.region || undefined;
+            payload.region = regionValue;
+            payload.regionAllocation = regionValue
+                ? ({ [regionValue]: 100 } as Partial<Record<RegionKey, number>>)
+                : undefined;
+        }
+
+        if (editingAsset.id) {
+            await db.instruments.update(editingAsset.id, payload);
+        } else {
+            const existing = await db.instruments.where('ticker').equals(editingAsset.ticker).first();
+            if (existing?.id) await db.instruments.update(existing.id, payload);
+        }
+
+        handleCloseEditAsset();
+    };
 
     const handleOpenTxModal = (ticker: string, txToEdit?: Transaction) => {
         setActiveAssetForTx(ticker);
@@ -422,7 +543,7 @@ export const Transactions: React.FC = () => {
                                         onChange={e => setAssetForm({ ...assetForm, type: e.target.value as AssetType })}
                                         className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
                                     >
-                                        {Object.values(AssetType).map(t => <option key={t} value={t}>{t}</option>)}
+                                        {Object.values(AssetType).map(t => <option key={t} value={t}>{getAssetTypeLabel(t)}</option>)}
                                     </select>
                                 </div>
                                 <div>
@@ -532,7 +653,7 @@ export const Transactions: React.FC = () => {
                                         value={txForm.type}
                                         onChange={e => setTxForm({ ...txForm, type: e.target.value as TransactionType })}
                                     >
-                                        {Object.values(TransactionType).map(t => <option key={t} value={t}>{t}</option>)}
+                                        {Object.values(TransactionType).map(t => <option key={t} value={t}>{getTransactionTypeLabel(t)}</option>)}
                                     </select>
                                 </div>
                             </div>
@@ -595,9 +716,116 @@ export const Transactions: React.FC = () => {
                 </div>
             )}
 
+            {isEditAssetModalOpen && editingAsset && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
+                    <div className="bg-backgroundElevated rounded-2xl shadow-xl w-full max-w-lg overflow-hidden border border-borderSoft">
+                        <div className="p-6 border-b border-borderSoft flex justify-between items-center bg-white/5">
+                            <div>
+                                <h3 className="text-lg font-bold text-textPrimary">Modifica Asset</h3>
+                                <p className="text-xs text-primary font-bold uppercase tracking-wider mt-0.5">{editingAsset.ticker}</p>
+                            </div>
+                            <button onClick={handleCloseEditAsset} className="text-gray-400 hover:text-slate-900">
+                                <span className="material-symbols-outlined">close</span>
+                            </button>
+                        </div>
+                        <form onSubmit={handleSaveAssetMeta} className="p-6 space-y-4">
+                            <div>
+                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Nome</label>
+                                <input
+                                    value={editAssetForm.name}
+                                    onChange={e => setEditAssetForm({ ...editAssetForm, name: e.target.value })}
+                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    required
+                                />
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Tipo</label>
+                                    <select
+                                        value={editAssetForm.type}
+                                        onChange={e => setEditAssetForm({ ...editAssetForm, type: e.target.value as AssetType })}
+                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    >
+                                        {Object.values(AssetType).map(t => <option key={t} value={t}>{getAssetTypeLabel(t)}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Asset class</label>
+                                    <select
+                                        value={editAssetForm.assetClass}
+                                        onChange={e => setEditAssetForm({ ...editAssetForm, assetClass: e.target.value as AssetClass })}
+                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    >
+                                        {Object.values(AssetClass).map(ac => <option key={ac} value={ac}>{getAssetClassLabel(ac)}</option>)}
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Valuta</label>
+                                    <select
+                                        value={editAssetForm.currency}
+                                        onChange={e => setEditAssetForm({ ...editAssetForm, currency: e.target.value as Currency })}
+                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    >
+                                        {Object.values(Currency).map(c => <option key={c} value={c}>{c}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Settore</label>
+                                    <input
+                                        value={editAssetForm.sector}
+                                        onChange={e => setEditAssetForm({ ...editAssetForm, sector: e.target.value })}
+                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    />
+                                </div>
+                            </div>
+
+                            <div>
+                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Geografia</label>
+                                <select
+                                    value={editAssetForm.region}
+                                    onChange={e => setEditAssetForm({ ...editAssetForm, region: e.target.value as RegionKey | '' })}
+                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                >
+                                    <option value="">Auto / multi</option>
+                                    {REGION_OPTIONS.map(opt => (
+                                        <option key={opt.key} value={opt.key}>{opt.label}</option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div className="pt-4 flex gap-3">
+                                <button
+                                    type="button"
+                                    onClick={handleCloseEditAsset}
+                                    className="flex-1 border border-borderSoft text-slate-700 py-3 rounded-xl font-bold hover:bg-slate-50 transition"
+                                >
+                                    Annulla
+                                </button>
+                                <button
+                                    type="submit"
+                                    className="flex-1 bg-primary text-slate-900 py-3 rounded-xl font-bold hover:bg-blue-600 transition"
+                                >
+                                    Salva
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
+
             {/* Accordion List */}
             <div className="space-y-3">
-                {groupedAssets.map(group => (
+                {groupedAssets.map(group => {
+                    const instrument = instrumentByTicker.get(group.ticker);
+                    const assetLabel = instrument ? getAssetTypeLabel(instrument.type) : (group.ticker === 'CASH' ? getAssetTypeLabel(AssetType.Cash) : '');
+                    const instrumentName = instrument?.name || group.ticker;
+                    const instrumentIsin = instrument?.isin;
+                    const displayCurrency = instrument?.currency || group.currency;
+                    return (
                     <div key={group.ticker} className="bg-white rounded-xl shadow-lg border border-borderSoft overflow-hidden transition-all hover:border-primary/30">
 
                         {/* Summary Header */}
@@ -616,18 +844,39 @@ export const Transactions: React.FC = () => {
                                     }
                                 </div>
                                 <div>
-                                    <h3 className="font-bold text-slate-900 text-sm">{group.ticker}</h3>
-                                    <p className="text-xs text-slate-500">{group.quantity.toLocaleString()} quote • Avg: {group.avgPrice.toFixed(2)} {group.currency}</p>
+                                    <h3 className="font-bold text-slate-900 text-sm">{instrumentName}</h3>
+                                    <p className="text-xs text-slate-500">
+                                        {group.ticker}{instrumentIsin ? ` • ISIN ${instrumentIsin}` : ''}
+                                    </p>
+                                    <p className="text-xs text-slate-500">
+                                        {assetLabel ? `${assetLabel} - ` : ''}Media: {group.avgPrice.toFixed(2)} {displayCurrency}
+                                    </p>
+                                    <p className="text-xs text-slate-500">
+                                        Investito: {group.invested.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} {displayCurrency} · Quote: {group.quantity.toLocaleString()}
+                                    </p>
                                 </div>
                             </div>
 
-                            <div className="flex items-center gap-6">
+                            <div className="flex items-center gap-4">
                                 <div className="text-right hidden sm:block">
                                     <p className="text-sm font-bold text-slate-900 tracking-tight">{group.currentValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} {group.currency}</p>
                                     <p className={clsx("text-xs font-bold", group.pnl >= 0 ? "text-positive" : "text-negative")}>
                                         {group.pnl >= 0 ? '+' : ''}{group.pnl.toLocaleString(undefined, { maximumFractionDigits: 0 })} ({group.pnlPercent.toFixed(1)}%)
                                     </p>
                                 </div>
+                                {instrument && (
+                                    <button
+                                        type="button"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleOpenEditAsset(instrument);
+                                        }}
+                                        className="p-2 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
+                                        aria-label="Modifica asset"
+                                    >
+                                        <span className="material-symbols-outlined text-[18px]">edit</span>
+                                    </button>
+                                )}
                                 <span className={`material-symbols-outlined text-slate-400 transition-transform duration-300 ${expandedTicker === group.ticker ? 'rotate-180' : ''}`}>
                                     expand_more
                                 </span>
@@ -643,7 +892,7 @@ export const Transactions: React.FC = () => {
                                             <th className="px-6 py-3 font-semibold">Data</th>
                                             <th className="px-6 py-3 font-semibold">Tipo</th>
                                             <th className="px-6 py-3 font-semibold text-right">Prezzo</th>
-                                            <th className="px-6 py-3 font-semibold text-right">Qtà</th>
+                                            <th className="px-6 py-3 font-semibold text-right">Qta</th>
                                             <th className="px-6 py-3 font-semibold text-right">Comm.</th>
                                             <th className="px-6 py-3 font-semibold text-right">Totale</th>
                                             <th className="px-6 py-3 font-semibold text-center">Azioni</th>
@@ -660,7 +909,7 @@ export const Transactions: React.FC = () => {
                                                             t.type === TransactionType.Sell ? "bg-red-100 text-red-700" :
                                                                 "bg-blue-100 text-blue-700"
                                                     )}>
-                                                        {t.type === TransactionType.Buy ? 'Acquisto' : t.type === TransactionType.Sell ? 'Vendita' : t.type}
+                                                        {getTransactionTypeLabel(t.type)}
                                                     </span>
                                                 </td>
                                                 <td className="px-6 py-3 text-right text-slate-900 font-mono">{t.price.toFixed(2)}</td>
@@ -700,7 +949,7 @@ export const Transactions: React.FC = () => {
                             </div>
                         )}
                     </div>
-                ))}
+                )})}
 
                 {!transactions?.length && (
                     <div className="text-center py-16 text-slate-500 bg-white rounded-2xl border border-dashed border-borderSoft">
@@ -713,4 +962,18 @@ export const Transactions: React.FC = () => {
         </div>
     );
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

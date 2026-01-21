@@ -1,0 +1,12 @@
+{
+  "instruments": [
+    { "ticker": "AAA", "name": "Asset AAA", "type": "Stock", "assetClass": "STOCK", "currency": "CHF" }
+  ],
+  "transactions": [
+    { "date": "2023-01-02", "type": "Buy", "instrumentTicker": "AAA", "quantity": 10, "price": 100, "fees": 0, "currency": "CHF", "account": "TEST" }
+  ],
+  "prices": [
+    { "ticker": "AAA", "date": "2023-01-02", "close": 100, "currency": "CHF" },
+    { "ticker": "AAA", "date": "2023-12-29", "close": 150, "currency": "CHF" }
+  ]
+}

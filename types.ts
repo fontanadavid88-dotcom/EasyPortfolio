@@ -18,7 +18,7 @@ export enum AssetClass {
   OTHER = 'OTHER'
 }
 
-export type RegionKey = 'CH' | 'NA' | 'EU' | 'AS' | 'OC' | 'LATAM' | 'AF' | 'UNASSIGNED';
+export type RegionKey = 'CH' | 'NA' | 'EU' | 'AS' | 'OC' | 'LATAM' | 'AF' | 'UNASSIGNED' | 'OTHER';
 
 export enum Currency {
   CHF = 'CHF',
@@ -38,6 +38,7 @@ export enum TransactionType {
 
 export interface Instrument {
   id?: number;
+  portfolioId?: string;
   ticker: string; // E.g., 'AAPL.US'
   name: string;
   type: AssetType;
@@ -62,6 +63,7 @@ export interface InstrumentListing {
 
 export interface Transaction {
   id?: number;
+  portfolioId?: string;
   date: Date;
   instrumentTicker?: string; // Null for pure Cash deposit/withdrawal
   type: TransactionType;
@@ -75,6 +77,7 @@ export interface Transaction {
 
 export interface PricePoint {
   id?: number;
+  portfolioId?: string;
   ticker: string;
   date: string; // YYYY-MM-DD
   close: number;
@@ -83,6 +86,7 @@ export interface PricePoint {
 
 export interface MacroIndicator {
   id?: number;
+  portfolioId?: string;
   date: string;
   value: number; // 0-100
   note?: string;

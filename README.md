@@ -18,3 +18,39 @@ View your app in AI Studio: https://ai.studio/apps/drive/1K_4zP_gCiwEpqIRATO8uBr
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## Production (Vercel)
+
+This app uses server-side proxies for price and sheet data to avoid CORS and keep secrets out of the client.
+
+- Set `EODHD_API_KEY` in Vercel Environment Variables (server-side only, not `VITE_*`).
+- The frontend calls `/api/eodhd/*` and `/api/sheets` (do not call EODHD or Google Sheets directly).
+- For local testing with proxies, use `npm run vercel:dev` (safe by default) and set `EODHD_API_KEY` in `.env.local`.
+
+## Troubleshooting vercel dev 502 (Windows)
+
+**Sintomo**
+- 502 `NO_RESPONSE_FROM_FUNCTION`
+- Log con `internal/preload` e path troncato su spazi (es. `Cannot find module 'F:\\...\\15'`)
+
+**Causa**
+- Variabile d'ambiente globale `NODE_OPTIONS` con `--require/--import` non quotato.
+
+**Fix definitivo**
+- Rimuovere `NODE_OPTIONS` da Environment Variables (User/Machine).
+
+**Workaround per sessione (se non puoi modificare variabili di sistema)**
+```powershell
+$env:NODE_OPTIONS=""
+Remove-Item Env:NODE_OPTIONS
+```
+
+**Script sicuro**
+- Usa `npm run vercel:dev` (alias di `vercel:dev:safe`) per avviare `vercel dev` con `NODE_OPTIONS` forzato a vuoto anche su PC aziendali.
+
+## Vercel deploy checklist
+
+- Imposta `EODHD_API_KEY` sia su **Preview** che **Production**.
+- Deploy Preview: verifica `/api/health` (200, `hasEodhdKey: true`).
+- Testa in UI: `Impostazioni > Aggiorna Prezzi` (nessun CORS, errori chiari).
+- Nota PWA: i prezzi si aggiornano **on-demand** (click o apertura app), non in background schedulato.
