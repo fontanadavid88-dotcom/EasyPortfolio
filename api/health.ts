@@ -4,10 +4,6 @@ console.log('[health] NODE_OPTIONS:', proc?.env?.NODE_OPTIONS ?? '(n/a)');
 console.log('[health] cwd:', proc?.cwd?.() ?? '(n/a)');
 console.log('[health] version:', proc?.version ?? '(n/a)');
 
-export const config = {
-  runtime: 'nodejs'
-};
-
 export default function handler(): Response {
   const hasKey = Boolean((globalThis as any).process?.env?.EODHD_API_KEY);
   const hasNodeOptions = Boolean((globalThis as any).process?.env?.NODE_OPTIONS);
