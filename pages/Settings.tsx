@@ -47,6 +47,8 @@ export const Settings: React.FC = () => {
   const [fxBase, setFxBase] = useState<Currency>(Currency.CHF);
   const [fxQuote, setFxQuote] = useState<Currency>(Currency.USD);
   const [regionAllocation, setRegionAllocation] = useState<Partial<Record<RegionKey, number>>>({});
+  const [proxyHealth, setProxyHealth] = useState<{ ok: boolean; hasEodhdKey: boolean; error?: string } | null>(null);
+  const [proxyHealthLoading, setProxyHealthLoading] = useState(false);
 
   useEffect(() => {
     db.settings.where('portfolioId').equals(currentPortfolioId).first().then(s => {
@@ -70,6 +72,30 @@ export const Settings: React.FC = () => {
     });
   }, [currentPortfolioId]);
 
+  const loadProxyHealth = async () => {
+    setProxyHealthLoading(true);
+    try {
+      const res = await fetch('/api/health');
+      if (!res.ok) {
+        setProxyHealth({ ok: false, hasEodhdKey: false, error: 'Proxy non raggiungibile' });
+        return;
+      }
+      const data = await res.json();
+      setProxyHealth({
+        ok: Boolean(data?.ok),
+        hasEodhdKey: Boolean(data?.hasEodhdKey)
+      });
+    } catch (e) {
+      setProxyHealth({ ok: false, hasEodhdKey: false, error: 'Proxy non raggiungibile' });
+    } finally {
+      setProxyHealthLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadProxyHealth();
+  }, []);
+
   const handleSave = async () => {
     await db.settings.put({ ...config, id: settingsId, portfolioId: currentPortfolioId });
     alert('Impostazioni salvate');
@@ -91,8 +117,8 @@ export const Settings: React.FC = () => {
     try {
       await syncPrices();
       alert('Prezzi aggiornati con successo!');
-    } catch (e) {
-      alert('Errore aggiornamento prezzi.');
+    } catch (e: any) {
+      alert(e?.message || 'Errore aggiornamento prezzi.');
     } finally {
       setLoading(false);
     }
@@ -170,7 +196,7 @@ export const Settings: React.FC = () => {
         date: t.date ? new Date(t.date) : new Date()
       }));
 
-      await db.transaction('rw', db.portfolios, db.settings, db.instruments, db.transactions, db.prices, db.macro, async () => {
+      await db.transaction('rw', [db.portfolios, db.settings, db.instruments, db.transactions, db.prices, db.macro], async () => {
         await db.portfolios.clear();
         await db.settings.clear();
         await db.instruments.clear();
@@ -227,33 +253,36 @@ export const Settings: React.FC = () => {
       setListingMessage('Inserisci un ISIN');
       return;
     }
-    if (!config.eodhdApiKey) {
-      setListingMessage('Configura prima la API key EODHD');
-      return;
-    }
-    const listings = await resolveListingsByIsin(isinInput.trim(), config.eodhdApiKey);
-    if (listings.length === 0) {
-      setListingMessage('Nessun listing trovato per questo ISIN');
+    try {
+      const listings = await resolveListingsByIsin(isinInput.trim());
+      if (listings.length === 0) {
+        setListingMessage('Nessun listing trovato per questo ISIN');
+        setRecommendedListings([]);
+        setOtherListings([]);
+        setSelectedListing(null);
+        return;
+      }
+      const { recommended, others } = pickRecommendedListings(
+        listings,
+        isinInput.trim(),
+        config.preferredExchangesOrder || ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'],
+        config.baseCurrency || Currency.CHF
+      );
+      const def = pickDefaultListing(
+        listings,
+        config.preferredExchangesOrder || ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'],
+        config.baseCurrency || Currency.CHF
+      );
+      setRecommendedListings(recommended);
+      setOtherListings(others);
+      setSelectedListing(def || recommended[0] || listings[0]);
+      setListingMessage(`Trovati ${listings.length} listing`);
+    } catch (e: any) {
+      setListingMessage(e?.message || 'Errore lookup listing');
       setRecommendedListings([]);
       setOtherListings([]);
       setSelectedListing(null);
-      return;
     }
-    const { recommended, others } = pickRecommendedListings(
-      listings,
-      isinInput.trim(),
-      config.preferredExchangesOrder || ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'],
-      config.baseCurrency || Currency.CHF
-    );
-    const def = pickDefaultListing(
-      listings,
-      config.preferredExchangesOrder || ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'],
-      config.baseCurrency || Currency.CHF
-    );
-    setRecommendedListings(recommended);
-    setOtherListings(others);
-    setSelectedListing(def || recommended[0] || listings[0]);
-    setListingMessage(`Trovati ${listings.length} listing`);
   };
 
   const handleApplyListing = async () => {
@@ -427,8 +456,8 @@ export const Settings: React.FC = () => {
               value={currentPortfolioId}
               onChange={e => handleSwitchPortfolio(e.target.value)}
             >
-              {portfolios.map(p => (
-                <option key={p.portfolioId} value={p.portfolioId}>{p.name}</option>
+              {portfolios.map((p, idx) => (
+                <option key={`${p.portfolioId}-${idx}`} value={p.portfolioId}>{p.name}</option>
               ))}
             </select>
           </div>
@@ -449,13 +478,30 @@ export const Settings: React.FC = () => {
         </div>
       </div>
 
+      {import.meta.env.DEV && (
+        <div className="bg-amber-50 p-4 rounded-2xl border border-amber-200 shadow-sm">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-xs font-bold uppercase text-amber-700">Dev Tools</div>
+              <div className="text-sm text-amber-800">Diagnostica dati e controlli qualita.</div>
+            </div>
+            <a
+              href="#/data"
+              className="px-3 py-2 rounded-lg text-xs font-bold bg-amber-600 text-white hover:bg-amber-700 transition"
+            >
+              Apri Data Inspector
+            </a>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white p-8 rounded-2xl shadow-lg border border-borderSoft">
         <h2 className="text-xl font-bold mb-6 flex items-center gap-2 text-slate-900">
           <span className="material-symbols-outlined text-primary">database</span>
           Fonti Dati
         </h2>
         <div className="space-y-6">
-          <div>
+          <form onSubmit={(e) => e.preventDefault()}>
             <label className="block text-sm font-bold text-slate-500 mb-2">EODHD API Key</label>
             <input
               type="password"
@@ -463,7 +509,7 @@ export const Settings: React.FC = () => {
               value={config.eodhdApiKey}
               onChange={e => setConfig({ ...config, eodhdApiKey: e.target.value })}
             />
-          </div>
+          </form>
           <div>
             <label className="block text-sm font-bold text-slate-500 mb-2">Price Sheet URL (JSON output)</label>
             <input
@@ -472,6 +518,38 @@ export const Settings: React.FC = () => {
               onChange={e => setConfig({ ...config, googleSheetUrl: e.target.value })}
             />
             <p className="text-xs text-gray-500 mt-2 ml-1">L'URL deve puntare a un endpoint pubblico JSON o Google Viz API.</p>
+          </div>
+          <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-sm text-slate-700">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold uppercase text-slate-500">Stato Proxy</span>
+                {proxyHealthLoading ? (
+                  <span className="text-xs text-slate-400">Verifica...</span>
+                ) : proxyHealth?.ok ? (
+                  <span className="text-xs font-bold text-green-600">OK</span>
+                ) : (
+                  <span className="text-xs font-bold text-red-600">Errore</span>
+                )}
+              </div>
+              <button
+                type="button"
+                className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                onClick={loadProxyHealth}
+              >
+                Riprova
+              </button>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-3 text-xs">
+              <div>
+                <span className="text-slate-500">EODHD key:</span>{' '}
+                {proxyHealthLoading ? '...' : proxyHealth?.hasEodhdKey ? 'OK' : 'Mancante'}
+              </div>
+              {!proxyHealth?.ok && (
+                <div className="text-slate-500">
+                  Avvia `vercel dev` oppure verifica il deploy su Vercel.
+                </div>
+              )}
+            </div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
@@ -988,4 +1066,5 @@ export const Settings: React.FC = () => {
     </div>
   );
 };
+
 

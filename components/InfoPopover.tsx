@@ -6,9 +6,19 @@ interface InfoPopoverProps {
   renderContent: (close: () => void) => React.ReactNode;
   onOpenChange?: (open: boolean) => void;
   popoverClassName?: string;
+  triggerContent?: React.ReactNode;
+  triggerClassName?: string;
 }
 
-export const InfoPopover: React.FC<InfoPopoverProps> = ({ title, ariaLabel, renderContent, onOpenChange, popoverClassName }) => {
+export const InfoPopover: React.FC<InfoPopoverProps> = ({
+  title,
+  ariaLabel,
+  renderContent,
+  onOpenChange,
+  popoverClassName,
+  triggerContent,
+  triggerClassName
+}) => {
   const [open, setOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
@@ -50,12 +60,12 @@ export const InfoPopover: React.FC<InfoPopoverProps> = ({ title, ariaLabel, rend
         ref={buttonRef}
         type="button"
         aria-label={ariaLabel}
-        className="p-1.5 rounded-full text-slate-500 hover:text-slate-800 hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-primary transition"
+        className={triggerClassName || "p-1.5 rounded-full text-slate-500 hover:text-slate-800 hover:bg-slate-200 focus:outline-none focus:ring-2 focus:ring-primary transition"}
         onClick={() => {
           setOpen(o => !o);
         }}
       >
-        <span className="material-symbols-outlined text-[22px]">info</span>
+        {triggerContent ?? <span className="material-symbols-outlined text-[22px]">info</span>}
       </button>
       {open && (
         <div

@@ -1,13 +1,50 @@
 import React, { useEffect, useState } from 'react';
-import { HashRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
+import { createHashRouter, RouterProvider, Navigate, Outlet } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { Dashboard } from './pages/Dashboard';
 import { Transactions } from './pages/Transactions';
 import { Rebalance } from './pages/Rebalance';
 import { Macro } from './pages/Macro';
 import { Settings } from './pages/Settings';
+import { Data } from './pages/Data';
 import { Report } from './pages/Report';
 import { initSettings, seedDatabase, ensureDefaultPortfolio } from './db';
+
+const InitErrorContext = React.createContext<string | null>(null);
+
+const LayoutShell: React.FC = () => {
+  const initError = React.useContext(InitErrorContext);
+
+  return (
+    <Layout>
+      {initError && (
+        <div className="bg-red-50 text-red-700 border border-red-200 px-4 py-3 text-sm text-center">
+          Errore inizializzazione: {initError}
+        </div>
+      )}
+      <Outlet />
+    </Layout>
+  );
+};
+
+const router = createHashRouter(
+  [
+    { path: '/report', element: <Report /> },
+    {
+      element: <LayoutShell />,
+      children: [
+        { path: '/', element: <Dashboard /> },
+        { path: '/transactions', element: <Transactions /> },
+        { path: '/rebalance', element: <Rebalance /> },
+        { path: '/macro', element: <Macro /> },
+        { path: '/settings', element: <Settings /> },
+        { path: '/data', element: <Data /> },
+        { path: '*', element: <Navigate to="/" replace /> }
+      ]
+    }
+  ],
+  { future: { v7_startTransition: true, v7_relativeSplatPath: true } as any }
+);
 
 const App: React.FC = () => {
   const [initialized, setInitialized] = useState(false);
@@ -63,32 +100,13 @@ const App: React.FC = () => {
     );
   }
 
-  const LayoutShell: React.FC = () => (
-    <Layout>
-      {initError && (
-        <div className="bg-red-50 text-red-700 border border-red-200 px-4 py-3 text-sm text-center">
-          Errore inizializzazione: {initError}
-        </div>
-      )}
-      <Outlet />
-    </Layout>
-  );
-
   return (
-    <HashRouter>
-      <Routes>
-        <Route path="/report" element={<Report />} />
-        <Route element={<LayoutShell />}>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/transactions" element={<Transactions />} />
-          <Route path="/rebalance" element={<Rebalance />} />
-          <Route path="/macro" element={<Macro />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
-    </HashRouter>
+    <InitErrorContext.Provider value={initError}>
+      <RouterProvider router={router} />
+    </InitErrorContext.Provider>
   );
 };
 
 export default App;
+
+

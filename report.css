@@ -256,6 +256,12 @@
   pointer-events: auto;
 }
 
+.report-root.is-designer .widget-drag-handle {
+  pointer-events: auto;
+  position: relative;
+  z-index: 4;
+}
+
 .report-root.is-designer .no-drag {
   cursor: default !important;
 }

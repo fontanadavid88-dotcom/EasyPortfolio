@@ -120,7 +120,19 @@ export const fetchMacroData = async (sheetUrl: string): Promise<MacroDataPoint[]
     const query = encodeURIComponent("select A, B, C, D");
     const url = `https://docs.google.com/spreadsheets/d/${docId}/gviz/tq?tq=${query}&sheet=Macro`;
 
-    const response = await fetch(url);
+    let response: Response;
+    try {
+        response = await fetch(`/api/sheets?url=${encodeURIComponent(url)}`);
+    } catch (e) {
+        if (e instanceof TypeError) {
+            throw new Error('Impossibile raggiungere proxy API');
+        }
+        throw e;
+    }
+    if (!response.ok) {
+        const msg = await response.text();
+        throw new Error(msg || 'Impossibile raggiungere proxy API');
+    }
     const text = await response.text();
 
     const jsonMatch = text.match(/google\.visualization\.Query\.setResponse\(([\s\S\w]+)\);/);

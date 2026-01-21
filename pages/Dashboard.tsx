@@ -1,7 +1,7 @@
 ﻿import React, { useMemo, useState } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure } from '../services/financeUtils';
+import { calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly } from '../services/financeUtils';
 import { DEFAULT_INDICATORS, computeMacroIndex, mapIndexToPhase, MacroIndicatorConfig } from '../services/macroService';
 import {
   PRIMARY_BLUE,
@@ -18,10 +18,10 @@ import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid,
   AreaChart, Area, BarChart, Bar, ReferenceLine, LabelList, ReferenceDot
 } from 'recharts';
-import { format, subMonths, getYear } from 'date-fns';
+import { format, subMonths } from 'date-fns';
 import clsx from 'clsx';
 import { InfoPopover } from '../components/InfoPopover';
-import { AssetClass, RegionKey } from '../types';
+import { RegionKey } from '../types';
 
 // --- Sub-Components ---
 
@@ -49,7 +49,7 @@ const KPICard = ({ title, value, subValue, highlight = false, alert = false }: {
 
 
 
-const REGION_BUBBLE_POSITIONS: Record<Exclude<RegionKey, 'UNASSIGNED'>, { x: number; y: number }> = {
+const REGION_BUBBLE_POSITIONS: Record<Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>, { x: number; y: number }> = {
   NA: { x: 69.3, y: 64.6 },     // Nord America
   LATAM: { x: 114.4, y: 161.2 },// America Latina
   EU: { x: 267.3, y: 37.6 },    // Europa
@@ -59,11 +59,23 @@ const REGION_BUBBLE_POSITIONS: Record<Exclude<RegionKey, 'UNASSIGNED'>, { x: num
   OC: { x: 404.4, y: 152.3 }    // Oceania
 };
 
+const CHART_DOWNSAMPLE_THRESHOLD = 1200;
+
 const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; pct: number }[] }) => {
-  const filtered = data.filter(d => d.region !== 'UNASSIGNED') as { region: Exclude<RegionKey, 'UNASSIGNED'>; label: string; pct: number }[];
-  const maxPct = filtered.reduce((acc, cur) => Math.max(acc, cur.pct), 0);
+  const regionOrder: Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>[] = ['NA', 'LATAM', 'EU', 'CH', 'AS', 'AF', 'OC'];
+  const safeData = data.filter(d => regionOrder.includes(d.region as Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>)) as {
+    region: Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>;
+    label: string;
+    pct: number;
+  }[];
+  const dataMap = new Map(safeData.map(d => [d.region, d]));
+  const fullData: { region: Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>; label: string; pct: number }[] = regionOrder.map(region => {
+    const existing = dataMap.get(region);
+    return existing ?? { region, label: getRegionLabel(region), pct: 0 };
+  });
+  const maxPct = fullData.reduce((acc, cur) => Math.max(acc, cur.pct), 0);
   const [showAnchors, setShowAnchors] = useState(false);
-  const [dragRegion, setDragRegion] = useState<Exclude<RegionKey, 'UNASSIGNED'> | null>(null);
+  const [dragRegion, setDragRegion] = useState<Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'> | null>(null);
   const [draftPositions, setDraftPositions] = useState<typeof REGION_BUBBLE_POSITIONS>(REGION_BUBBLE_POSITIONS);
 
   const getSvgPoint = (e: React.MouseEvent<SVGSVGElement, MouseEvent>) => {
@@ -85,16 +97,18 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
   };
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement, MouseEvent>) => {
-    if (!import.meta.env.DEV || !dragRegion) return;
+    if (!dragRegion) return;
     const pt = getSvgPoint(e);
     if (!pt) return;
     setDraftPositions(prev => ({ ...prev, [dragRegion]: { x: pt.x, y: pt.y } }));
   };
 
   const handleMouseUp = () => {
-    if (!import.meta.env.DEV || !dragRegion) return;
+    if (!dragRegion) return;
     const updated = draftPositions;
-    console.log("NEW_REGION_POSITIONS", updated);
+    if (import.meta.env.DEV) {
+      console.log("NEW_REGION_POSITIONS", updated);
+    }
     setDragRegion(null);
   };
 
@@ -122,9 +136,9 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
         onMouseLeave={handleMouseUp}
       >
         <image href="/World-map.png" x="0" y="0" width="520" height="240" preserveAspectRatio="none" />
-        {filtered.map((d, idx) => {
+        {fullData.map((d, idx) => {
           const pos = draftPositions[d.region];
-          const radiusBase = 10;
+          const radiusBase = 8;
           const radius = maxPct > 0 ? radiusBase + (d.pct / maxPct) * 20 : radiusBase;
           return (
             <g key={d.region}>
@@ -136,6 +150,11 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
                 fillOpacity={0.85}
                 stroke="white"
                 strokeWidth="2"
+                cursor="grab"
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                  setDragRegion(d.region);
+                }}
               />
               <text x={pos.x} y={pos.y + 4} textAnchor="middle" fontSize="11" fontWeight={700} fill="#0f172a">
                 {`${d.pct.toFixed(1)}%`}
@@ -165,7 +184,7 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
           );
         })}
       </svg>
-      {filtered.length === 0 && (
+      {fullData.length === 0 && (
         <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-500">
           Nessuna allocazione geografica disponibile
         </div>
@@ -197,6 +216,7 @@ export const Dashboard: React.FC = () => {
   // --- Filter State (Global) ---
   const [timeRange, setTimeRange] = useState<'3M' | '6M' | '1Y' | '5Y' | '10Y' | 'YTD' | 'MAX'>('MAX');
   const [metric, setMetric] = useState<'PERF' | 'TWRR' | 'MWRR'>('PERF');
+  const [valueMode, setValueMode] = useState<'NAV' | 'PERF_INDEX'>('NAV');
 
   // --- Macro State ---
   const [macroConfig] = useState<MacroIndicatorConfig[]>(() => {
@@ -223,25 +243,100 @@ export const Dashboard: React.FC = () => {
     };
   }, [macroConfig]);
 
-  const granularity: Granularity = useMemo(() => {
-    return timeRange === 'MAX' ? 'monthly' : 'daily';
-  }, [timeRange]);
-
   // --- Calculations ---
   const state = useMemo(() => {
     if (!transactions || !prices || !instruments) return null;
     return calculatePortfolioState(transactions, instruments, prices);
   }, [transactions, prices, instruments]);
 
-  const rawTrends = useMemo(() => {
+  const bounds = useMemo(() => {
     if (!transactions || !prices || !instruments) return null;
-    return calculateHistoricalPerformance(transactions, instruments, prices, 120, granularity);
-  }, [transactions, prices, instruments, granularity]);
+    return getPortfolioDateBounds(transactions, prices, instruments);
+  }, [transactions, prices, instruments]);
+
+  const dailyTrends = useMemo(() => {
+    if (!transactions || !prices || !instruments) return null;
+    return calculateHistoricalPerformance(transactions, instruments, prices, 120, 'daily');
+  }, [transactions, prices, instruments]);
+
+  const monthlyTrends = useMemo(() => {
+    if (!transactions || !prices || !instruments) return null;
+    if (dailyTrends && dailyTrends.history.length > 1) return null;
+    return calculateHistoricalPerformance(transactions, instruments, prices, 120, 'monthly');
+  }, [transactions, prices, instruments, dailyTrends]);
+
+  const baseHistory = useMemo(() => {
+    if (dailyTrends && dailyTrends.history.length > 1) return dailyTrends.history;
+    return monthlyTrends?.history || [];
+  }, [dailyTrends, monthlyTrends]);
+
+  const kpiGranularity: Granularity = useMemo(() => {
+    if (dailyTrends && dailyTrends.history.length > 1) return 'daily';
+    if (monthlyTrends && monthlyTrends.history.length > 1) return 'monthly';
+    return 'daily';
+  }, [dailyTrends, monthlyTrends]);
+
+  // Common Date Calculation (Range)
+  const rangeStartDate = useMemo(() => {
+    if (!bounds?.effectiveStartDate) return '';
+    const now = new Date();
+    let start = new Date(0);
+    switch (timeRange) {
+      case '3M': start = subMonths(now, 3); break;
+      case '6M': start = subMonths(now, 6); break;
+      case '1Y': start = subMonths(now, 12); break;
+      case '5Y': start = subMonths(now, 60); break;
+      case '10Y': start = subMonths(now, 120); break;
+      case 'YTD': start = new Date(now.getFullYear(), 0, 1); break;
+      case 'MAX': start = new Date(bounds.effectiveStartDate); break;
+      default: start = new Date(0);
+    }
+    const effectiveStart = new Date(bounds.effectiveStartDate);
+    const clamped = start < effectiveStart ? effectiveStart : start;
+    return format(clamped, 'yyyy-MM-dd');
+  }, [timeRange, bounds]);
+
+  const rangeEndDate = useMemo(() => {
+    if (!baseHistory.length) return '';
+    return baseHistory[baseHistory.length - 1].date;
+  }, [baseHistory]);
+
+  const rangeHistory = useMemo(() => {
+    if (!baseHistory.length) return [];
+    return baseHistory.filter(p => {
+      if (rangeStartDate && p.date < rangeStartDate) return false;
+      if (rangeEndDate && p.date > rangeEndDate) return false;
+      return true;
+    });
+  }, [baseHistory, rangeStartDate, rangeEndDate]);
+
+  const chartGranularity: Granularity = useMemo(() => {
+    if (kpiGranularity === 'monthly') return 'monthly';
+    if (timeRange === 'MAX' && rangeHistory.length > CHART_DOWNSAMPLE_THRESHOLD) return 'monthly';
+    return 'daily';
+  }, [kpiGranularity, timeRange, rangeHistory.length]);
+
+  const chartHistory = useMemo(() => {
+    if (!rangeHistory.length) return [];
+    if (chartGranularity === 'monthly' && kpiGranularity === 'daily') {
+      const downsampled = downsampleHistoryToMonthly(rangeHistory);
+      const firstPoint = rangeHistory[0];
+      const byDate = new Map<string, typeof rangeHistory[number]>();
+      if (firstPoint) byDate.set(firstPoint.date, firstPoint);
+      downsampled.forEach(point => byDate.set(point.date, point));
+      return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
+    }
+    return rangeHistory;
+  }, [rangeHistory, chartGranularity, kpiGranularity]);
 
   const analytics = useMemo(() => {
-    if (!rawTrends) return null;
-    return calculateAnalytics(rawTrends.history, granularity);
-  }, [rawTrends, granularity]);
+    return calculateAnalytics(rangeHistory, kpiGranularity);
+  }, [rangeHistory, kpiGranularity]);
+
+  const analyticsAll = useMemo(() => {
+    if (!baseHistory.length) return null;
+    return calculateAnalytics(baseHistory, kpiGranularity);
+  }, [baseHistory, kpiGranularity]);
 
   // --- Data Preparation (Filtered by TimeRange) ---
 
@@ -250,35 +345,52 @@ export const Dashboard: React.FC = () => {
     return calculateAllocationByAssetClass(state, instruments);
   }, [state, instruments]);
 
-  // Common Date Calculation
-  const startDate = useMemo(() => {
-    const now = new Date();
-    switch (timeRange) {
-      case '3M': return subMonths(now, 3);
-      case '6M': return subMonths(now, 6);
-      case '1Y': return subMonths(now, 12);
-      case '5Y': return subMonths(now, 60);
-      case '10Y': return subMonths(now, 120);
-      case 'YTD': return new Date(now.getFullYear(), 0, 1);
-      default: return new Date(0);
-    }
-  }, [timeRange]);
+  const perfBaseNav = useMemo(() => {
+    const base = rangeHistory.find(point => point.value > 0);
+    return base?.value || 0;
+  }, [rangeHistory]);
 
-  // 1. Performance Chart Data
+  const hasPerfBase = perfBaseNav > 0;
+  const twrrBaseIndex = useMemo(() => {
+    const base = rangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
+    return base?.cumulativeTWRRIndex || 1;
+  }, [rangeHistory]);
+
+  const mwrrSeries = useMemo(() => {
+    if (metric !== 'MWRR' || !rangeHistory.length) return [];
+    return computeMwrrSeries(rangeHistory, transactions || []);
+  }, [metric, rangeHistory, transactions]);
+
+  // 1. Performance Chart Data (downsampled for rendering only)
   const chartData = useMemo(() => {
-    if (!rawTrends) return [];
-    const data = [...rawTrends.history];
+    if (!chartHistory.length) return [];
+    const mwrrSorted = mwrrSeries.slice().sort((a, b) => a.date.localeCompare(b.date));
+    let mwrrIdx = 0;
+    let lastMwrr = 0;
 
-    return data
-      .filter(d => new Date(d.date) >= startDate)
-      .map(d => ({
-        ...d,
-        displayDate: format(new Date(d.date), 'MMM yy'),
-        metricValue: metric === 'PERF' ? d.value :
-          metric === 'TWRR' ? d.cumulativeReturnPct :
-            (d.invested > 0 ? ((d.value - d.invested) / d.invested) * 100 : 0)
-      }));
-  }, [rawTrends, startDate, metric]);
+    return chartHistory.map(point => {
+      while (mwrrIdx < mwrrSorted.length && mwrrSorted[mwrrIdx].date <= point.date) {
+        lastMwrr = mwrrSorted[mwrrIdx].mwrrPct;
+        mwrrIdx += 1;
+      }
+      const perfIndex = hasPerfBase ? (100 * point.value / perfBaseNav) : 100;
+      const perfPct = hasPerfBase ? ((point.value / perfBaseNav) - 1) * 100 : 0;
+      const twrrRangePct = twrrBaseIndex > 0
+        ? (((point.cumulativeTWRRIndex ?? 1) / twrrBaseIndex) - 1) * 100
+        : 0;
+      const metricValue = metric === 'PERF'
+        ? (valueMode === 'PERF_INDEX' ? perfIndex : point.value)
+        : (metric === 'TWRR' ? twrrRangePct : lastMwrr);
+      return {
+        ...point,
+        displayDate: format(new Date(point.date), 'MMM yy'),
+        perfIndex,
+        perfPct,
+        twrrRangePct,
+        metricValue
+      };
+    });
+  }, [chartHistory, mwrrSeries, metric, valueMode, hasPerfBase, perfBaseNav, twrrBaseIndex]);
 
   const lastChartPoint = useMemo(() => {
     if (!chartData.length) return null;
@@ -286,16 +398,34 @@ export const Dashboard: React.FC = () => {
   }, [chartData]);
 
   const investedAtEnd = useMemo(() => {
-    if (!rawTrends) return 0;
-    const filtered = rawTrends.history.filter(d => new Date(d.date) >= startDate);
-    if (!filtered.length) return 0;
-    return filtered[filtered.length - 1].invested || 0;
-  }, [rawTrends, startDate]);
+    if (!rangeHistory.length) return 0;
+    return rangeHistory[rangeHistory.length - 1].invested || 0;
+  }, [rangeHistory]);
 
   const renderChartTooltip = ({ active, payload, label }: any) => {
     if (!active || !payload || !payload.length) return null;
     const point = payload[0]?.payload;
     if (!point) return null;
+
+    if (metric === 'PERF' && valueMode === 'PERF_INDEX') {
+      const perfIndex = typeof point.perfIndex === 'number' ? point.perfIndex : 100;
+      const perfPct = typeof point.perfPct === 'number' ? point.perfPct : 0;
+      return (
+        <div className="bg-white border border-borderSoft rounded-xl shadow-xl px-4 py-3 min-w-[220px]">
+          <div className="text-xs text-slate-500 mb-1">{point.displayDate || label}</div>
+          <div className="flex items-center justify-between text-sm font-bold text-slate-900">
+            <span>Indice 100</span>
+            <span>{perfIndex.toFixed(2)}</span>
+          </div>
+          <div className="flex items-center justify-between text-xs mt-1">
+            <span className="text-slate-600">Rendimento</span>
+            <span className={clsx("font-bold", perfPct >= 0 ? "text-green-600" : "text-red-600")}>
+              {`${perfPct.toFixed(2)}%`}
+            </span>
+          </div>
+        </div>
+      );
+    }
 
     if (metric === 'PERF') {
       const value = point.value ?? 0;
@@ -337,14 +467,12 @@ export const Dashboard: React.FC = () => {
 
   // 2. Drawdown Chart Data
   const drawdownData = useMemo(() => {
-    if (!analytics || !rawTrends) return [];
-    return analytics.drawdownSeries
-      .filter(d => new Date(d.date) >= startDate)
-      .map(d => ({
-        ...d,
-        displayDate: format(new Date(d.date), 'MMM yy')
-      }));
-  }, [analytics, rawTrends, startDate]);
+    if (!analyticsAll) return [];
+    return analyticsAll.drawdownSeries.map(d => ({
+      ...d,
+      displayDate: format(new Date(d.date), 'MMM yy')
+    }));
+  }, [analyticsAll]);
 
   const regionExposure = useMemo(() => {
     if (!state || !instruments) return [];
@@ -354,16 +482,11 @@ export const Dashboard: React.FC = () => {
   const unassignedRegion = useMemo(() => regionExposure.find(r => r.region === 'UNASSIGNED'), [regionExposure]);
   const hasIncompleteRegionData = !!(unassignedRegion && unassignedRegion.value > 0);
 
-  // 3. Annual Returns (Filtered Bars)
-  const filteredAnnualReturns = useMemo(() => {
-    if (!analytics) return [];
-    const startYear = getYear(startDate);
-
-    // For MAX, return all. For others, return years >= start year of filter
-    if (timeRange === 'MAX') return analytics.annualReturns;
-
-    return analytics.annualReturns.filter(d => d.year >= startYear);
-  }, [analytics, startDate, timeRange]);
+  // 3. Annual Returns (Full History)
+  const annualReturns = useMemo(() => {
+    if (!analyticsAll) return [];
+    return analyticsAll.annualReturns;
+  }, [analyticsAll]);
 
   // 4. Bar Data
   const currencyBars = useMemo(() => {
@@ -391,6 +514,9 @@ export const Dashboard: React.FC = () => {
   );
 
   const [macroInfoOpen, setMacroInfoOpen] = useState(false);
+  const maxDrawdownValue = analytics?.maxDrawdown ?? 0;
+  const chartGranularityLabel = chartGranularity === 'monthly' ? 'Monthly' : 'Daily';
+  const kpiGranularityLabel = kpiGranularity === 'monthly' ? 'Monthly' : 'Daily';
 
 
   return (
@@ -411,12 +537,12 @@ export const Dashboard: React.FC = () => {
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-3 md:gap-4">
           <KPICard
             title="Capitale Iniziale"
-            value={`CHF ${(state.investedCapital / 1000).toFixed(1)}k`}
+            value={`CHF ${((state?.investedCapital ?? 0) / 1000).toFixed(1)}k`}
             subValue="Investito Netto"
           />
           <KPICard
             title="Capitale Finale"
-            value={`CHF ${(state.totalValue / 1000).toFixed(1)}k`}
+            value={`CHF ${((state?.totalValue ?? 0) / 1000).toFixed(1)}k`}
             subValue="Valore Attuale"
             highlight
           />
@@ -437,7 +563,7 @@ export const Dashboard: React.FC = () => {
           />
           <KPICard
             title="Drawdown Max"
-            value={`${analytics.maxDrawdown.toFixed(2)}%`}
+            value={`${maxDrawdownValue.toFixed(2)}%`}
             subValue="Dal picco max"
             alert
           />
@@ -463,6 +589,29 @@ export const Dashboard: React.FC = () => {
             ))}
           </div>
 
+          {/* Value/Performance Toggle */}
+          <div className={clsx(
+            "flex bg-white p-1 rounded-xl shadow border border-borderSoft",
+            metric !== 'PERF' && "opacity-60 pointer-events-none"
+          )}>
+            {([
+              { key: 'NAV', label: 'Valore (NAV)' },
+              { key: 'PERF_INDEX', label: 'Performance' }
+            ] as const).map(option => (
+              <button
+                key={option.key}
+                onClick={() => setValueMode(option.key)}
+                className={clsx(
+                  "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
+                  valueMode === option.key ? "text-white shadow-md bg-[#0052a3]" : "text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                )}
+                title={option.key === 'PERF_INDEX' ? 'Indice 100 rebased sul range' : 'NAV in valuta base'}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
           {/* Time Toggle (ORANGE ACCENT) */}
           <div className="flex bg-white p-1 rounded-xl shadow border border-borderSoft overflow-x-auto no-scrollbar">
             {(['3M', '6M', '1Y', '5Y', 'YTD', 'MAX'] as const).map(t => (
@@ -478,6 +627,15 @@ export const Dashboard: React.FC = () => {
               </button>
             ))}
           </div>
+        </div>
+        <div className="text-[11px] text-slate-500 mt-2 md:mt-0 md:ml-auto">
+          {`Chart: ${chartGranularityLabel} (KPI: ${kpiGranularityLabel})`}
+          {kpiGranularity === 'monthly' && (
+            <span className="ml-2 px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">KPI Monthly</span>
+          )}
+          {metric === 'PERF' && valueMode === 'PERF_INDEX' && !hasPerfBase && (
+            <span className="ml-2 text-amber-600 font-bold">Base NAV non disponibile</span>
+          )}
         </div>
       </div>
 
@@ -495,6 +653,7 @@ export const Dashboard: React.FC = () => {
             renderContent={() => (
               <div className="text-sm space-y-1">
                 <p><strong>Valore:</strong> profitto vs investito (CHF).</p>
+                <p><strong>Performance:</strong> indice 100 rebased sul range.</p>
                 <p><strong>TWRR:</strong> rendimento ponderato nel tempo (indipendente dai flussi).</p>
                 <p><strong>MWRR:</strong> rendimento ponderato per il denaro (sensibile a depositi/prelievi).</p>
               </div>
@@ -517,7 +676,14 @@ export const Dashboard: React.FC = () => {
               )}
             </div>
             <div className="text-xl font-bold text-slate-900 flex items-center gap-2">
-              {metric === 'PERF' && lastChartPoint && investedAtEnd > 0 ? (
+              {metric === 'PERF' && valueMode === 'PERF_INDEX' && lastChartPoint ? (
+                <>
+                  <span>{`Indice ${lastChartPoint.perfIndex.toFixed(1)}`}</span>
+                  <span className={clsx("text-sm font-bold", lastChartPoint.perfPct >= 0 ? "text-green-600" : "text-red-600")}>
+                    {`${lastChartPoint.perfPct.toFixed(2)}%`}
+                  </span>
+                </>
+              ) : metric === 'PERF' && lastChartPoint && investedAtEnd > 0 ? (
                 <>
                   <span>{`CHF ${(lastChartPoint.value - investedAtEnd).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}</span>
                   <span className={clsx("text-sm font-bold", (lastChartPoint.value - investedAtEnd) >= 0 ? "text-green-600" : "text-red-600")}>
@@ -582,7 +748,9 @@ export const Dashboard: React.FC = () => {
                   ifOverflow="visible"
                   label={{
                     position: 'top',
-                    value: metric === 'PERF' ? '' : `${lastChartPoint.metricValue.toFixed(2)}%`,
+                    value: metric === 'PERF'
+                      ? (valueMode === 'PERF_INDEX' ? lastChartPoint.perfIndex.toFixed(1) : '')
+                      : `${lastChartPoint.metricValue.toFixed(2)}%`,
                     fill: '#0f172a',
                     fontSize: 11,
                     fontWeight: 700
@@ -604,7 +772,7 @@ export const Dashboard: React.FC = () => {
           </h3>
           <div className="h-64 w-full">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={filteredAnnualReturns}>
+              <BarChart data={annualReturns}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#334155" opacity={0.3} />
                 <XAxis dataKey="year" tick={{ fontSize: 11, fill: '#64748b' }} axisLine={false} tickLine={false} dy={10} />
                 <Tooltip
@@ -619,7 +787,7 @@ export const Dashboard: React.FC = () => {
                 />
                 <ReferenceLine y={0} stroke="#475569" />
                 <Bar dataKey="returnPct" radius={[4, 4, 0, 0]}>
-                  {filteredAnnualReturns.map((entry, index) => (
+                  {annualReturns.map((entry, index) => (
                     <Cell
                       key={`cell-${index}`}
                       fill={entry.returnPct >= 0 ? PRIMARY_BLUE : ACCENT_ORANGE}

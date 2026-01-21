@@ -8,10 +8,119 @@ const toDate = (dateInput: string | Date | number): Date => {
   return new Date(dateInput);
 };
 
+const toDateString = (dateInput: string | Date | number): string => {
+  if (typeof dateInput === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateInput)) {
+    const [y, m, d] = dateInput.split('-').map(Number);
+    return format(new Date(y, m - 1, d), 'yyyy-MM-dd');
+  }
+  return format(toDate(dateInput), 'yyyy-MM-dd');
+};
+
 // Helper sicuro per divisioni
 const safeDiv = (num: number, den: number): number => {
   if (den === 0 || isNaN(den)) return 0;
   return num / den;
+};
+
+type Cashflow = { date: string; amount: number };
+
+const sumCashflowsByDate = (flows: Cashflow[]): Cashflow[] => {
+  const map = new Map<string, number>();
+  flows.forEach(f => map.set(f.date, (map.get(f.date) || 0) + f.amount));
+  return Array.from(map.entries())
+    .map(([date, amount]) => ({ date, amount }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+};
+
+export const computeXIRR = (cashflows: Cashflow[], guess = 0.1): number | null => {
+  if (cashflows.length === 0) return null;
+  const toDays = (d: string) => new Date(d).getTime();
+  const t0 = toDays(cashflows[0].date);
+
+  const npv = (rate: number) => cashflows.reduce((acc, cf) => {
+    const days = (toDays(cf.date) - t0) / (1000 * 60 * 60 * 24);
+    return acc + cf.amount / Math.pow(1 + rate, days / 365.25);
+  }, 0);
+
+  const dNpv = (rate: number) => cashflows.reduce((acc, cf) => {
+    const days = (toDays(cf.date) - t0) / (1000 * 60 * 60 * 24);
+    const frac = days / 365.25;
+    return acc - (cf.amount * frac) / Math.pow(1 + rate, frac + 1);
+  }, 0);
+
+  let x = guess;
+  for (let i = 0; i < 50; i++) {
+    const f = npv(x);
+    const df = dNpv(x);
+    if (Math.abs(df) < 1e-10) break;
+    const next = x - f / df;
+    if (Math.abs(next - x) < 1e-7) return next;
+    x = next;
+  }
+  return null;
+};
+
+const buildMwrrCashflows = (transactions: Transaction[]): Cashflow[] => {
+  const hasExternal = transactions.some(t => t.type === TransactionType.Deposit || t.type === TransactionType.Withdrawal);
+  const cashflows: Cashflow[] = [];
+
+  transactions.forEach(t => {
+    const dateStr = toDateString(t.date);
+    const qty = t.quantity || 0;
+    const price = t.price || 0;
+    const fees = t.fees || 0;
+
+    if (t.type === TransactionType.Deposit) cashflows.push({ date: dateStr, amount: -qty });
+    if (t.type === TransactionType.Withdrawal) cashflows.push({ date: dateStr, amount: qty });
+    if (t.type === TransactionType.Dividend) cashflows.push({ date: dateStr, amount: qty });
+    if (t.type === TransactionType.Fee) cashflows.push({ date: dateStr, amount: -(fees || qty) });
+
+    if (!hasExternal && t.instrumentTicker) {
+      if (t.type === TransactionType.Buy) cashflows.push({ date: dateStr, amount: -((qty * price) + fees) });
+      if (t.type === TransactionType.Sell) cashflows.push({ date: dateStr, amount: (qty * price) - fees });
+    }
+  });
+
+  return sumCashflowsByDate(cashflows);
+};
+
+export const computeMwrrSeries = (
+  history: PerformancePoint[],
+  transactions: Transaction[]
+): { date: string; mwrrPct: number }[] => {
+  if (history.length === 0) return [];
+
+  const startDate = history[0].date;
+  const endDate = history[history.length - 1].date;
+  const cashflowsAll = buildMwrrCashflows(transactions);
+  const hasBeforeStart = cashflowsAll.some(cf => cf.date < startDate);
+  const cashflowsInRange = cashflowsAll.filter(cf => cf.date >= startDate && cf.date <= endDate);
+
+  const startValue = history[0].value || 0;
+  const startNetFlow = cashflowsInRange
+    .filter(cf => cf.date === startDate)
+    .reduce((sum, cf) => sum + cf.amount, 0);
+  const initialAmount = startValue - startNetFlow;
+  const initialFlow = hasBeforeStart && initialAmount > 0
+    ? { date: startDate, amount: -initialAmount }
+    : null;
+
+  const flowsSorted = [...cashflowsInRange].sort((a, b) => a.date.localeCompare(b.date));
+  const activeFlows: Cashflow[] = initialFlow ? [initialFlow] : [];
+  let flowIdx = 0;
+
+  return history.map(point => {
+    while (flowIdx < flowsSorted.length && flowsSorted[flowIdx].date <= point.date) {
+      activeFlows.push(flowsSorted[flowIdx]);
+      flowIdx += 1;
+    }
+    if (point.date === startDate) {
+      return { date: point.date, mwrrPct: 0 };
+    }
+    const irrFlows = [...activeFlows, { date: point.date, amount: point.value }];
+    const rate = computeXIRR(irrFlows);
+    return { date: point.date, mwrrPct: rate !== null ? rate * 100 : 0 };
+  });
 };
 
 // Helper to get price at specific date

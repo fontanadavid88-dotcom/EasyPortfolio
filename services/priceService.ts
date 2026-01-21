@@ -3,6 +3,9 @@ import { Instrument, PricePoint, TransactionType } from '../types';
 import { format, subDays, addDays, differenceInCalendarDays } from 'date-fns';
 import Dexie from 'dexie';
 
+const EODHD_PROXY_BASE = '/api/eodhd/api';
+const PROXY_ERROR_MESSAGE = 'Impossibile raggiungere proxy API';
+
 interface PriceProvider {
   getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null>;
   getHistory(ticker: string, from: string, to: string): Promise<PricePoint[]>;
@@ -22,6 +25,10 @@ const resolveInstrumentForTicker = (instruments: Instrument[], ticker: string): 
   return instruments.find(i => i.preferredListing?.symbol === ticker)
     || instruments.find(i => i.ticker === ticker)
     || instruments.find(i => i.listings?.some(l => l.symbol === ticker));
+};
+
+const getCanonicalTickerFromInstrument = (instrument: Instrument): string => {
+  return instrument.preferredListing?.symbol || instrument.ticker;
 };
 
 export const buildCoverageRows = (
@@ -59,34 +66,37 @@ export const buildCoverageRows = (
 
 // 1. EODHD Provider
 class EodhdPriceProvider implements PriceProvider {
-  private apiKey: string;
-  private baseUrl = 'https://eodhd.com/api';
-
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
-  }
+  private baseUrl = EODHD_PROXY_BASE;
 
   async getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null> {
-    if (!this.apiKey) return null;
     try {
       // For real implementation, use EODHD real-time or EOD endpoint
-      const response = await fetch(`${this.baseUrl}/real-time/${ticker}?api_token=${this.apiKey}&fmt=json`);
+      const response = await fetch(`${this.baseUrl}/real-time/${encodeURIComponent(ticker)}?fmt=json`);
+      if (!response.ok) {
+        if (response.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
+        return null;
+      }
       const data = await response.json();
       return {
         close: data.close,
         date: format(new Date(), 'yyyy-MM-dd')
       };
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.message === PROXY_ERROR_MESSAGE) throw e;
+      if (e instanceof TypeError) throw new Error(PROXY_ERROR_MESSAGE);
       console.error('EODHD Latest Error', e);
       return null;
     }
   }
 
   async getHistory(ticker: string, from: string, to: string): Promise<PricePoint[]> {
-    if (!this.apiKey) return [];
     try {
-      const url = `${this.baseUrl}/eod/${ticker}?api_token=${this.apiKey}&from=${from}&to=${to}&fmt=json`;
+      const url = `${this.baseUrl}/eod/${encodeURIComponent(ticker)}?from=${from}&to=${to}&fmt=json`;
       const res = await fetch(url);
+      if (!res.ok) {
+        if (res.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
+        return [];
+      }
       const data = await res.json();
       
       if (!Array.isArray(data)) return [];
@@ -97,7 +107,9 @@ class EodhdPriceProvider implements PriceProvider {
         close: d.close,
         currency: 'USD' as any // API usually doesn't return currency in EOD, needs master data. Assuming basic mapping or user input.
       }));
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.message === PROXY_ERROR_MESSAGE) throw e;
+      if (e instanceof TypeError) throw new Error(PROXY_ERROR_MESSAGE);
       console.error('EODHD History Error', e);
       return [];
     }
@@ -116,7 +128,13 @@ class GoogleSheetsPriceProvider implements PriceProvider {
     if (!this.sheetUrl) return [];
     try {
       // Using Google Viz API logic to parse JSONP-like response
-      const res = await fetch(this.sheetUrl);
+      const res = await fetch(`/api/sheets?url=${encodeURIComponent(this.sheetUrl)}`);
+      if (!res.ok) {
+        const msg = await res.text();
+        if (res.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
+        console.error('Sheet fetch error', msg);
+        return [];
+      }
       const text = await res.text();
       // Remove "/*O_o*/ google.visualization.Query.setResponse(" and ");"
       const jsonText = text.substring(47).slice(0, -2);
@@ -131,7 +149,9 @@ class GoogleSheetsPriceProvider implements PriceProvider {
         };
       });
       return rows;
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.message === PROXY_ERROR_MESSAGE) throw e;
+      if (e instanceof TypeError) throw new Error(PROXY_ERROR_MESSAGE);
       console.error('Sheet fetch error', e);
       return [];
     }
@@ -161,7 +181,7 @@ export const syncPrices = async () => {
   if (!settings) return;
 
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
-  const eodhd = new EodhdPriceProvider(settings.eodhdApiKey);
+  const eodhd = new EodhdPriceProvider();
   const sheet = new GoogleSheetsPriceProvider(settings.googleSheetUrl);
 
   const today = format(new Date(), 'yyyy-MM-dd');
@@ -171,10 +191,12 @@ export const syncPrices = async () => {
 
   for (const instr of instruments) {
     if (instr.type === 'Cash') continue;
+    const priceTicker = getCanonicalTickerFromInstrument(instr);
+    const priceCurrency = instr.preferredListing?.currency || instr.currency;
 
     const existing = await db.prices
       .where('[ticker+date]')
-      .between([instr.ticker, Dexie.minKey], [instr.ticker, Dexie.maxKey])
+      .between([priceTicker, Dexie.minKey], [priceTicker, Dexie.maxKey])
       .and(p => p.portfolioId === portfolioId)
       .sortBy('date');
 
@@ -191,17 +213,17 @@ export const syncPrices = async () => {
     if (startDate === today) continue;
 
     // 1. Try EODHD History
-    let newPoints = await eodhd.getHistory(instr.ticker, startDate, today);
+    let newPoints = await eodhd.getHistory(priceTicker, startDate, today);
     
     // 2. If EODHD fails or is empty, try Sheet for at least the latest price
     if (newPoints.length === 0) {
-      const latest = await sheet.getLatestPrice(instr.ticker);
+      const latest = await sheet.getLatestPrice(priceTicker);
       if (latest && latest.close) {
         newPoints.push({
-          ticker: instr.ticker,
+          ticker: priceTicker,
           date: latest.date || today,
           close: latest.close,
-          currency: (latest.currency as any) || instr.currency
+          currency: (latest.currency as any) || priceCurrency
         });
       }
     }
@@ -211,7 +233,8 @@ export const syncPrices = async () => {
       // Ensure currency is set correctly from instrument if missing
       const pointsToSave = newPoints.map(p => ({
         ...p,
-        currency: p.currency || instr.currency
+        ticker: priceTicker,
+        currency: p.currency || priceCurrency
       }));
       await db.prices.bulkPut(pointsToSave.map(p => ({ ...p, portfolioId })));
     }
@@ -221,9 +244,12 @@ export const syncPrices = async () => {
 // Helpers per backfill
 export const getTickersForBackfill = async (portfolioId: string, scope: 'current' | 'all'): Promise<string[]> => {
   const tx = await db.transactions.where('portfolioId').equals(portfolioId).toArray();
+  const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
+  const canonicalByTicker = new Map(instruments.map(i => [i.ticker, getCanonicalTickerFromInstrument(i)]));
+  const mapCanonical = (ticker: string) => canonicalByTicker.get(ticker) || ticker;
   if (scope === 'all') {
     const all = Array.from(new Set(tx.map(t => t.instrumentTicker).filter(Boolean))) as string[];
-    return all;
+    return Array.from(new Set(all.map(mapCanonical)));
   }
 
   const qtyMap = new Map<string, number>();
@@ -238,9 +264,9 @@ export const getTickersForBackfill = async (portfolioId: string, scope: 'current
     .map(([ticker]) => ticker);
   if (current.length === 0) {
     const all = Array.from(new Set(tx.map(t => t.instrumentTicker).filter(Boolean))) as string[];
-    return all;
+    return Array.from(new Set(all.map(mapCanonical)));
   }
-  return current;
+  return Array.from(new Set(current.map(mapCanonical)));
 };
 
 export const getPriceCoverage = async (portfolioId: string, tickers: string[], minHistoryDate: string) => {
@@ -281,13 +307,13 @@ export const backfillPricesForPortfolio = async (
   onProgress?: (info: { ticker: string; index: number; total: number; phase: 'backfill' | 'forward' | 'done'; error?: string }) => void
 ) => {
   const settings = await db.settings.where('portfolioId').equals(portfolioId).first();
-  if (!settings || !settings.eodhdApiKey) {
-    const msg = 'API key EODHD mancante';
+  if (!settings) {
+    const msg = 'Impostazioni mancanti';
     if (onProgress) onProgress({ ticker: '', index: 0, total: tickers.length, phase: 'done', error: msg });
     throw new Error(msg);
   }
 
-  const eodhd = new EodhdPriceProvider(settings.eodhdApiKey);
+  const eodhd = new EodhdPriceProvider();
   const today = format(new Date(), 'yyyy-MM-dd');
 
   for (let i = 0; i < tickers.length; i++) {
@@ -321,7 +347,9 @@ export const backfillPricesForPortfolio = async (
         await new Promise(res => setTimeout(res, 400)); // rate-limit soft
       }
     } catch (e: any) {
-      if (onProgress) onProgress({ ticker, index: i + 1, total: tickers.length, phase: 'backfill', error: e?.message || String(e) });
+      const message = e?.message || String(e);
+      if (onProgress) onProgress({ ticker, index: i + 1, total: tickers.length, phase: 'backfill', error: message });
+      if (message === PROXY_ERROR_MESSAGE) throw e;
     }
   }
   if (onProgress) onProgress({ ticker: '', index: tickers.length, total: tickers.length, phase: 'done' });

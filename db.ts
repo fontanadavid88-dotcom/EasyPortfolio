@@ -1,4 +1,4 @@
-import Dexie, { Table } from 'dexie';
+import Dexie, { Table, Transaction as DexieTransaction } from 'dexie';
 import { Instrument, Transaction, PricePoint, MacroIndicator, AppSettings, Currency, AssetType, TransactionType, AssetClass } from './types';
 import { subDays, format } from 'date-fns';
 
@@ -31,7 +31,7 @@ export class PortfolioDB extends Dexie {
       portfolios: '++id, portfolioId',
       instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
       fxRates: '++id, [baseCurrency+quoteCurrency+date]'
-    }).upgrade(tx => {
+    }).upgrade((tx: DexieTransaction) => {
       const defaultId = 'default';
       tx.table('instruments').toCollection().modify((obj: any) => { obj.portfolioId = obj.portfolioId || defaultId; });
       tx.table('transactions').toCollection().modify((obj: any) => { obj.portfolioId = obj.portfolioId || defaultId; });
@@ -49,7 +49,7 @@ export class PortfolioDB extends Dexie {
       portfolios: '++id, portfolioId',
       instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
       fxRates: '++id, [baseCurrency+quoteCurrency+date]'
-    }).upgrade(tx => {
+    }).upgrade((tx: DexieTransaction) => {
       tx.table('settings').toCollection().modify((obj: any) => {
         obj.minHistoryDate = obj.minHistoryDate || '2020-01-01';
         obj.priceBackfillScope = obj.priceBackfillScope || 'current';
@@ -65,7 +65,7 @@ export class PortfolioDB extends Dexie {
       portfolios: '++id, portfolioId',
       instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
       fxRates: '++id, [baseCurrency+quoteCurrency+date]'
-    }).upgrade(tx => {
+    }).upgrade((tx: DexieTransaction) => {
       tx.table('instruments').toCollection().modify((obj: any) => {
         if (!obj.assetClass) {
           if (obj.type === AssetType.Crypto) obj.assetClass = AssetClass.CRYPTO;
@@ -86,7 +86,7 @@ export class PortfolioDB extends Dexie {
       portfolios: '++id, portfolioId',
       instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
       fxRates: '++id, [baseCurrency+quoteCurrency+date]'
-    }).upgrade(tx => {
+    }).upgrade((tx: DexieTransaction) => {
       tx.table('instruments').toCollection().modify((obj: any) => {
         obj.regionAllocation = obj.regionAllocation || null;
       });

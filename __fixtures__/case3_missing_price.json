@@ -1,0 +1,11 @@
+{
+  "instruments": [
+    { "ticker": "MISSING", "name": "Missing Price", "type": "Stock", "assetClass": "STOCK", "currency": "CHF" }
+  ],
+  "transactions": [
+    { "date": "2023-03-01", "type": "Buy", "instrumentTicker": "MISSING", "quantity": 1, "price": 50, "fees": 0, "currency": "CHF", "account": "TEST" }
+  ],
+  "prices": [
+    { "ticker": "MISSING", "date": "2023-03-10", "close": 55, "currency": "CHF" }
+  ]
+}
