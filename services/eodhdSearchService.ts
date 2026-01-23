@@ -1,10 +1,12 @@
 import { InstrumentListing, Currency } from '../types';
 
 // Risoluzione listing da ISIN usando EODHD Search API
-export const resolveListingsByIsin = async (isin: string): Promise<InstrumentListing[]> => {
-  const url = `/api/eodhd/api/search/${encodeURIComponent(isin)}?fmt=json`;
+export const resolveListingsByIsin = async (isin: string, apiKey?: string): Promise<InstrumentListing[]> => {
+  const params = new URLSearchParams({ path: `/api/search/${encodeURIComponent(isin)}`, fmt: 'json' });
+  const url = `/api/eodhd-proxy?${params.toString()}`;
   try {
-    const res = await fetch(url);
+    const headers = apiKey?.trim() ? { 'x-eodhd-key': apiKey.trim() } : undefined;
+    const res = await fetch(url, headers ? { headers } : undefined);
     if (!res.ok) {
       const msg = await res.text();
       throw new Error(msg || 'Impossibile raggiungere proxy API');
