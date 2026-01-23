@@ -1,4 +1,9 @@
 const proc = (globalThis as any).process;
+const isDev = proc?.env?.NODE_ENV !== 'production';
+const devLog = (...args: unknown[]) => {
+  if (!isDev) return;
+  console.log('[eodhd-proxy]', ...args);
+};
 
 const readHeader = (req: any, name: string): string => {
   if (!req) return '';
@@ -49,7 +54,7 @@ export default async function handler(req?: unknown, res?: any): Promise<Respons
     return buildJsonResponse({ error: 'Missing or invalid path' }, 400);
   }
 
-  const headerKey = readHeader(req, 'x-eodhd-key');
+  const headerKey = readHeader(req, 'x-eodhd-key') || readHeader(req, 'x-eodhd-api-key');
   const envKey = proc?.env?.EODHD_API_KEY as string | undefined;
   const apiKey = (headerKey || envKey || '').trim();
   if (!apiKey) {
@@ -77,9 +82,11 @@ export default async function handler(req?: unknown, res?: any): Promise<Respons
   });
   upstreamUrl.searchParams.set('api_token', apiKey);
 
+  devLog('upstream', upstreamUrl.toString());
   const upstream = await fetch(upstreamUrl.toString(), {
     method: 'GET'
   });
+  devLog('status', upstream.status);
   const upstreamType = upstream.headers.get('content-type') || '';
   const contentType = upstreamType.includes('application/json')
     ? 'application/json; charset=utf-8'
