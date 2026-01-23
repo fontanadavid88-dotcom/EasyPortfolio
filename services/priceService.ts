@@ -1,5 +1,5 @@
 import { db, getCurrentPortfolioId } from '../db';
-import { Instrument, PricePoint, TransactionType } from '../types';
+import { Currency, Instrument, PricePoint, TransactionType } from '../types';
 import { format, subDays, addDays, differenceInCalendarDays } from 'date-fns';
 import Dexie from 'dexie';
 
@@ -33,6 +33,13 @@ export interface CoverageRow {
   to: string;
   status: 'OK' | 'INCOMPLETO' | 'PARZIALE';
 }
+
+export type SyncPricesSummary = {
+  status: 'ok' | 'partial' | 'failed';
+  updatedTickers: string[];
+  failedTickers: { ticker: string; reason: string }[];
+  sheet: { enabled: boolean; reason?: string };
+};
 
 const resolveInstrumentForTicker = (instruments: Instrument[], ticker: string): Instrument | undefined => {
   return instruments.find(i => i.preferredListing?.symbol === ticker)
@@ -93,7 +100,7 @@ class EodhdPriceProvider implements PriceProvider {
       const response = await fetch(url, headers ? { headers } : undefined);
       if (!response.ok) {
         if (response.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
-        return null;
+        throw new Error(`EODHD ${response.status}`);
       }
       const data = await response.json();
       return {
@@ -115,7 +122,7 @@ class EodhdPriceProvider implements PriceProvider {
       const res = await fetch(url, headers ? { headers } : undefined);
       if (!res.ok) {
         if (res.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
-        return [];
+        throw new Error(`EODHD ${res.status}`);
       }
       const data = await res.json();
       
@@ -137,49 +144,106 @@ class EodhdPriceProvider implements PriceProvider {
 }
 
 // 2. Google Sheet Provider
+type SheetRow = { ticker: string; close: number; currency?: Currency };
+type SheetFetchResult = { rows: SheetRow[]; disabledReason?: string };
+
 class GoogleSheetsPriceProvider implements PriceProvider {
   private sheetUrl: string;
+  private cached?: SheetFetchResult;
 
   constructor(sheetUrl: string) {
     this.sheetUrl = sheetUrl;
   }
 
-  private async fetchSheetData(): Promise<any[]> {
-    if (!this.sheetUrl) return [];
+  private parseJsonRows(raw: any): SheetRow[] | null {
+    if (Array.isArray(raw)) {
+      return raw
+        .map((row: any) => ({
+          ticker: String(row.ticker || row.Ticker || '').trim(),
+          close: Number(row.close ?? row.Close),
+          currency: (row.currency || row.Currency) as Currency | undefined
+        }))
+        .filter(r => r.ticker && Number.isFinite(r.close));
+    }
+    return null;
+  }
+
+  private parseGvizRows(text: string): SheetRow[] | null {
+    if (!text.includes('google.visualization.Query.setResponse')) return null;
+    const jsonText = text.substring(47).slice(0, -2);
+    const json = JSON.parse(jsonText);
+    if (!json?.table?.rows) return null;
+    return json.table.rows.map((r: any) => ({
+      ticker: r.c[0]?.v,
+      close: r.c[1]?.v,
+      currency: r.c[2]?.v as Currency | undefined
+    })).filter((r: any) => r.ticker && Number.isFinite(r.close));
+  }
+
+  async getSheetRows(): Promise<SheetFetchResult> {
+    if (this.cached) return this.cached;
+    const rawUrl = this.sheetUrl?.trim() || '';
+    if (!rawUrl) {
+      this.cached = { rows: [], disabledReason: 'Sheet URL non configurato' };
+      return this.cached;
+    }
+    let parsed: URL | null = null;
     try {
-      // Using Google Viz API logic to parse JSONP-like response
-      const res = await fetch(`/api/sheets?url=${encodeURIComponent(this.sheetUrl)}`);
+      parsed = new URL(rawUrl);
+    } catch {
+      this.cached = { rows: [], disabledReason: 'Sheet URL non valido' };
+      return this.cached;
+    }
+
+    const urlLooksGviz = parsed.pathname.includes('/gviz') || parsed.searchParams.has('gviz');
+    const urlLooksExport = parsed.searchParams.has('output') || parsed.searchParams.has('format');
+    if (!urlLooksGviz && !urlLooksExport) {
+      this.cached = { rows: [], disabledReason: 'Sheet URL non è un endpoint export' };
+      return this.cached;
+    }
+
+    try {
+      const res = await fetch(`/api/sheets?url=${encodeURIComponent(rawUrl)}`);
       if (!res.ok) {
         const msg = await res.text();
         if (res.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
-        console.error('Sheet fetch error', msg);
-        return [];
+        console.warn('Sheet fetch error', msg);
+        this.cached = { rows: [], disabledReason: 'Sheet non disponibile' };
+        return this.cached;
       }
       const text = await res.text();
-      // Remove "/*O_o*/ google.visualization.Query.setResponse(" and ");"
-      const jsonText = text.substring(47).slice(0, -2);
-      const json = JSON.parse(jsonText);
-      
-      // Parse columns: [A] TICKER, [B] CLOSE, [C] CURRENCY
-      const rows = json.table.rows.map((r: any) => {
-        return {
-          ticker: r.c[0]?.v,
-          close: r.c[1]?.v,
-          currency: r.c[2]?.v
-        };
-      });
-      return rows;
+      const trimmed = text.trim();
+      if (!trimmed || trimmed.startsWith('<')) {
+        this.cached = { rows: [], disabledReason: 'Sheet ha risposto con HTML' };
+        return this.cached;
+      }
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        const parsedJson = JSON.parse(trimmed);
+        const rows = this.parseJsonRows(parsedJson);
+        if (rows) {
+          this.cached = { rows };
+          return this.cached;
+        }
+      }
+      const gvizRows = this.parseGvizRows(trimmed);
+      if (gvizRows) {
+        this.cached = { rows: gvizRows };
+        return this.cached;
+      }
+      this.cached = { rows: [], disabledReason: 'Sheet non è in formato supportato' };
+      return this.cached;
     } catch (e: any) {
       if (e?.message === PROXY_ERROR_MESSAGE) throw e;
       if (e instanceof TypeError) throw new Error(PROXY_ERROR_MESSAGE);
-      console.error('Sheet fetch error', e);
-      return [];
+      console.warn('Sheet fetch error', e);
+      this.cached = { rows: [], disabledReason: 'Sheet non disponibile' };
+      return this.cached;
     }
   }
 
   async getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null> {
-    const data = await this.fetchSheetData();
-    const row = data.find(r => r.ticker === ticker);
+    const result = await this.getSheetRows();
+    const row = result.rows.find(r => r.ticker === ticker);
     if (!row) return null;
     return {
       close: row.close,
@@ -195,20 +259,42 @@ class GoogleSheetsPriceProvider implements PriceProvider {
 }
 
 // 3. Orchestrator
-export const syncPrices = async (apiKeyOverride?: string) => {
+export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSummary> => {
+  const summary: SyncPricesSummary = {
+    status: 'ok',
+    updatedTickers: [],
+    failedTickers: [],
+    sheet: { enabled: true }
+  };
   const portfolioId = getCurrentPortfolioId();
   const settings = await db.settings.where('portfolioId').equals(portfolioId).first();
-  if (!settings) return;
+  if (!settings) {
+    summary.status = 'failed';
+    summary.failedTickers.push({ ticker: '*', reason: 'Impostazioni mancanti' });
+    summary.sheet = { enabled: false, reason: 'Impostazioni mancanti' };
+    return summary;
+  }
 
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
   const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey;
   const eodhd = new EodhdPriceProvider(eodhdKey);
   const sheet = new GoogleSheetsPriceProvider(settings.googleSheetUrl);
+  let sheetResult: SheetFetchResult = { rows: [] };
+  try {
+    sheetResult = await sheet.getSheetRows();
+    if (sheetResult.disabledReason) {
+      summary.sheet = { enabled: false, reason: sheetResult.disabledReason };
+    }
+  } catch (e: any) {
+    summary.sheet = { enabled: false, reason: e?.message || 'Sheet non disponibile' };
+  }
 
   const today = format(new Date(), 'yyyy-MM-dd');
-
   const allTx = await db.transactions.where('portfolioId').equals(portfolioId).sortBy('date');
-  const earliestDateNeeded = allTx.length > 0 ? format(subDays(allTx[0].date, 7), 'yyyy-MM-dd') : format(subDays(new Date(), 365), 'yyyy-MM-dd');
+  const earliestDateNeeded = allTx.length > 0
+    ? format(subDays(allTx[0].date, 7), 'yyyy-MM-dd')
+    : format(subDays(new Date(), 365), 'yyyy-MM-dd');
+  const failedSet = new Set<string>();
 
   for (const instr of instruments) {
     if (instr.type === 'Cash') continue;
@@ -233,10 +319,19 @@ export const syncPrices = async (apiKeyOverride?: string) => {
 
     if (startDate === today) continue;
 
-    // 1. Try EODHD History
-    let newPoints = await eodhd.getHistory(priceTicker, startDate, today);
-    
-    // 2. If EODHD fails or is empty, try Sheet for at least the latest price
+    let newPoints: PricePoint[] = [];
+    let eodhdError = '';
+
+    try {
+      newPoints = await eodhd.getHistory(priceTicker, startDate, today);
+    } catch (e: any) {
+      eodhdError = e?.message || 'Errore EODHD';
+      if (!failedSet.has(priceTicker)) {
+        summary.failedTickers.push({ ticker: priceTicker, reason: eodhdError || 'Errore EODHD' });
+        failedSet.add(priceTicker);
+      }
+    }
+
     if (newPoints.length === 0) {
       const latest = await sheet.getLatestPrice(priceTicker);
       if (latest && latest.close) {
@@ -249,17 +344,28 @@ export const syncPrices = async (apiKeyOverride?: string) => {
       }
     }
 
-    // 3. Save to DB
     if (newPoints.length > 0) {
-      // Ensure currency is set correctly from instrument if missing
       const pointsToSave = newPoints.map(p => ({
         ...p,
         ticker: priceTicker,
         currency: p.currency || priceCurrency
       }));
       await db.prices.bulkPut(pointsToSave.map(p => ({ ...p, portfolioId })));
+      summary.updatedTickers.push(priceTicker);
+    } else if (!eodhdError && !failedSet.has(priceTicker)) {
+      summary.failedTickers.push({ ticker: priceTicker, reason: 'Nessun dato disponibile' });
+      failedSet.add(priceTicker);
     }
   }
+
+  if (summary.failedTickers.length > 0) {
+    summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'failed';
+  }
+  if (!summary.sheet.enabled && summary.status === 'ok') {
+    summary.status = 'partial';
+  }
+
+  return summary;
 };
 
 // Helpers per backfill

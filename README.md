@@ -10,7 +10,7 @@ View your app in AI Studio: https://ai.studio/apps/drive/1K_4zP_gCiwEpqIRATO8uBr
 
 ## Run Locally
 
-**Prerequisites:**  Node.js
+**Prerequisites:**  Node.js (consigliato LTS 20/22)
 
 
 1. Install dependencies:
@@ -24,7 +24,7 @@ View your app in AI Studio: https://ai.studio/apps/drive/1K_4zP_gCiwEpqIRATO8uBr
 This app uses server-side proxies for price and sheet data to avoid CORS and keep secrets out of the client.
 
 - Set `EODHD_API_KEY` in Vercel Environment Variables (server-side only, not `VITE_*`).
-- The frontend calls `/api/eodhd/*` and `/api/sheets` (do not call EODHD or Google Sheets directly).
+- The frontend calls `/api/eodhd-proxy` and `/api/sheets` (do not call EODHD or Google Sheets directly).
 - For local testing with proxies, use `npm run vercel:dev` (safe by default) and set `EODHD_API_KEY` in `.env.local`.
 
 ## Troubleshooting vercel dev 502 (Windows)
@@ -54,3 +54,6 @@ Remove-Item Env:NODE_OPTIONS
 - Deploy Preview: verifica `/api/health` (200, `hasEodhdKey: true`).
 - Testa in UI: `Impostazioni > Aggiorna Prezzi` (nessun CORS, errori chiari).
 - Nota PWA: i prezzi si aggiornano **on-demand** (click o apertura app), non in background schedulato.
+
+## Nota Node.js (dev Windows)
+- Consigliato Node LTS 20/22. Con Node 24 su Windows sono stati osservati crash/asserzioni `UV_HANDLE_CLOSING` in libuv.

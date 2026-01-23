@@ -1,6 +1,6 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { db, getCurrentPortfolioId, setCurrentPortfolioId } from '../db';
-import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow } from '../services/priceService';
+import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary } from '../services/priceService';
 import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
 import { importFxCsv, FxRateRow } from '../services/fxService';
@@ -41,6 +41,8 @@ export const Settings: React.FC = () => {
   const [bfLoading, setBfLoading] = useState(false);
   const [bfStatus, setBfStatus] = useState('');
   const [loading, setLoading] = useState(false);
+  const [syncSummary, setSyncSummary] = useState<SyncPricesSummary | null>(null);
+  const [saveNotice, setSaveNotice] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const listingsSectionRef = useRef<HTMLDivElement | null>(null);
   const listingSelectRef = useRef<HTMLSelectElement | null>(null);
@@ -124,6 +126,12 @@ export const Settings: React.FC = () => {
 
   const handleSave = async () => {
     await db.settings.put({ ...config, id: settingsId, portfolioId: currentPortfolioId });
+    if (config.eodhdApiKey?.trim()) {
+      setSaveNotice('Key salvata');
+    } else {
+      setSaveNotice('Impostazioni salvate');
+    }
+    setTimeout(() => setSaveNotice(''), 2500);
     alert('Impostazioni salvate');
   };
 
@@ -146,9 +154,17 @@ export const Settings: React.FC = () => {
 
   const handleSync = async () => {
     setLoading(true);
+    setSyncSummary(null);
     try {
-      await syncPrices(config.eodhdApiKey);
-      alert('Prezzi aggiornati con successo!');
+      const result = await syncPrices(config.eodhdApiKey);
+      setSyncSummary(result);
+      if (result.status === 'ok') {
+        alert('Prezzi aggiornati con successo!');
+      } else if (result.status === 'partial') {
+        alert('Aggiornamento parziale: alcuni ticker non sono stati aggiornati.');
+      } else {
+        alert('Aggiornamento fallito: nessun ticker aggiornato.');
+      }
     } catch (e: any) {
       alert(e?.message || 'Errore aggiornamento prezzi.');
     } finally {
@@ -474,6 +490,21 @@ export const Settings: React.FC = () => {
     requestAnimationFrame(() => listingSelectRef.current?.focus());
   };
 
+  const syncStatusLabel = syncSummary
+    ? syncSummary.status === 'ok'
+      ? 'OK'
+      : syncSummary.status === 'partial'
+        ? 'Parziale'
+        : 'Fallito'
+    : '';
+  const syncStatusClass = syncSummary
+    ? syncSummary.status === 'ok'
+      ? 'bg-green-100 text-green-700'
+      : syncSummary.status === 'partial'
+        ? 'bg-amber-100 text-amber-700'
+        : 'bg-red-100 text-red-700'
+    : '';
+
   const listingUsage = useMemo(() => {
     const usage = new Map<string, { count: number; names: string[] }>();
     instruments.forEach(inst => {
@@ -739,6 +770,7 @@ export const Settings: React.FC = () => {
                   <div className="text-xs text-slate-600">Valuta base: {config.baseCurrency}</div>
                   <div className="text-xs text-slate-600">Exchange preferiti: {(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(', ')}</div>
                   <div className="text-xs text-slate-600">Backfill: dal {config.minHistoryDate || '2020-01-01'} ({(config.priceBackfillScope || 'current') === 'all' ? 'Completo' : 'Solo correnti'})</div>
+                  {saveNotice && <div className="text-xs text-green-700 mt-2">{saveNotice}</div>}
                 </div>
                 <button
                   type="button"
@@ -760,6 +792,11 @@ export const Settings: React.FC = () => {
                     <span className="text-xs font-bold text-green-600">OK</span>
                   ) : (
                     <span className="text-xs font-bold text-red-600">Errore</span>
+                  )}
+                  {config.eodhdApiKey?.trim() && (
+                    <span className="text-[10px] font-bold uppercase text-emerald-700 bg-emerald-100 px-2 py-1 rounded-full">
+                      Key locale attiva
+                    </span>
                   )}
                 </div>
                 <button
@@ -832,6 +869,23 @@ export const Settings: React.FC = () => {
                 </button>
               </div>
               {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
+              {syncSummary && (
+                <div className="text-xs text-slate-600 space-y-1">
+                  <div>
+                    <span className="text-slate-500">Sync:</span>{' '}
+                    <span className={`px-2 py-0.5 rounded-full font-bold ${syncStatusClass}`}>{syncStatusLabel}</span>
+                  </div>
+                  {syncSummary.failedTickers.length > 0 && (
+                    <div className="text-amber-700">
+                      Errori: {syncSummary.failedTickers.slice(0, 5).map(f => f.ticker).join(', ')}
+                      {syncSummary.failedTickers.length > 5 ? '…' : ''}
+                    </div>
+                  )}
+                  {syncSummary.sheet.enabled ? null : (
+                    <div className="text-slate-500">Sheets disabilitato: {syncSummary.sheet.reason}</div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
