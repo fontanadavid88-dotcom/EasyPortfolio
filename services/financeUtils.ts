@@ -1,5 +1,6 @@
 import { Transaction, TransactionType, Instrument, PricePoint, PortfolioState, PortfolioPosition, PerformancePoint, AssetType, Currency, AssetClass, RegionKey } from '../types';
 import { format, startOfMonth, endOfMonth, eachMonthOfInterval, isValid, getYear, eachDayOfInterval, differenceInCalendarDays } from 'date-fns';
+import { fillMissingPrices, PriceFillMeta } from './priceBackfill';
 
 // Helper sicuro per gestire date che potrebbero essere stringhe o oggetti Date
 const toDateSafe = (dateInput: string | Date | number): Date => {
@@ -87,16 +88,6 @@ export const inferAssetClass = (instrument: Instrument): AssetClass => {
   return AssetClass.OTHER;
 };
 
-// Helper to get price at specific date
-const getPriceAtDate = (ticker: string, dateStr: string, prices: PricePoint[]): number => {
-  // Filter prices for ticker and find the latest one on or before dateStr
-  const relevantPrices = prices
-    .filter(p => p.ticker === ticker && p.date <= dateStr)
-    .sort((a, b) => b.date.localeCompare(a.date));
-
-  return relevantPrices.length > 0 ? relevantPrices[0].close : 0;
-};
-
 export const getLatestPricePoint = (
   ticker: string,
   dateStr: string,
@@ -151,22 +142,6 @@ const buildTxPriceMap = (transactions: Transaction[]) => {
   });
   map.forEach(arr => arr.sort((a, b) => b.dateStr.localeCompare(a.dateStr)));
   return map;
-};
-
-const getPriceWithFallback = (
-  ticker: string,
-  dateStr: string,
-  prices: PricePoint[],
-  txPriceMap: Map<string, { dateStr: string, price: number }[]>,
-  txTicker?: string
-): number => {
-  const price = getPriceAtDate(ticker, dateStr, prices);
-  if (price > 0) return price;
-  const fallbackTicker = txTicker || ticker;
-  const txArr = txPriceMap.get(fallbackTicker);
-  if (!txArr || txArr.length === 0) return 0;
-  const latest = txArr.find(tx => tx.dateStr <= dateStr);
-  return latest ? latest.price : 0;
 };
 
 export const cleanNumber = (value: unknown, fallback = 0) =>
@@ -266,13 +241,22 @@ export const calculatePortfolioState = (
   const positions: PortfolioPosition[] = [];
   const todayStr = format(new Date(), 'yyyy-MM-dd');
   const txPriceMap = buildTxPriceMap(transactions);
+  const priceTickers = Array.from(new Set(uniqueInstruments.map(inst => getCanonicalTicker(inst)))).filter(Boolean);
+  const { filledByTicker } = fillMissingPrices(prices, [todayStr], { tickers: priceTickers });
 
   uniqueInstruments.forEach(inst => {
     const qty = holdingsMap.get(inst.ticker) || 0;
     // Handle floating point dust
     if (qty > 0.000001) {
       const priceTicker = getCanonicalTicker(inst);
-      const currentPrice = getPriceWithFallback(priceTicker, todayStr, prices, txPriceMap, inst.ticker);
+      const filled = filledByTicker.get(priceTicker)?.get(todayStr);
+      let currentPrice = filled?.close;
+      if (currentPrice === undefined) {
+        const txArr = txPriceMap.get(inst.ticker);
+        const latestTx = txArr?.find(tx => tx.dateStr <= todayStr);
+        if (latestTx) currentPrice = latestTx.price;
+      }
+      if (currentPrice === undefined) currentPrice = 0;
       // NOTE: Here we assume Price is in Base Currency or converted. 
       // For MVP, if currency matches app base currency, use as is. 
       // A full Forex implementation would convert here.
@@ -322,6 +306,7 @@ export type NavDetailPoint = {
   internalFlow: number;
   fxUsed: Record<string, number>;
   missingPriceTickers: string[];
+  backfilledPriceTickers: string[];
   missingFxPairs: string[];
 };
 
@@ -361,7 +346,7 @@ export const getPortfolioDateBounds = (
     }
   });
 
-  const effectiveStartDate = firstTransactionDate ? (firstPriceDate || firstTransactionDate) : undefined;
+  const effectiveStartDate = firstTransactionDate || firstPriceDate;
 
   return {
     firstTransactionDate,
@@ -405,21 +390,13 @@ export const buildNavSeriesDetailed = (
     ? eachMonthOfInterval({ start: startDate, end: rangeEndDate }).map(d => format(endOfMonth(d), 'yyyy-MM-dd'))
     : eachDayOfInterval({ start: startDate, end: rangeEndDate }).map(d => format(d, 'yyyy-MM-dd'));
 
-  const priceMap = new Map<string, PricePoint[]>();
-  prices
-    .filter(p => !!p?.date && !!p?.ticker)
-    .slice()
-    .sort((a, b) => (a.date || '').localeCompare(b.date || ''))
-    .forEach(p => {
-      const arr = priceMap.get(p.ticker) || [];
-      arr.push(p);
-      priceMap.set(p.ticker, arr);
-    });
+  const priceTickers = Array.from(
+    new Set(uniqueInstruments.map(instr => canonicalByTicker.get(instr.ticker) || instr.ticker))
+  ).filter(Boolean);
+  const { filledByTicker } = fillMissingPrices(prices, dateIndex, { tickers: priceTickers });
 
   const trackCash = transactions.some(t => t.type === TransactionType.Deposit || t.type === TransactionType.Withdrawal);
   const runningQty = new Map<string, number>();
-  const pricePtr = new Map<string, number>();
-  const lastClose = new Map<string, number>();
   let cashRunning = 0;
 
   const applyTransactionToRunning = (t: Transaction) => {
@@ -478,6 +455,7 @@ export const buildNavSeriesDetailed = (
 
     let holdingsValue = 0;
     const missingPriceTickers: string[] = [];
+    const backfilledPriceSet = new Set<string>();
 
     uniqueInstruments.forEach(instr => {
       const ticker = instr.ticker;
@@ -485,24 +463,28 @@ export const buildNavSeriesDetailed = (
       const qty = runningQty.get(ticker) || 0;
       if (qty <= 0.000001) return;
 
-      const pArr = priceMap.get(priceTicker) || [];
-      const pIdx = pricePtr.get(priceTicker) || 0;
-      let i = pIdx;
-      while (i < pArr.length && pArr[i].date <= dateStr) {
-        lastClose.set(priceTicker, pArr[i].close);
-        i++;
-      }
-      pricePtr.set(priceTicker, i);
-      let price = lastClose.get(priceTicker);
+      const filled = filledByTicker.get(priceTicker)?.get(dateStr);
+      let price = filled?.close;
+      let isBackfilled = Boolean(filled?.synthetic);
+
       if (price === undefined) {
         const txArr = txPriceMap.get(ticker);
         const latestTx = txArr?.find(tx => tx.dateStr <= dateStr);
-        price = latestTx ? latestTx.price : undefined;
+        if (latestTx) {
+          price = latestTx.price;
+          isBackfilled = true;
+        }
       }
+
       if (price === undefined) {
         missingPriceTickers.push(priceTicker);
         return;
       }
+
+      if (isBackfilled) {
+        backfilledPriceSet.add(priceTicker);
+      }
+
       holdingsValue += qty * price;
     });
 
@@ -517,6 +499,7 @@ export const buildNavSeriesDetailed = (
       internalFlow,
       fxUsed: {},
       missingPriceTickers,
+      backfilledPriceTickers: Array.from(backfilledPriceSet),
       missingFxPairs: []
     };
   });
@@ -624,7 +607,8 @@ export const calculateHistoricalPerformance = (
 ): {
   history: PerformancePoint[],
   assetHistory: Record<string, { date: string, pct: number }[]>,
-  currencyHistory: Record<string, { date: string, pct: number }[]>
+  currencyHistory: Record<string, { date: string, pct: number }[]>,
+  priceFillMeta?: PriceFillMeta
 } => {
 
   const uniqueInstruments = Array.from(
@@ -637,17 +621,18 @@ export const calculateHistoricalPerformance = (
   const assetHistory: Record<string, { date: string, pct: number }[]> = {};
   const currencyHistory: Record<string, { date: string, pct: number }[]> = {};
   const txPriceMap = buildTxPriceMap(transactions);
+  let priceFillMeta: PriceFillMeta | undefined;
 
   Object.values(AssetType).forEach(t => assetHistory[t] = []);
   Object.values(Currency).forEach(c => currencyHistory[c] = []);
 
   if (transactions.length === 0) {
-    return { history, assetHistory, currencyHistory };
+    return { history, assetHistory, currencyHistory, priceFillMeta };
   }
 
   const bounds = getPortfolioDateBounds(transactions, prices, instruments);
   if (!bounds.effectiveStartDate) {
-    return { history, assetHistory, currencyHistory };
+    return { history, assetHistory, currencyHistory, priceFillMeta };
   }
 
   const today = new Date();
@@ -664,9 +649,17 @@ export const calculateHistoricalPerformance = (
 
   if (granularity === 'monthly') {
     const months = eachMonthOfInterval({ start, end });
+    const dateIndex = months.map(date => format(endOfMonth(date), 'yyyy-MM-dd'));
+    const priceTickers = Array.from(
+      new Set(uniqueInstruments.map(inst => canonicalByTicker.get(inst.ticker) || inst.ticker))
+    ).filter(Boolean);
+    const fillResult = fillMissingPrices(prices, dateIndex, { tickers: priceTickers });
+    const filledByTicker = fillResult.filledByTicker;
+    priceFillMeta = fillResult.meta;
 
     months.forEach((date, idx) => {
-      const dateStr = format(endOfMonth(date), 'yyyy-MM-dd');
+      void date;
+      const dateStr = dateIndex[idx];
 
       const txUntilNow = transactions.filter(t => {
         const d = toDateSafe(t.date);
@@ -706,12 +699,23 @@ export const calculateHistoricalPerformance = (
       let totalValueAtDate = 0;
       const assetValues: Record<string, number> = {};
       const currencyValues: Record<string, number> = {};
+      const backfilledPriceSet = new Set<string>();
 
       holdingsMap.forEach((qty, ticker) => {
         if (qty <= 0.000001) return;
         const priceTicker = canonicalByTicker.get(ticker) || ticker;
-        const price = getPriceWithFallback(priceTicker, dateStr, prices, txPriceMap, ticker);
-        if (price <= 0) return;
+        const filled = filledByTicker.get(priceTicker)?.get(dateStr);
+        let price = filled?.close;
+        let isBackfilled = Boolean(filled?.synthetic);
+        if (price === undefined) {
+          const txArr = txPriceMap.get(ticker);
+          const latestTx = txArr?.find(tx => tx.dateStr <= dateStr);
+          if (latestTx) {
+            price = latestTx.price;
+            isBackfilled = true;
+          }
+        }
+        if (price === undefined || price <= 0) return;
         const val = qty * price;
         totalValueAtDate += val;
 
@@ -719,6 +723,9 @@ export const calculateHistoricalPerformance = (
         if (instr) {
           assetValues[instr.type] = (assetValues[instr.type] || 0) + val;
           currencyValues[instr.currency] = (currencyValues[instr.currency] || 0) + val;
+        }
+        if (isBackfilled) {
+          backfilledPriceSet.add(priceTicker);
         }
       });
 
@@ -739,7 +746,8 @@ export const calculateHistoricalPerformance = (
         invested: investedAtDate,
         monthlyReturnPct: periodReturn,
         cumulativeReturnPct: cumulativeReturnPct,
-        cumulativeTWRRIndex: currentTWRRIndex
+        cumulativeTWRRIndex: currentTWRRIndex,
+        backfilledPriceTickers: Array.from(backfilledPriceSet)
       });
 
       Object.keys(assetHistory).forEach(key => {
@@ -756,40 +764,21 @@ export const calculateHistoricalPerformance = (
     });
 
     const twrrHistory = computeTWRRFromNav(history, externalFlows);
-    return { history: twrrHistory, assetHistory, currencyHistory };
+    return { history: twrrHistory, assetHistory, currencyHistory, priceFillMeta };
   }
 
   // DAILY PATH
   const days = eachDayOfInterval({ start, end });
   const dateIndex = days.map(d => format(d, 'yyyy-MM-dd'));
 
-  // group transactions by ticker sorted asc
-  const txByTicker = new Map<string, Transaction[]>();
-  transactions
-    .slice()
-    .sort((a, b) => toDateSafe(a.date).getTime() - toDateSafe(b.date).getTime())
-    .forEach(t => {
-      if (!t.instrumentTicker) return;
-      const arr = txByTicker.get(t.instrumentTicker) || [];
-      arr.push(t);
-      txByTicker.set(t.instrumentTicker, arr);
-    });
-
-  // price map sorted asc for forward fill
-  const priceMap = new Map<string, PricePoint[]>();
-  prices
-    .filter(p => !!p?.date && !!p?.ticker)
-    .slice()
-    .sort((a, b) => (a.date || '').localeCompare(b.date || ''))
-    .forEach(p => {
-      const arr = priceMap.get(p.ticker) || [];
-      arr.push(p);
-      priceMap.set(p.ticker, arr);
-    });
+  const priceTickers = Array.from(
+    new Set(uniqueInstruments.map(instr => canonicalByTicker.get(instr.ticker) || instr.ticker))
+  ).filter(Boolean);
+  const fillResult = fillMissingPrices(prices, dateIndex, { tickers: priceTickers });
+  const filledByTicker = fillResult.filledByTicker;
+  priceFillMeta = fillResult.meta;
 
   const runningQty = new Map<string, number>();
-  const pricePtr = new Map<string, number>();
-  const lastClose = new Map<string, number>();
   let investedRunning = 0;
   let cashRunning = 0;
   const startDateStr = format(start, 'yyyy-MM-dd');
@@ -845,6 +834,7 @@ export const calculateHistoricalPerformance = (
     let totalValueAtDate = 0;
     const assetValues: Record<string, number> = {};
     const currencyValues: Record<string, number> = {};
+    const backfilledPriceSet = new Set<string>();
 
     uniqueInstruments.forEach(instr => {
       const ticker = instr.ticker;
@@ -852,25 +842,25 @@ export const calculateHistoricalPerformance = (
       const qty = runningQty.get(ticker) || 0;
       if (qty <= 0.000001) return;
 
-      const pArr = priceMap.get(priceTicker) || [];
-      const pIdx = pricePtr.get(priceTicker) || 0;
-      let i = pIdx;
-      while (i < pArr.length && pArr[i].date <= dateStr) {
-        lastClose.set(priceTicker, pArr[i].close);
-        i++;
-      }
-      pricePtr.set(priceTicker, i);
-      let price = lastClose.get(priceTicker);
+      const filled = filledByTicker.get(priceTicker)?.get(dateStr);
+      let price = filled?.close;
+      let isBackfilled = Boolean(filled?.synthetic);
       if (price === undefined) {
         const txArr = txPriceMap.get(ticker);
         const latestTx = txArr?.find(tx => tx.dateStr <= dateStr);
-        price = latestTx ? latestTx.price : 0;
+        if (latestTx) {
+          price = latestTx.price;
+          isBackfilled = true;
+        }
       }
-      if (price <= 0) return;
+      if (price === undefined || price <= 0) return;
       const val = qty * price;
       totalValueAtDate += val;
       assetValues[instr.type] = (assetValues[instr.type] || 0) + val;
       currencyValues[instr.currency] = (currencyValues[instr.currency] || 0) + val;
+      if (isBackfilled) {
+        backfilledPriceSet.add(priceTicker);
+      }
     });
 
     const nav = totalValueAtDate + (trackCash ? cashRunning : 0);
@@ -889,7 +879,8 @@ export const calculateHistoricalPerformance = (
       invested: investedRunning,
       monthlyReturnPct: periodReturn,
       cumulativeReturnPct,
-      cumulativeTWRRIndex: currentTWRRIndex
+      cumulativeTWRRIndex: currentTWRRIndex,
+      backfilledPriceTickers: Array.from(backfilledPriceSet)
     });
 
     Object.keys(assetHistory).forEach(key => {
@@ -905,7 +896,7 @@ export const calculateHistoricalPerformance = (
   });
 
   const twrrHistory = computeTWRRFromNav(history, externalFlows);
-  return { history: twrrHistory, assetHistory, currencyHistory };
+  return { history: twrrHistory, assetHistory, currencyHistory, priceFillMeta };
 };
 
 // --- NEW ANALYTICS HELPERS ---

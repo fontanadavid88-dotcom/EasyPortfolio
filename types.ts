@@ -140,6 +140,7 @@ export interface PerformancePoint {
   cumulativeReturnPct: number;
   cumulativeTWRRIndex?: number; // indice TWRR (base 1)
   mwrrPct?: number; // money-weighted return complessivo
+  backfilledPriceTickers?: string[];
 }
 
 export interface Portfolio {

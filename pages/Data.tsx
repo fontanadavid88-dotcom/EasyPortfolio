@@ -4,6 +4,7 @@ import { useLocation } from 'react-router-dom';
 import { db, getCurrentPortfolioId } from '../db';
 import { Currency, Instrument, PricePoint } from '../types';
 import { analyzeFxSeries, analyzePriceSeries, FxRatePoint, analyzeRebalanceQuality } from '../services/dataQuality';
+import { fillMissingPrices } from '../services/priceBackfill';
 import { buildNavSeriesDetailed, calculateHoldings, getCanonicalTicker, getValuationDateForHoldings } from '../services/financeUtils';
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 import clsx from 'clsx';
@@ -537,9 +538,24 @@ export const Data: React.FC = () => {
     if (!transactions || !instruments || !prices) return null;
     const detailed = buildNavSeriesDetailed(transactions, instruments, prices, 'daily');
     const missingPriceDays = detailed.filter(p => p.missingPriceTickers.length > 0);
+    const backfilledDays = detailed.filter(p => p.backfilledPriceTickers.length > 0);
+    const dateIndex = detailed.map(point => point.date);
+    const priceTickers = Array.from(new Set(instruments.map(instr => getCanonicalTicker(instr)).filter(Boolean)));
+    const priceFillMeta = fillMissingPrices(prices, dateIndex, { tickers: priceTickers }).meta;
+    const backfillRows = Object.entries(priceFillMeta.countsByTicker)
+      .map(([ticker, count]) => ({
+        ticker,
+        count,
+        range: priceFillMeta.filledRangesByTicker[ticker]
+      }))
+      .sort((a, b) => b.count - a.count);
     return {
       missingPriceDays: missingPriceDays.length,
-      examples: missingPriceDays.slice(0, 5)
+      examples: missingPriceDays.slice(0, 5),
+      backfilledPriceDays: backfilledDays.length,
+      backfillTotal: priceFillMeta.totalFilled,
+      backfillRows,
+      backfillWarnings: priceFillMeta.warnings
     };
   }, [transactions, instruments, prices, checkRunId]);
 
@@ -1135,6 +1151,39 @@ export const Data: React.FC = () => {
             </div>
           ) : (
             <div className="text-xs text-slate-500">Nessun missing price tickers rilevato.</div>
+          )}
+
+          {navChecks && navChecks.backfillTotal > 0 ? (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-900">
+              <div className="font-bold text-amber-800 uppercase mb-2">Backfill prezzi</div>
+              <div className="text-amber-800">
+                Punti sintetici: <span className="font-semibold">{navChecks.backfillTotal}</span> · Giorni con backfill: <span className="font-semibold">{navChecks.backfilledPriceDays}</span>
+              </div>
+              {navChecks.backfillRows.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {navChecks.backfillRows.slice(0, 8).map(row => (
+                    <div key={`backfill-${row.ticker}`} className="flex items-center justify-between">
+                      <span className="font-semibold">{row.ticker}</span>
+                      <span>{row.count} {row.range ? `(${row.range.start} → ${row.range.end})` : ''}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {navChecks.backfillWarnings.length > 0 && (
+                <div className="mt-2 text-amber-800">
+                  <div className="font-semibold">Gap lunghi rilevati</div>
+                  <ul className="space-y-1">
+                    {navChecks.backfillWarnings.slice(0, 5).map((warning, idx) => (
+                      <li key={`gap-${warning.ticker}-${idx}`}>
+                        {warning.ticker}: {warning.startDate} → {warning.endDate} ({warning.gapDays}g)
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-xs text-slate-500">Nessun backfill prezzi rilevato.</div>
           )}
 
           {rebalanceQuality && (

@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "vercel:dev": "vercel dev",
+    "vercel:dev": "vercel dev --listen 3000",
     "vercel:dev:safe": "node scripts/vercel-dev-safe.cjs"
   },
   "dependencies": {
