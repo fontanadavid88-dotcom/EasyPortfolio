@@ -1,11 +1,24 @@
-import React, { useEffect, useRef, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { db, getCurrentPortfolioId, setCurrentPortfolioId } from '../db';
 import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow } from '../services/priceService';
 import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
-import { importFxCsv } from '../services/fxService';
+import { importFxCsv, FxRateRow } from '../services/fxService';
 import { Currency, InstrumentListing, Instrument, RegionKey } from '../types';
 import { InfoPopover } from '../components/InfoPopover';
+import { useLiveQuery } from 'dexie-react-hooks';
+
+type InstrumentListingRow = {
+  id?: number;
+  isin: string;
+  exchangeCode: string;
+  symbol: string;
+  currency: Currency;
+  name?: string;
+  portfolioId?: string;
+};
+
+type FxRateRowWithId = FxRateRow & { id?: number };
 
 export const Settings: React.FC = () => {
   const [config, setConfig] = useState({
@@ -16,6 +29,8 @@ export const Settings: React.FC = () => {
     priceBackfillScope: 'current' as 'current' | 'all',
     preferredExchangesOrder: ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'] as string[]
   });
+  const [isConfigModalOpen, setConfigModalOpen] = useState(false);
+  const [coverageExpanded, setCoverageExpanded] = useState(false);
   const [coverage, setCoverage] = useState<{
     earliestCoveredDate?: string;
     latestCoveredDate?: string;
@@ -49,6 +64,12 @@ export const Settings: React.FC = () => {
   const [regionAllocation, setRegionAllocation] = useState<Partial<Record<RegionKey, number>>>({});
   const [proxyHealth, setProxyHealth] = useState<{ ok: boolean; hasEodhdKey: boolean; error?: string } | null>(null);
   const [proxyHealthLoading, setProxyHealthLoading] = useState(false);
+  const instrumentListings = useLiveQuery(
+    () => db.instrumentListings.where('portfolioId').equals(currentPortfolioId).toArray(),
+    [currentPortfolioId],
+    []
+  ) as InstrumentListingRow[];
+  const fxRates = useLiveQuery(() => db.fxRates.toArray(), [], []) as FxRateRowWithId[];
 
   useEffect(() => {
     db.settings.where('portfolioId').equals(currentPortfolioId).first().then(s => {
@@ -72,10 +93,11 @@ export const Settings: React.FC = () => {
     });
   }, [currentPortfolioId]);
 
-  const loadProxyHealth = async () => {
+  const loadProxyHealth = async (apiKey?: string) => {
     setProxyHealthLoading(true);
     try {
-      const res = await fetch('/api/health');
+      const headers = apiKey?.trim() ? { 'x-eodhd-key': apiKey.trim() } : undefined;
+      const res = await fetch('/api/health', headers ? { headers } : undefined);
       if (!res.ok) {
         setProxyHealth({ ok: false, hasEodhdKey: false, error: 'Proxy non raggiungibile' });
         return;
@@ -93,12 +115,22 @@ export const Settings: React.FC = () => {
   };
 
   useEffect(() => {
-    loadProxyHealth();
-  }, []);
+    const key = config.eodhdApiKey?.trim();
+    const timeoutId = setTimeout(() => {
+      loadProxyHealth(key);
+    }, 300);
+    return () => clearTimeout(timeoutId);
+  }, [config.eodhdApiKey]);
 
   const handleSave = async () => {
     await db.settings.put({ ...config, id: settingsId, portfolioId: currentPortfolioId });
     alert('Impostazioni salvate');
+  };
+
+  const handleSaveConfig = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    await handleSave();
+    setConfigModalOpen(false);
   };
 
   const loadCoverage = async () => {
@@ -115,7 +147,7 @@ export const Settings: React.FC = () => {
   const handleSync = async () => {
     setLoading(true);
     try {
-      await syncPrices();
+      await syncPrices(config.eodhdApiKey);
       alert('Prezzi aggiornati con successo!');
     } catch (e: any) {
       alert(e?.message || 'Errore aggiornamento prezzi.');
@@ -140,7 +172,8 @@ export const Settings: React.FC = () => {
           } else {
             setBfStatus(`${p.phase === 'backfill' ? 'Backfill' : 'Forward'} ${p.index}/${p.total} ${p.ticker}${p.error ? ' - ' + p.error : ''}`);
           }
-        }
+        },
+        config.eodhdApiKey
       );
       await loadCoverage();
       alert('Storico aggiornato');
@@ -254,7 +287,7 @@ export const Settings: React.FC = () => {
       return;
     }
     try {
-      const listings = await resolveListingsByIsin(isinInput.trim());
+      const listings = await resolveListingsByIsin(isinInput.trim(), config.eodhdApiKey);
       if (listings.length === 0) {
         setListingMessage('Nessun listing trovato per questo ISIN');
         setRecommendedListings([]);
@@ -441,8 +474,203 @@ export const Settings: React.FC = () => {
     requestAnimationFrame(() => listingSelectRef.current?.focus());
   };
 
+  const listingUsage = useMemo(() => {
+    const usage = new Map<string, { count: number; names: string[] }>();
+    instruments.forEach(inst => {
+      const symbols = new Set<string>();
+      if (inst.ticker) symbols.add(inst.ticker);
+      if (inst.preferredListing?.symbol) symbols.add(inst.preferredListing.symbol);
+      (inst.listings || []).forEach(l => {
+        if (l?.symbol) symbols.add(l.symbol);
+      });
+      symbols.forEach(symbol => {
+        const entry = usage.get(symbol) || { count: 0, names: [] as string[] };
+        entry.count += 1;
+        entry.names.push(inst.name || inst.ticker || symbol);
+        usage.set(symbol, entry);
+      });
+    });
+    return usage;
+  }, [instruments]);
+
+  const listingRows = useMemo(() => {
+    return [...(instrumentListings || [])].sort((a, b) => {
+      if (a.symbol === b.symbol) return a.exchangeCode.localeCompare(b.exchangeCode);
+      return a.symbol.localeCompare(b.symbol);
+    });
+  }, [instrumentListings]);
+
+  const fxPairs = useMemo(() => {
+    const map = new Map<string, { base: Currency; quote: Currency; count: number; from?: string; to?: string }>();
+    (fxRates || []).forEach(row => {
+      const key = `${row.baseCurrency}/${row.quoteCurrency}`;
+      const entry = map.get(key) || { base: row.baseCurrency, quote: row.quoteCurrency, count: 0 };
+      entry.count += 1;
+      entry.from = entry.from ? (row.date < entry.from ? row.date : entry.from) : row.date;
+      entry.to = entry.to ? (row.date > entry.to ? row.date : entry.to) : row.date;
+      map.set(key, entry);
+    });
+    const instrumentCurrencies = new Set((instruments || []).map(i => i.currency).filter(Boolean));
+    return Array.from(map.values())
+      .map(entry => ({
+        ...entry,
+        key: `${entry.base}/${entry.quote}`,
+        referenced: instrumentCurrencies.has(entry.base)
+          || instrumentCurrencies.has(entry.quote)
+          || config.baseCurrency === entry.base
+          || config.baseCurrency === entry.quote
+      }))
+      .sort((a, b) => a.key.localeCompare(b.key));
+  }, [fxRates, instruments, config.baseCurrency]);
+
+  const handleDeleteListing = async (row: InstrumentListingRow) => {
+    const usage = listingUsage.get(row.symbol);
+    const hasRefs = Boolean(usage?.count);
+    const confirmMessage = hasRefs
+      ? `Il listing ${row.symbol} è ancora usato da ${usage?.count} strumento/i. Verrà rimosso dai riferimenti. Continuare?`
+      : `Eliminare il listing ${row.symbol}?`;
+    if (!confirm(confirmMessage)) return;
+    await db.transaction('rw', [db.instrumentListings, db.instruments], async () => {
+      if (row.id) await db.instrumentListings.delete(row.id);
+      const related = instruments.filter(inst =>
+        inst.ticker === row.symbol
+        || inst.preferredListing?.symbol === row.symbol
+        || inst.listings?.some(l => l.symbol === row.symbol)
+      );
+      for (const inst of related) {
+        const nextListings = (inst.listings || []).filter(l => l.symbol !== row.symbol);
+        const nextPreferred = inst.preferredListing?.symbol === row.symbol ? nextListings[0] : inst.preferredListing;
+        if (inst.id) {
+          await db.instruments.update(inst.id, {
+            listings: nextListings.length > 0 ? nextListings : undefined,
+            preferredListing: nextPreferred
+          });
+        }
+      }
+    });
+    const refreshed = await db.instruments.where('portfolioId').equals(currentPortfolioId).toArray();
+    setInstruments(refreshed as Instrument[]);
+  };
+
+  const handleDeleteFxPair = async (pair: { base: Currency; quote: Currency; key: string; referenced?: boolean }) => {
+    const warn = pair.referenced
+      ? 'Questa coppia FX potrebbe essere ancora usata. Vuoi eliminarla comunque?'
+      : 'Eliminare tutti i tassi FX per questa coppia?';
+    if (!confirm(warn)) return;
+    const toDelete = (fxRates || [])
+      .filter(row => row.baseCurrency === pair.base && row.quoteCurrency === pair.quote)
+      .map(row => row.id)
+      .filter((id): id is number => typeof id === 'number');
+    if (toDelete.length > 0) {
+      await db.fxRates.bulkDelete(toDelete);
+    }
+  };
+
   return (
-    <div className="space-y-8 max-w-4xl animate-fade-in text-textPrimary">
+    <div className="space-y-8 max-w-6xl animate-fade-in text-textPrimary">
+      {isConfigModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
+          <div className="bg-backgroundElevated rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden max-h-[90vh] overflow-y-auto border border-borderSoft">
+            <div className="p-6 border-b border-borderSoft flex justify-between items-center sticky top-0 bg-backgroundElevated z-10">
+              <h3 className="text-lg font-bold text-textPrimary">Impostazioni base</h3>
+              <button onClick={() => setConfigModalOpen(false)} className="text-gray-400 hover:text-slate-900 transition-colors">
+                <span className="material-symbols-outlined">close</span>
+              </button>
+            </div>
+            <form onSubmit={handleSaveConfig} className="p-6 space-y-5">
+              <div>
+                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">EODHD API Key</label>
+                <input
+                  type="password"
+                  className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
+                  value={config.eodhdApiKey}
+                  onChange={e => setConfig({ ...config, eodhdApiKey: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Price Sheet URL</label>
+                <input
+                  className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl text-sm text-slate-900 focus:ring-2 focus:ring-primary focus:outline-none transition-all"
+                  value={config.googleSheetUrl}
+                  onChange={e => setConfig({ ...config, googleSheetUrl: e.target.value })}
+                />
+                <p className="text-xs text-gray-500 mt-1">Endpoint pubblico JSON o Google Viz API.</p>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Valuta base</label>
+                  <select
+                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
+                    value={config.baseCurrency}
+                    onChange={e => setConfig({ ...config, baseCurrency: e.target.value as Currency })}
+                  >
+                    {Object.values(Currency).map(c => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Ordine exchange</label>
+                  <input
+                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl text-sm text-slate-900 focus:ring-2 focus:ring-primary focus:outline-none transition-all"
+                    value={(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(',')}
+                    onChange={e => setConfig({ ...config, preferredExchangesOrder: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Backfill da data</label>
+                  <input
+                    type="date"
+                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
+                    value={config.minHistoryDate || '2020-01-01'}
+                    onChange={e => setConfig({ ...config, minHistoryDate: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Ambito backfill</label>
+                  <div className="flex flex-col gap-2 text-sm text-slate-700">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="scope"
+                        checked={(config.priceBackfillScope || 'current') === 'current'}
+                        onChange={() => setConfig({ ...config, priceBackfillScope: 'current' })}
+                      />
+                      Solo tickers in portafoglio
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="scope"
+                        checked={(config.priceBackfillScope || 'current') === 'all'}
+                        onChange={() => setConfig({ ...config, priceBackfillScope: 'all' })}
+                      />
+                      Includi storici venduti
+                    </label>
+                  </div>
+                </div>
+              </div>
+              <div className="pt-4 flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => setConfigModalOpen(false)}
+                  className="flex-1 border border-borderSoft text-slate-700 py-3 rounded-xl font-bold hover:bg-slate-50 transition"
+                >
+                  Annulla
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 bg-primary text-slate-900 py-3 rounded-xl font-bold hover:bg-blue-600 transition"
+                >
+                  Salva
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
       <div className="bg-white p-6 rounded-2xl shadow-lg border border-borderSoft">
         <h2 className="text-lg font-bold mb-4 flex items-center gap-2 text-slate-900">
           <span className="material-symbols-outlined text-primary">layers</span>
@@ -501,113 +729,137 @@ export const Settings: React.FC = () => {
           Fonti Dati
         </h2>
         <div className="space-y-6">
-          <form onSubmit={(e) => e.preventDefault()}>
-            <label className="block text-sm font-bold text-slate-500 mb-2">EODHD API Key</label>
-            <input
-              type="password"
-              className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
-              value={config.eodhdApiKey}
-              onChange={e => setConfig({ ...config, eodhdApiKey: e.target.value })}
-            />
-          </form>
-          <div>
-            <label className="block text-sm font-bold text-slate-500 mb-2">Price Sheet URL (JSON output)</label>
-            <input
-              className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl text-sm text-slate-900 focus:ring-2 focus:ring-primary focus:outline-none transition-all"
-              value={config.googleSheetUrl}
-              onChange={e => setConfig({ ...config, googleSheetUrl: e.target.value })}
-            />
-            <p className="text-xs text-gray-500 mt-2 ml-1">L'URL deve puntare a un endpoint pubblico JSON o Google Viz API.</p>
-          </div>
-          <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-sm text-slate-700">
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-bold uppercase text-slate-500">Stato Proxy</span>
-                {proxyHealthLoading ? (
-                  <span className="text-xs text-slate-400">Verifica...</span>
-                ) : proxyHealth?.ok ? (
-                  <span className="text-xs font-bold text-green-600">OK</span>
-                ) : (
-                  <span className="text-xs font-bold text-red-600">Errore</span>
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 text-sm text-slate-700">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-bold text-slate-900">Impostazioni base</div>
+                  <div className="text-xs text-slate-600 mt-1">Key EODHD: {config.eodhdApiKey?.trim() ? 'Impostata' : 'Mancante'}</div>
+                  <div className="text-xs text-slate-600">Sheet prezzi: {config.googleSheetUrl?.trim() ? 'Configurato' : 'Non configurato'}</div>
+                  <div className="text-xs text-slate-600">Valuta base: {config.baseCurrency}</div>
+                  <div className="text-xs text-slate-600">Exchange preferiti: {(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(', ')}</div>
+                  <div className="text-xs text-slate-600">Backfill: dal {config.minHistoryDate || '2020-01-01'} ({(config.priceBackfillScope || 'current') === 'all' ? 'Completo' : 'Solo correnti'})</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setConfigModalOpen(true)}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  Modifica
+                </button>
+              </div>
+            </div>
+
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 text-sm text-slate-700">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold uppercase text-slate-500">Proxy &amp; API</span>
+                  {proxyHealthLoading ? (
+                    <span className="text-xs text-slate-400">Verifica...</span>
+                  ) : proxyHealth?.ok ? (
+                    <span className="text-xs font-bold text-green-600">OK</span>
+                  ) : (
+                    <span className="text-xs font-bold text-red-600">Errore</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                  onClick={() => loadProxyHealth(config.eodhdApiKey)}
+                >
+                  Riprova
+                </button>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-3 text-xs">
+                <div>
+                  <span className="text-slate-500">EODHD key:</span>{' '}
+                  {proxyHealthLoading ? '...' : proxyHealth?.hasEodhdKey ? 'OK' : 'Mancante'}
+                </div>
+                {!proxyHealth?.ok && (
+                  <div className="text-slate-500">
+                    Avvia `vercel dev` oppure verifica il deploy su Vercel.
+                  </div>
                 )}
               </div>
-              <button
-                type="button"
-                className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
-                onClick={loadProxyHealth}
-              >
-                Riprova
-              </button>
             </div>
-            <div className="mt-2 flex flex-wrap gap-3 text-xs">
-              <div>
-                <span className="text-slate-500">EODHD key:</span>{' '}
-                {proxyHealthLoading ? '...' : proxyHealth?.hasEodhdKey ? 'OK' : 'Mancante'}
+
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
+              <div className="text-sm font-bold text-slate-900">Prezzi &amp; Backfill</div>
+              <div className="text-xs text-slate-600">
+                Copertura: {coverage.okCount}/{coverage.total} tickers - {coverage.earliestCoveredDate || 'N/D'} - {coverage.latestCoveredDate || 'N/D'}
               </div>
-              {!proxyHealth?.ok && (
-                <div className="text-slate-500">
-                  Avvia `vercel dev` oppure verifica il deploy su Vercel.
-                </div>
-              )}
+              <div className="flex flex-wrap gap-3">
+                <button
+                  onClick={handleSync}
+                  disabled={loading}
+                  className="bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-blue-600 transition shadow-sm flex items-center gap-2"
+                >
+                  {loading ? (
+                    <>
+                      <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
+                      Aggiornamento...
+                    </>
+                  ) : (
+                    <>
+                      <span className="material-symbols-outlined text-sm">sync</span>
+                      Aggiorna Prezzi
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={handleBackfill}
+                  disabled={bfLoading}
+                  className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50 transition shadow-sm flex items-center gap-2"
+                >
+                  {bfLoading ? (
+                    <>
+                      <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
+                      Scaricamento...
+                    </>
+                  ) : (
+                    <>
+                      <span className="material-symbols-outlined text-sm">download</span>
+                      Scarica storico prezzi
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCoverageExpanded(prev => !prev)}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  {coverageExpanded ? 'Nascondi copertura' : 'Dettagli copertura'}
+                </button>
+              </div>
+              {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
             </div>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-bold text-slate-500 mb-2">Valuta base</label>
-              <select
-                className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
-                value={config.baseCurrency}
-                onChange={e => setConfig({ ...config, baseCurrency: e.target.value as Currency })}
-              >
-                {Object.values(Currency).map(c => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-bold text-slate-500 mb-2">Ordine exchange preferiti (comma)</label>
-              <input
-                className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl text-sm text-slate-900 focus:ring-2 focus:ring-primary focus:outline-none transition-all"
-                value={(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(',')}
-                onChange={e => setConfig({ ...config, preferredExchangesOrder: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
-              />
-              <p className="text-xs text-gray-500 mt-2 ml-1">Usato per proporre il listing migliore (SW prioritario con base CHF).</p>
-            </div>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-bold text-slate-500 mb-2">Backfill da data</label>
-              <input
-                type="date"
-                className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
-                value={config.minHistoryDate || '2020-01-01'}
-                onChange={e => setConfig({ ...config, minHistoryDate: e.target.value })}
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-bold text-slate-500 mb-2">Ambito backfill</label>
-              <div className="flex gap-4 text-sm text-slate-700">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    name="scope"
-                    checked={(config.priceBackfillScope || 'current') === 'current'}
-                    onChange={() => setConfig({ ...config, priceBackfillScope: 'current' })}
-                  />
-                  Solo tickers in portafoglio (più veloce)
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="radio"
-                    name="scope"
-                    checked={(config.priceBackfillScope || 'current') === 'all'}
-                    onChange={() => setConfig({ ...config, priceBackfillScope: 'all' })}
-                  />
-                  Includi storici venduti (copertura completa)
-                </label>
+
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
+              <div className="text-sm font-bold text-slate-900">Backup &amp; Import</div>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  onClick={handleExport}
+                  className="bg-slate-100 text-slate-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-slate-200 transition border border-borderSoft"
+                >
+                  Export Backup
+                </button>
+                <button
+                  onClick={handleImportClick}
+                  className="bg-white text-slate-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-slate-50 transition border border-borderSoft"
+                >
+                  Importa Backup
+                </button>
+                <input
+                  type="file"
+                  accept="application/json"
+                  ref={fileInputRef}
+                  onChange={handleImport}
+                  className="hidden"
+                />
               </div>
             </div>
           </div>
+
           <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 relative">
             <div className="flex items-center justify-between">
               <div>
@@ -653,84 +905,70 @@ export const Settings: React.FC = () => {
                 />
               </div>
             </div>
-            <div className="overflow-auto max-h-56 border border-borderSoft rounded-lg bg-white">
-              <table className="w-full text-sm">
-                <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
-                  <tr>
-                    <th className="px-3 py-2 text-left">Strumento</th>
-                    <th className="px-3 py-2 text-left">Dal</th>
-                    <th className="px-3 py-2 text-left">Al</th>
-                    <th className="px-3 py-2 text-left">Stato</th>
-                    <th className="px-3 py-2 text-left">Azioni</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {coverage.perTicker.map((row, index) => (
-                    <tr key={`${row.ticker}-${row.instrumentId ?? index}`} className="border-t border-borderSoft">
-                      <td className="px-3 py-2">
-                        <div className="flex flex-col">
-                          <span className="font-semibold text-slate-900">{row.ticker}</span>
-                          <span className="text-xs text-slate-600">
-                            ISIN: {row.isin || '—'}{row.name ? ` - ${row.name}` : ''}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="px-3 py-2 text-slate-700">{row.from}</td>
-                      <td className="px-3 py-2 text-slate-700">{row.to}</td>
-                      <td className="px-3 py-2">
-                        <span className={`text-xs font-bold px-2 py-1 rounded-lg ${
-                          row.status === 'OK'
-                            ? 'bg-green-100 text-green-700'
-                            : row.status === 'PARZIALE'
-                              ? 'bg-amber-100 text-amber-700'
-                              : 'bg-red-100 text-red-700'
-                        }`}>
-                          {row.status}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2">
-                        {row.status !== 'OK' && (
-                          <button
-                            type="button"
-                            className="text-xs font-bold text-[#0052a3] hover:text-blue-500"
-                            onClick={() => handleOpenListingsFromCoverage(row)}
-                            aria-label={`Apri in Listings & FX per ${row.ticker}`}
-                          >
-                            Apri in Listings &amp; FX
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                  {coverage.perTicker.length === 0 && (
+            {coverageExpanded ? (
+              <div className="overflow-auto max-h-56 border border-borderSoft rounded-lg bg-white">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
                     <tr>
-                      <td className="px-3 py-2 text-slate-500 text-sm" colSpan={5}>Nessun ticker da mostrare.</td>
+                      <th className="px-3 py-2 text-left">Strumento</th>
+                      <th className="px-3 py-2 text-left">Dal</th>
+                      <th className="px-3 py-2 text-left">Al</th>
+                      <th className="px-3 py-2 text-left">Stato</th>
+                      <th className="px-3 py-2 text-left">Azioni</th>
                     </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-            <div className="flex flex-wrap gap-3 pt-2">
-              <button
-                onClick={handleBackfill}
-                disabled={bfLoading}
-                className="bg-[#0052a3] text-white px-6 py-3 rounded-xl text-sm font-bold disabled:opacity-50 hover:bg-blue-600 transition shadow-lg hover:shadow-primary/30 flex items-center gap-2"
-              >
-                {bfLoading ? (
-                  <>
-                    <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
-                    Scaricamento...
-                  </>
-                ) : (
-                  <>
-                    <span className="material-symbols-outlined text-sm">download</span>
-                    Scarica storico prezzi
-                  </>
-                )}
-              </button>
-              {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
-            </div>
+                  </thead>
+                  <tbody>
+                    {coverage.perTicker.map((row, index) => (
+                      <tr key={`${row.ticker}-${row.instrumentId ?? index}`} className="border-t border-borderSoft">
+                        <td className="px-3 py-2">
+                          <div className="flex flex-col">
+                            <span className="font-semibold text-slate-900">{row.ticker}</span>
+                            <span className="text-xs text-slate-600">
+                              ISIN: {row.isin || '—'}{row.name ? ` - ${row.name}` : ''}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-slate-700">{row.from}</td>
+                        <td className="px-3 py-2 text-slate-700">{row.to}</td>
+                        <td className="px-3 py-2">
+                          <span className={`text-xs font-bold px-2 py-1 rounded-lg ${
+                            row.status === 'OK'
+                              ? 'bg-green-100 text-green-700'
+                              : row.status === 'PARZIALE'
+                                ? 'bg-amber-100 text-amber-700'
+                                : 'bg-red-100 text-red-700'
+                          }`}>
+                            {row.status}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2">
+                          {row.status !== 'OK' && (
+                            <button
+                              type="button"
+                              className="text-xs font-bold text-[#0052a3] hover:text-blue-500"
+                              onClick={() => handleOpenListingsFromCoverage(row)}
+                              aria-label={`Apri in Listings & FX per ${row.ticker}`}
+                            >
+                              Apri in Listings &amp; FX
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                    {coverage.perTicker.length === 0 && (
+                      <tr>
+                        <td className="px-3 py-2 text-slate-500 text-sm" colSpan={5}>Nessun ticker da mostrare.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="text-xs text-slate-500">Apri i dettagli per vedere la tabella completa.</div>
+            )}
+
           </div>
+
           <div ref={listingsSectionRef} className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-4 relative">
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div>
@@ -1002,46 +1240,114 @@ export const Settings: React.FC = () => {
               </div>
             </div>
           </div>
-          <div className="flex flex-wrap gap-3 pt-4">
-            <button onClick={handleSave} className="bg-[#0052a3] text-white px-6 py-3 rounded-xl text-sm font-bold hover:bg-blue-600 transition shadow-lg hover:shadow-primary/30">
-              Salva Configurazione
-            </button>
-            <button
-              onClick={handleSync}
-              disabled={loading}
-              className="bg-[#0052a3] text-white px-6 py-3 rounded-xl text-sm font-bold disabled:opacity-50 hover:bg-blue-600 transition shadow-lg hover:shadow-primary/30 flex items-center gap-2"
-            >
-              {loading ? (
-                <>
-                  <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
-                  Aggiornamento...
-                </>
-              ) : (
-                <>
-                  <span className="material-symbols-outlined text-sm">sync</span>
-                  Aggiorna Prezzi
-                </>
-              )}
-            </button>
-            <button
-              onClick={handleExport}
-              className="bg-slate-100 text-slate-700 px-6 py-3 rounded-xl text-sm font-bold hover:bg-slate-200 transition border border-borderSoft"
-            >
-              Export Backup
-            </button>
-            <button
-              onClick={handleImportClick}
-              className="bg-white text-slate-700 px-6 py-3 rounded-xl text-sm font-bold hover:bg-slate-50 transition border border-borderSoft"
-            >
-              Importa Backup
-            </button>
-            <input
-              type="file"
-              accept="application/json"
-              ref={fileInputRef}
-              onChange={handleImport}
-              className="hidden"
-            />
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-bold text-slate-900">Gestione Listings</div>
+                  <div className="text-xs text-slate-600">Voci salvate: {listingRows.length}</div>
+                </div>
+              </div>
+              <div className="mt-3 max-h-56 overflow-auto border border-borderSoft rounded-lg bg-white">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
+                    <tr>
+                      <th className="px-3 py-2 text-left">Ticker</th>
+                      <th className="px-3 py-2 text-left">Exch</th>
+                      <th className="px-3 py-2 text-left">Cur</th>
+                      <th className="px-3 py-2 text-left">Usato</th>
+                      <th className="px-3 py-2 text-right">Azione</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {listingRows.map((row) => {
+                      const usage = listingUsage.get(row.symbol);
+                      const usedCount = usage?.count || 0;
+                      const usageLabel = usedCount ? `${usedCount} str.` : '-';
+                      return (
+                        <tr key={`${row.symbol}-${row.exchangeCode}-${row.id ?? 'row'}`} className="border-t border-borderSoft">
+                          <td className="px-3 py-2 font-semibold">{row.symbol}</td>
+                          <td className="px-3 py-2 text-slate-700">{row.exchangeCode}</td>
+                          <td className="px-3 py-2 text-slate-700">{row.currency}</td>
+                          <td className="px-3 py-2" title={usage?.names?.join(', ') || ''}>
+                            <span className={usedCount ? 'text-amber-700 font-semibold' : 'text-slate-500'}>{usageLabel}</span>
+                          </td>
+                          <td className="px-3 py-2 text-right">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteListing(row)}
+                              className="text-xs font-bold text-red-600 hover:text-red-500 inline-flex items-center gap-1"
+                              aria-label={`Elimina listing ${row.symbol}`}
+                            >
+                              <span className="material-symbols-outlined text-[14px]">delete</span>
+                              Elimina
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {listingRows.length === 0 && (
+                      <tr>
+                        <td className="px-3 py-2 text-slate-500 text-sm" colSpan={5}>Nessun listing salvato.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-bold text-slate-900">Gestione FX</div>
+                  <div className="text-xs text-slate-600">Coppie: {fxPairs.length}</div>
+                </div>
+              </div>
+              <div className="mt-3 max-h-56 overflow-auto border border-borderSoft rounded-lg bg-white">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
+                    <tr>
+                      <th className="px-3 py-2 text-left">Coppia</th>
+                      <th className="px-3 py-2 text-left">Range</th>
+                      <th className="px-3 py-2 text-left">#</th>
+                      <th className="px-3 py-2 text-left">Uso</th>
+                      <th className="px-3 py-2 text-right">Azione</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {fxPairs.map(pair => (
+                      <tr key={pair.key} className="border-t border-borderSoft">
+                        <td className="px-3 py-2 font-semibold">{pair.key}</td>
+                        <td className="px-3 py-2 text-slate-700">{pair.from || 'N/D'} - {pair.to || 'N/D'}</td>
+                        <td className="px-3 py-2 text-slate-700">{pair.count}</td>
+                        <td className="px-3 py-2">
+                          <span className={pair.referenced ? 'text-amber-700 font-semibold' : 'text-slate-500'}>
+                            {pair.referenced ? 'Usata' : '-'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2 text-right">
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteFxPair(pair)}
+                            className="text-xs font-bold text-red-600 hover:text-red-500 inline-flex items-center gap-1"
+                            aria-label={`Elimina FX ${pair.key}`}
+                          >
+                            <span className="material-symbols-outlined text-[14px]">delete</span>
+                            Elimina
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {fxPairs.length === 0 && (
+                      <tr>
+                        <td className="px-3 py-2 text-slate-500 text-sm" colSpan={5}>Nessuna coppia FX salvata.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1066,5 +1372,11 @@ export const Settings: React.FC = () => {
     </div>
   );
 };
+
+
+
+
+
+
 
 

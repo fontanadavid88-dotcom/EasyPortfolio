@@ -4,6 +4,12 @@ export const config = {
 
 const MAX_BYTES = 10 * 1024 * 1024;
 const TIMEOUT_MS = 15000;
+const proc = (globalThis as any).process;
+const isDev = proc?.env?.NODE_ENV !== 'production';
+const devLog = (...args: unknown[]) => {
+  if (!isDev) return;
+  console.log('[eodhd]', ...args);
+};
 
 const readLimitedBody = async (
   stream: ReadableStream<Uint8Array> | null,
@@ -48,8 +54,13 @@ export default async function handler(request: Request): Promise<Response> {
     return new Response('Invalid path', { status: 400 });
   }
 
-  const apiKey = (globalThis as any).process?.env?.EODHD_API_KEY as string | undefined;
+  const envKey = (globalThis as any).process?.env?.EODHD_API_KEY as string | undefined;
+  const headerKey = request.headers.get('x-eodhd-api-key') || request.headers.get('x-eodhd-key') || '';
+  const urlKey = requestUrl.searchParams.get('api_token') || '';
+  const apiKey = (envKey || headerKey || urlKey).trim();
   if (!apiKey) {
+    devLog('req', request.url);
+    devLog('hasKey', false);
     return new Response('EODHD_API_KEY not configured', { status: 500 });
   }
 
@@ -58,6 +69,9 @@ export default async function handler(request: Request): Promise<Response> {
     if (key !== 'api_token') upstreamUrl.searchParams.append(key, value);
   });
   upstreamUrl.searchParams.set('api_token', apiKey);
+  devLog('req', request.url);
+  devLog('upstream', upstreamUrl.toString());
+  devLog('hasKey', true);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -67,6 +81,7 @@ export default async function handler(request: Request): Promise<Response> {
       method: request.method,
       signal: controller.signal
     });
+    devLog('upstreamStatus', upstream.status);
     const contentType = upstream.headers.get('content-type') || 'application/json';
     const cacheControl = upstream.headers.get('cache-control') || 'no-store';
 

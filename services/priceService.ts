@@ -3,8 +3,21 @@ import { Instrument, PricePoint, TransactionType } from '../types';
 import { format, subDays, addDays, differenceInCalendarDays } from 'date-fns';
 import Dexie from 'dexie';
 
-const EODHD_PROXY_BASE = '/api/eodhd/api';
+const EODHD_PROXY_ENDPOINT = '/api/eodhd-proxy';
 const PROXY_ERROR_MESSAGE = 'Impossibile raggiungere proxy API';
+
+const buildEodhdHeaders = (apiKey?: string) => {
+  const trimmed = apiKey?.trim();
+  return trimmed ? { 'x-eodhd-key': trimmed } : undefined;
+};
+
+const buildEodhdProxyUrl = (path: string, params: Record<string, string>) => {
+  const search = new URLSearchParams({ path });
+  Object.entries(params).forEach(([key, value]) => {
+    if (value) search.append(key, value);
+  });
+  return `${EODHD_PROXY_ENDPOINT}?${search.toString()}`;
+};
 
 interface PriceProvider {
   getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null>;
@@ -66,12 +79,18 @@ export const buildCoverageRows = (
 
 // 1. EODHD Provider
 class EodhdPriceProvider implements PriceProvider {
-  private baseUrl = EODHD_PROXY_BASE;
+  private apiKey?: string;
+
+  constructor(apiKey?: string) {
+    this.apiKey = apiKey?.trim() || undefined;
+  }
 
   async getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null> {
     try {
       // For real implementation, use EODHD real-time or EOD endpoint
-      const response = await fetch(`${this.baseUrl}/real-time/${encodeURIComponent(ticker)}?fmt=json`);
+      const headers = buildEodhdHeaders(this.apiKey);
+      const url = buildEodhdProxyUrl(`/api/real-time/${encodeURIComponent(ticker)}`, { fmt: 'json' });
+      const response = await fetch(url, headers ? { headers } : undefined);
       if (!response.ok) {
         if (response.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
         return null;
@@ -91,8 +110,9 @@ class EodhdPriceProvider implements PriceProvider {
 
   async getHistory(ticker: string, from: string, to: string): Promise<PricePoint[]> {
     try {
-      const url = `${this.baseUrl}/eod/${encodeURIComponent(ticker)}?from=${from}&to=${to}&fmt=json`;
-      const res = await fetch(url);
+      const url = buildEodhdProxyUrl(`/api/eod/${encodeURIComponent(ticker)}`, { from, to, fmt: 'json' });
+      const headers = buildEodhdHeaders(this.apiKey);
+      const res = await fetch(url, headers ? { headers } : undefined);
       if (!res.ok) {
         if (res.status >= 500) throw new Error(PROXY_ERROR_MESSAGE);
         return [];
@@ -175,13 +195,14 @@ class GoogleSheetsPriceProvider implements PriceProvider {
 }
 
 // 3. Orchestrator
-export const syncPrices = async () => {
+export const syncPrices = async (apiKeyOverride?: string) => {
   const portfolioId = getCurrentPortfolioId();
   const settings = await db.settings.where('portfolioId').equals(portfolioId).first();
   if (!settings) return;
 
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
-  const eodhd = new EodhdPriceProvider();
+  const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey;
+  const eodhd = new EodhdPriceProvider(eodhdKey);
   const sheet = new GoogleSheetsPriceProvider(settings.googleSheetUrl);
 
   const today = format(new Date(), 'yyyy-MM-dd');
@@ -304,7 +325,8 @@ export const backfillPricesForPortfolio = async (
   portfolioId: string,
   tickers: string[],
   minHistoryDate: string,
-  onProgress?: (info: { ticker: string; index: number; total: number; phase: 'backfill' | 'forward' | 'done'; error?: string }) => void
+  onProgress?: (info: { ticker: string; index: number; total: number; phase: 'backfill' | 'forward' | 'done'; error?: string }) => void,
+  apiKeyOverride?: string
 ) => {
   const settings = await db.settings.where('portfolioId').equals(portfolioId).first();
   if (!settings) {
@@ -313,7 +335,8 @@ export const backfillPricesForPortfolio = async (
     throw new Error(msg);
   }
 
-  const eodhd = new EodhdPriceProvider();
+  const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey;
+  const eodhd = new EodhdPriceProvider(eodhdKey);
   const today = format(new Date(), 'yyyy-MM-dd');
 
   for (let i = 0; i < tickers.length; i++) {
