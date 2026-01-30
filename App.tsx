@@ -9,6 +9,7 @@ import { Settings } from './pages/Settings';
 import { Data } from './pages/Data';
 import { Report } from './pages/Report';
 import { initSettings, seedDatabase, ensureDefaultPortfolio } from './db';
+import { runSymbolMigrationOnce } from './services/symbolMigration';
 
 const InitErrorContext = React.createContext<string | null>(null);
 
@@ -62,6 +63,7 @@ const App: React.FC = () => {
         await initSettings();
         setStatus('Seeding dati demo...');
         await seedDatabase();
+        await runSymbolMigrationOnce();
         console.log('[INIT] completed');
       } catch (e) {
         console.error("Initialization error:", e);

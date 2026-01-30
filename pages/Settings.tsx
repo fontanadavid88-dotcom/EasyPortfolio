@@ -1,12 +1,16 @@
-﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { db, getCurrentPortfolioId, setCurrentPortfolioId } from '../db';
-import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary } from '../services/priceService';
+import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary, resolvePriceSyncConfig, testSheetLatestPrice, SheetTestResult, toNum, fetchJsonWithDiagnostics, getResolvedSymbol } from '../services/priceService';
 import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
 import { importFxCsv, FxRateRow } from '../services/fxService';
-import { Currency, InstrumentListing, Instrument, RegionKey } from '../types';
+import { isIsin, normalizeTicker, resolveEodhdSymbol, hasExchangeSuffix } from '../services/symbolUtils';
+import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType } from '../types';
 import { InfoPopover } from '../components/InfoPopover';
 import { useLiveQuery } from 'dexie-react-hooks';
+import { format, subDays } from 'date-fns';
+import { useLocation } from 'react-router-dom';
+import { resetSymbolMigrationFlag, runSymbolMigrationOnce } from '../services/symbolMigration';
 
 type InstrumentListingRow = {
   id?: number;
@@ -21,14 +25,16 @@ type InstrumentListingRow = {
 type FxRateRowWithId = FxRateRow & { id?: number };
 
 export const Settings: React.FC = () => {
-  const [config, setConfig] = useState({
+  const [config, setConfig] = useState<AppSettings>({
     eodhdApiKey: '',
     googleSheetUrl: '',
     baseCurrency: Currency.CHF,
     minHistoryDate: '2020-01-01',
-    priceBackfillScope: 'current' as 'current' | 'all',
-    preferredExchangesOrder: ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'] as string[]
+    priceBackfillScope: 'current',
+    preferredExchangesOrder: ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'],
+    priceTickerConfig: {}
   });
+  const location = useLocation();
   const [isConfigModalOpen, setConfigModalOpen] = useState(false);
   const [coverageExpanded, setCoverageExpanded] = useState(false);
   const [coverage, setCoverage] = useState<{
@@ -43,9 +49,16 @@ export const Settings: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [syncSummary, setSyncSummary] = useState<SyncPricesSummary | null>(null);
   const [saveNotice, setSaveNotice] = useState('');
+  const [eodhdTests, setEodhdTests] = useState<Record<string, { status: string; symbol?: string; message?: string; httpStatus?: number; sample?: string; contentType?: string; rawPreview?: string; parseError?: string; url?: string }>>({});
+  const [eodhdSymbolErrors, setEodhdSymbolErrors] = useState<Record<string, string>>({});
+  const [bulkEodhdTesting, setBulkEodhdTesting] = useState(false);
+  const [sheetTests, setSheetTests] = useState<Record<string, SheetTestResult & { symbol?: string }>>({});
+  const [eodhdTesting, setEodhdTesting] = useState<Record<string, boolean>>({});
+  const [sheetTesting, setSheetTesting] = useState<Record<string, boolean>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const listingsSectionRef = useRef<HTMLDivElement | null>(null);
   const listingSelectRef = useRef<HTMLSelectElement | null>(null);
+  const focusHandledRef = useRef<string | null>(null);
   const [settingsId, setSettingsId] = useState<number | undefined>(undefined);
   const currentPortfolioId = getCurrentPortfolioId();
   const [portfolios, setPortfolios] = useState<{ id?: number; portfolioId: string; name: string }[]>([]);
@@ -63,6 +76,7 @@ export const Settings: React.FC = () => {
   const importFxButtonRef = useRef<HTMLButtonElement | null>(null);
   const [fxBase, setFxBase] = useState<Currency>(Currency.CHF);
   const [fxQuote, setFxQuote] = useState<Currency>(Currency.USD);
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
   const [regionAllocation, setRegionAllocation] = useState<Partial<Record<RegionKey, number>>>({});
   const [proxyHealth, setProxyHealth] = useState<{ ok: boolean; hasEodhdKey: boolean; error?: string } | null>(null);
   const [proxyHealthLoading, setProxyHealthLoading] = useState(false);
@@ -81,7 +95,8 @@ export const Settings: React.FC = () => {
           ...s,
           minHistoryDate: s.minHistoryDate || '2020-01-01',
           priceBackfillScope: (s.priceBackfillScope as any) || 'current',
-          preferredExchangesOrder: s.preferredExchangesOrder || prev.preferredExchangesOrder
+          preferredExchangesOrder: s.preferredExchangesOrder || prev.preferredExchangesOrder,
+          priceTickerConfig: s.priceTickerConfig || prev.priceTickerConfig || {}
         }));
         setSettingsId(s.id);
         if (s.baseCurrency) setFxBase(s.baseCurrency);
@@ -94,6 +109,28 @@ export const Settings: React.FC = () => {
       if (res.length > 0 && res[0].regionAllocation) setRegionAllocation(res[0].regionAllocation);
     });
   }, [currentPortfolioId]);
+  useEffect(() => {
+    const params = new URLSearchParams(location.search || "");
+    if (params.get("focus") !== "listing") return;
+    const tickerParam = params.get("ticker") || "";
+    const isinParam = params.get("isin") || "";
+    const focusKey = `${tickerParam}|${isinParam}`;
+    if (focusHandledRef.current === focusKey) return;
+    if (!instruments || instruments.length === 0) return;
+    const instrument = instruments.find(i => {
+      if (isinParam && i.isin === isinParam) return true;
+      if (!tickerParam) return false;
+      return i.ticker === tickerParam
+        || i.preferredListing?.symbol === tickerParam
+        || i.listings?.some(l => l.symbol === tickerParam);
+    });
+    if (instrument?.id) setSelectedInstrumentId(instrument.id);
+    const nextIsin = instrument?.isin || (isinParam ? isinParam : "");
+    if (nextIsin) setIsinInput(nextIsin);
+    listingsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    requestAnimationFrame(() => listingSelectRef.current?.focus());
+    focusHandledRef.current = focusKey;
+  }, [location.search, instruments]);
 
   const loadProxyHealth = async (apiKey?: string) => {
     setProxyHealthLoading(true);
@@ -152,6 +189,192 @@ export const Settings: React.FC = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config.priceBackfillScope, config.minHistoryDate, currentPortfolioId]);
 
+  const getRowConfig = (ticker: string) => resolvePriceSyncConfig(ticker, config);
+
+  const updateTickerConfig = async (ticker: string, patch: Partial<PriceTickerConfig>) => {
+    const nextConfig: AppSettings = {
+      ...config,
+      priceTickerConfig: {
+        ...(config.priceTickerConfig || {}),
+        [ticker]: {
+          ...(config.priceTickerConfig?.[ticker] || {}),
+          ...patch
+        }
+      }
+    };
+    setConfig(nextConfig);
+    await db.settings.put({ ...nextConfig, id: settingsId, portfolioId: currentPortfolioId });
+    if (patch.eodhdSymbol !== undefined || patch.provider !== undefined) {
+      setEodhdTests(prev => {
+        const copy = { ...prev };
+        delete copy[ticker];
+        return copy;
+      });
+    }
+    if (patch.sheetSymbol !== undefined || patch.provider !== undefined) {
+      setSheetTests(prev => {
+        const copy = { ...prev };
+        delete copy[ticker];
+        return copy;
+      });
+    }
+  };
+
+    const handleTestEodhd = async (ticker: string) => {
+      const cfg = getRowConfig(ticker);
+      const instrument = resolveInstrumentForTicker(ticker);
+      const symbol = getResolvedSymbol(ticker, config, 'EODHD', instrument?.type);
+      if (!symbol) {
+        setEodhdTests(prev => ({ ...prev, [ticker]: { status: 'MAP', symbol: cfg.eodhdSymbol, message: 'Symbol non valido' } }));
+        return;
+      }
+      const from = format(subDays(new Date(), 10), 'yyyy-MM-dd');
+      const to = format(new Date(), 'yyyy-MM-dd');
+      const params = new URLSearchParams({ path: '/api/eod/' + symbol, from, to, fmt: 'json' });
+      const headers = config.eodhdApiKey?.trim() ? { 'x-eodhd-key': config.eodhdApiKey.trim() } : undefined;
+      const url = `/api/eodhd-proxy?${params.toString()}`;
+      setEodhdTesting(prev => ({ ...prev, [ticker]: true }));
+      try {
+        const diag = await fetchJsonWithDiagnostics(url, headers ? { headers } : undefined);
+        let status = 'ERR';
+        let message = '';
+        let sample = '';
+        const rawPreview = diag.rawPreview;
+        const parseError = diag.parseError;
+        const contentType = diag.contentType;
+        const httpStatus = diag.httpStatus;
+        const rawTrim = diag.rawPreview.trimStart();
+
+        if (diag.ok) {
+          if (rawTrim.startsWith('<')) {
+            status = 'ERR';
+            message = 'HTML response';
+          } else if (Array.isArray(diag.json)) {
+            if (diag.json.length === 0) {
+              status = 'NO_DATA';
+              message = 'Nessun dato nel range';
+            } else {
+              const first = diag.json[0] as Record<string, unknown>;
+              const keys = Object.keys(first || {});
+              const closeType = typeof (first as Record<string, unknown>)?.close;
+              const adjType = typeof (first as Record<string, unknown>)?.adjusted_close;
+              const validRow = diag.json.find((row) => {
+                const obj = row as Record<string, unknown>;
+                const rowDate = String(obj?.date || '');
+                const closeRaw = obj?.adjusted_close ?? obj?.close;
+                const close = toNum(closeRaw);
+                return rowDate && close !== null;
+              });
+              if (validRow) {
+                status = 'OK';
+                const preview = diag.json.slice(0, 2).map((row) => {
+                  const obj = row as Record<string, unknown>;
+                  const rowDate = String(obj?.date || '');
+                  const closeRaw = obj?.adjusted_close ?? obj?.close;
+                  const close = toNum(closeRaw);
+                  return rowDate && close !== null ? `${rowDate}: ${close}` : null;
+                }).filter(Boolean) as string[];
+                sample = preview.join(' | ');
+                message = `count=${diag.json.length}`;
+              } else {
+                status = 'ERR';
+                message = `Validazione fallita: array=true length=${diag.json.length} keys=${keys.join(',')} closeType=${closeType} adjustedType=${adjType}`;
+              }
+            }
+          } else if (diag.json && typeof diag.json === 'object') {
+            const obj = diag.json as Record<string, unknown>;
+            const candidate = obj.message || obj.error || obj.errors || obj.code || obj.status;
+            message = typeof candidate === 'string' ? candidate : 'Payload oggetto (no array)';
+            status = 'ERR';
+          } else {
+            status = 'ERR';
+            message = `Validazione fallita: array=${Array.isArray(diag.json)} length=0`;
+          }
+        } else if (httpStatus === 400) {
+          const text = typeof diag.json === 'object' && diag.json && 'error' in (diag.json as Record<string, unknown>)
+            ? String((diag.json as Record<string, unknown>).error)
+            : rawPreview;
+          status = text.includes('Missing EODHD key') ? 'KEY' : 'ERR';
+          message = text;
+        } else if (httpStatus === 404) {
+          status = '404';
+        } else if (httpStatus === 429) {
+          status = 'RATE';
+        } else {
+          status = 'ERR';
+        }
+        setEodhdTests(prev => ({
+          ...prev,
+          [ticker]: { status, symbol, message, httpStatus, sample, contentType, rawPreview, parseError, url }
+        }));
+      } catch (e: any) {
+        setEodhdTests(prev => ({ ...prev, [ticker]: { status: 'ERR', symbol, message: e?.message || String(e) } }));
+      } finally {
+        setEodhdTesting(prev => ({ ...prev, [ticker]: false }));
+      }
+    };
+
+  const handleTestEodhdAll = async () => {
+    if (bulkEodhdTesting) return;
+    setBulkEodhdTesting(true);
+    try {
+      for (const row of coverage.perTicker) {
+        const cfg = getRowConfig(row.ticker);
+        if (cfg.needsMapping) {
+          setEodhdTests(prev => ({ ...prev, [row.ticker]: { status: 'MAP', symbol: cfg.eodhdSymbol, message: 'Needs mapping' } }));
+          continue;
+        }
+        if (cfg.excluded || cfg.provider !== 'EODHD') continue;
+        await handleTestEodhd(row.ticker);
+        await sleep(150);
+      }
+    } finally {
+      setBulkEodhdTesting(false);
+    }
+  };
+  const handleSetEodhdSymbol = async (ticker: string, symbol: string) => {
+    await updateTickerConfig(ticker, { eodhdSymbol: symbol, provider: 'EODHD', needsMapping: false });
+  };
+
+  const handleTestSheet = async (ticker: string) => {
+    const cfg = getRowConfig(ticker);
+    const symbol = cfg.sheetSymbol;
+    setSheetTesting(prev => ({ ...prev, [ticker]: true }));
+    try {
+      const result = await testSheetLatestPrice(config.googleSheetUrl, symbol);
+      setSheetTests(prev => ({ ...prev, [ticker]: { ...result, symbol } }));
+    } catch (e: any) {
+      setSheetTests(prev => ({ ...prev, [ticker]: { status: 'error', reason: e?.message || String(e), symbol } }));
+    } finally {
+      setSheetTesting(prev => ({ ...prev, [ticker]: false }));
+    }
+  };
+
+  const handleUseSheetLatest = async (ticker: string, symbol: string) => {
+    await updateTickerConfig(ticker, { provider: 'SHEETS', sheetSymbol: symbol });
+  };
+
+    const handleResetTickerPrices = async (ticker: string) => {
+      const first = window.confirm(`Vuoi eliminare tutti i prezzi per ${ticker}?`);
+      if (!first) return;
+      const second = window.confirm('Conferma definitiva: questa operazione e irreversibile.');
+      if (!second) return;
+      await db.prices
+        .where('portfolioId')
+        .equals(currentPortfolioId)
+        .and(p => p.ticker === ticker)
+        .delete();
+      await loadCoverage();
+    };
+
+    const handleRerunSymbolMigration = async () => {
+      const first = window.confirm('Vuoi rieseguire la migrazione symbol?');
+      if (!first) return;
+      resetSymbolMigrationFlag();
+      await runSymbolMigrationOnce();
+      await loadCoverage();
+    };
+
   const handleSync = async () => {
     setLoading(true);
     setSyncSummary(null);
@@ -201,7 +424,7 @@ export const Settings: React.FC = () => {
   };
 
   const handleReset = async () => {
-    if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione è irreversibile. Vuoi procedere?')) {
+    if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione � irreversibile. Vuoi procedere?')) {
       await (db as any).delete();
       window.location.reload();
     }
@@ -238,7 +461,7 @@ export const Settings: React.FC = () => {
       const json = JSON.parse(text);
       if (!json || typeof json !== 'object') throw new Error('Formato JSON non valido');
 
-      if (!confirm('Importare il backup sovrascriverà i dati attuali. Procedere?')) return;
+      if (!confirm('Importare il backup sovrascriver� i dati attuali. Procedere?')) return;
 
       const txs = (json.transactions || []).map((t: any) => ({
         ...t,
@@ -283,6 +506,7 @@ export const Settings: React.FC = () => {
       minHistoryDate: '2020-01-01',
       priceBackfillScope: 'current',
       preferredExchangesOrder: config.preferredExchangesOrder,
+      priceTickerConfig: {},
       portfolioId: id
     });
     setCurrentPortfolioId(id);
@@ -445,7 +669,7 @@ export const Settings: React.FC = () => {
     if (!selectedInstrumentId) return;
     const sum = Object.values(regionAllocation || {}).reduce((s, v) => s + (v || 0), 0);
     if (sum < 99.5 || sum > 100.5) {
-      if (!confirm('La somma delle percentuali non è 100%. Procedere lo stesso?')) return;
+      if (!confirm('La somma delle percentuali non � 100%. Procedere lo stesso?')) return;
     }
     await db.instruments.update(selectedInstrumentId, { regionAllocation });
     alert('Distribuzione geografica salvata');
@@ -467,13 +691,17 @@ export const Settings: React.FC = () => {
     setTimeout(() => ref.current?.focus(), 200);
   };
 
+  const resolveInstrumentForTicker = (ticker: string) => {
+    return instruments.find(i => i.preferredListing?.symbol === ticker)
+      || instruments.find(i => i.ticker === ticker)
+      || instruments.find(i => i.listings?.some(l => l.symbol === ticker));
+  };
+
   const resolveInstrumentForRow = (row: CoverageRow) => {
     if (row.instrumentId != null) {
       return instruments.find(i => i.id === Number(row.instrumentId));
     }
-    return instruments.find(i => i.preferredListing?.symbol === row.ticker)
-      || instruments.find(i => i.ticker === row.ticker)
-      || instruments.find(i => i.listings?.some(l => l.symbol === row.ticker))
+    return resolveInstrumentForTicker(row.ticker)
       || (row.isin ? instruments.find(i => i.isin === row.isin) : undefined);
   };
 
@@ -490,6 +718,46 @@ export const Settings: React.FC = () => {
     requestAnimationFrame(() => listingSelectRef.current?.focus());
   };
 
+  const handleEodhdSymbolChange = (row: CoverageRow, value: string) => {
+    const instrument = resolveInstrumentForRow(row);
+    const normalized = normalizeTicker(value);
+    if (!normalized) {
+      setEodhdSymbolErrors(prev => ({ ...prev, [row.ticker]: "" }));
+      updateTickerConfig(row.ticker, { eodhdSymbol: "", needsMapping: false });
+      return;
+    }
+    if (isIsin(normalized)) {
+      setEodhdSymbolErrors(prev => ({ ...prev, [row.ticker]: "Sembra un ISIN: spostalo nel campo ISIN." }));
+      updateTickerConfig(row.ticker, { needsMapping: true });
+      return;
+    }
+    const next = instrument?.type === AssetType.Crypto ? resolveEodhdSymbol(normalized, AssetType.Crypto) : normalized;
+    const missingExchange = instrument?.type !== AssetType.Crypto && !hasExchangeSuffix(next);
+    setEodhdSymbolErrors(prev => ({ ...prev, [row.ticker]: missingExchange ? "Manca exchange (es. .US, .SW)." : "" }));
+    updateTickerConfig(row.ticker, { eodhdSymbol: next, needsMapping: missingExchange ? true : false });
+  };
+
+  const getEodhdBadge = (status?: string) => {
+    if (!status) return null;
+    if (status === 'OK') return { label: 'OK', className: 'bg-green-100 text-green-700' };
+    if (status === 'NO_DATA') return { label: 'NO', className: 'bg-amber-100 text-amber-700' };
+    if (status === '404') return { label: '404', className: 'bg-red-100 text-red-700' };
+    if (status === 'KEY') return { label: 'KEY', className: 'bg-amber-100 text-amber-700' };
+    if (status === 'RATE') return { label: 'RATE', className: 'bg-amber-100 text-amber-700' };
+    if (status === 'MAP') return { label: 'MAP', className: 'bg-red-100 text-red-700' };
+    if (status === 'ERR') return { label: 'ERR', className: 'bg-red-100 text-red-700' };
+    return { label: status, className: 'bg-slate-100 text-slate-700' };
+  };
+
+  const getSheetBadge = (result?: SheetTestResult) => {
+    if (!result) return null;
+    if (result.status === 'ok') return { label: 'OK', className: 'bg-green-100 text-green-700' };
+    if (result.status === 'not_found') return { label: 'Not found', className: 'bg-amber-100 text-amber-700' };
+    if (result.status === 'disabled') return { label: 'URL', className: 'bg-red-100 text-red-700' };
+    if (result.status === 'error') return { label: 'ERR', className: 'bg-red-100 text-red-700' };
+    return { label: result.status, className: 'bg-slate-100 text-slate-700' };
+  };
+
   const syncStatusLabel = syncSummary
     ? syncSummary.status === 'ok'
       ? 'OK'
@@ -504,6 +772,41 @@ export const Settings: React.FC = () => {
         ? 'bg-amber-100 text-amber-700'
         : 'bg-red-100 text-red-700'
     : '';
+
+  const excludedTickers = useMemo(() => {
+    const set = new Set<string>();
+    Object.entries(config.priceTickerConfig || {}).forEach(([ticker, cfg]) => {
+      if (cfg?.exclude || cfg?.provider === 'MANUAL' || cfg?.needsMapping) set.add(ticker);
+    });
+    return set;
+  }, [config.priceTickerConfig]);
+
+  const coverageSummary = useMemo(() => {
+    const rows = coverage.perTicker.filter(row => !excludedTickers.has(row.ticker));
+    const okCount = rows.filter(row => row.status === 'OK').length;
+    let earliest: string | undefined;
+    let latest: string | undefined;
+    rows.forEach(row => {
+      if (row.from === 'N/D' || row.to === 'N/D') return;
+      earliest = earliest ? (row.from > earliest ? row.from : earliest) : row.from;
+      latest = latest ? (row.to < latest ? row.to : latest) : row.to;
+    });
+    return {
+      okCount,
+      total: rows.length,
+      earliest,
+      latest
+    };
+  }, [coverage.perTicker, excludedTickers]);
+
+  const sourcesStatus = useMemo(() => {
+    const sheetsConfigured = Boolean(config.googleSheetUrl?.trim());
+    const sheetsHasErrors = sheetsConfigured && Object.values(sheetTests).some(result => result.status === 'error' || result.status === 'disabled');
+    const sheetsStatus: 'disabled' | 'ok' | 'err' = !sheetsConfigured ? 'disabled' : sheetsHasErrors ? 'err' : 'ok';
+    const eodhdStatus: 'ok' | 'err' = proxyHealth?.ok && proxyHealth?.hasEodhdKey ? 'ok' : 'err';
+    const globalStatus = eodhdStatus === 'ok' && (sheetsStatus === 'ok' || sheetsStatus === 'disabled') ? 'OK' : 'PARZIALE';
+    return { eodhdStatus, sheetsStatus, globalStatus };
+  }, [config.googleSheetUrl, sheetTests, proxyHealth]);
 
   const listingUsage = useMemo(() => {
     const usage = new Map<string, { count: number; names: string[] }>();
@@ -558,7 +861,7 @@ export const Settings: React.FC = () => {
     const usage = listingUsage.get(row.symbol);
     const hasRefs = Boolean(usage?.count);
     const confirmMessage = hasRefs
-      ? `Il listing ${row.symbol} è ancora usato da ${usage?.count} strumento/i. Verrà rimosso dai riferimenti. Continuare?`
+      ? `Il listing ${row.symbol} � ancora usato da ${usage?.count} strumento/i. Verr� rimosso dai riferimenti. Continuare?`
       : `Eliminare il listing ${row.symbol}?`;
     if (!confirm(confirmMessage)) return;
     await db.transaction('rw', [db.instrumentListings, db.instruments], async () => {
@@ -764,11 +1067,22 @@ export const Settings: React.FC = () => {
             <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 text-sm text-slate-700">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <div className="text-sm font-bold text-slate-900">Impostazioni base</div>
-                  <div className="text-xs text-slate-600 mt-1">Key EODHD: {config.eodhdApiKey?.trim() ? 'Impostata' : 'Mancante'}</div>
-                  <div className="text-xs text-slate-600">Sheet prezzi: {config.googleSheetUrl?.trim() ? 'Configurato' : 'Non configurato'}</div>
-                  <div className="text-xs text-slate-600">Valuta base: {config.baseCurrency}</div>
-                  <div className="text-xs text-slate-600">Exchange preferiti: {(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(', ')}</div>
+                    <div className="text-sm font-bold text-slate-900">Impostazioni base</div>
+                    <div className="text-xs text-slate-600 mt-1">Key EODHD: {config.eodhdApiKey?.trim() ? 'Impostata' : 'Mancante'}</div>
+                    <div className="text-xs text-slate-600">Sheet prezzi: {config.googleSheetUrl?.trim() ? 'Configurato' : 'Non configurato'}</div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+                      <span className={`font-bold px-2 py-1 rounded-full ${sourcesStatus.eodhdStatus === 'ok' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                        EODHD {sourcesStatus.eodhdStatus === 'ok' ? 'OK' : 'ERR'}
+                      </span>
+                      <span className={`font-bold px-2 py-1 rounded-full ${sourcesStatus.sheetsStatus === 'disabled' ? 'bg-slate-100 text-slate-600' : sourcesStatus.sheetsStatus === 'ok' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                        Sheets {sourcesStatus.sheetsStatus === 'disabled' ? 'disabilitato' : sourcesStatus.sheetsStatus === 'ok' ? 'OK' : 'ERR'}
+                      </span>
+                      <span className={`font-bold px-2 py-1 rounded-full ${sourcesStatus.globalStatus === 'OK' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+                        Stato: {sourcesStatus.globalStatus}
+                      </span>
+                    </div>
+                    <div className="text-xs text-slate-600">Valuta base: {config.baseCurrency}</div>
+                    <div className="text-xs text-slate-600">Exchange preferiti: {(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(', ')}</div>
                   <div className="text-xs text-slate-600">Backfill: dal {config.minHistoryDate || '2020-01-01'} ({(config.priceBackfillScope || 'current') === 'all' ? 'Completo' : 'Solo correnti'})</div>
                   {saveNotice && <div className="text-xs text-green-700 mt-2">{saveNotice}</div>}
                 </div>
@@ -812,6 +1126,11 @@ export const Settings: React.FC = () => {
                   <span className="text-slate-500">EODHD key:</span>{' '}
                   {proxyHealthLoading ? '...' : proxyHealth?.hasEodhdKey ? 'OK' : 'Mancante'}
                 </div>
+                {proxyHealth?.ok && !proxyHealth?.hasEodhdKey && (
+                  <div className="text-amber-700">
+                    Missing EODHD_API_KEY in .env.local or Vercel env. Restart dev server.
+                  </div>
+                )}
                 {!proxyHealth?.ok && (
                   <div className="text-slate-500">
                     Avvia `vercel dev` oppure verifica il deploy su Vercel.
@@ -823,7 +1142,7 @@ export const Settings: React.FC = () => {
             <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
               <div className="text-sm font-bold text-slate-900">Prezzi &amp; Backfill</div>
               <div className="text-xs text-slate-600">
-                Copertura: {coverage.okCount}/{coverage.total} tickers - {coverage.earliestCoveredDate || 'N/D'} - {coverage.latestCoveredDate || 'N/D'}
+                Copertura: {coverageSummary.okCount}/{coverageSummary.total} tickers - {coverageSummary.earliest || coverage.earliestCoveredDate || 'N/D'} - {coverageSummary.latest || coverage.latestCoveredDate || 'N/D'}
               </div>
               <div className="flex flex-wrap gap-3">
                 <button
@@ -862,6 +1181,20 @@ export const Settings: React.FC = () => {
                 </button>
                 <button
                   type="button"
+                  onClick={handleTestEodhdAll}
+                  disabled={bulkEodhdTesting}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600 disabled:opacity-60"
+                >
+                  {bulkEodhdTesting ? 'Test EODHD (tutti)...' : 'Test EODHD (tutti)'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRerunSymbolMigration}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  Riesegui migrazione symbol
+                </button>
+                <button
                   onClick={() => setCoverageExpanded(prev => !prev)}
                   className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
                 >
@@ -878,7 +1211,7 @@ export const Settings: React.FC = () => {
                   {syncSummary.failedTickers.length > 0 && (
                     <div className="text-amber-700">
                       Errori: {syncSummary.failedTickers.slice(0, 5).map(f => f.ticker).join(', ')}
-                      {syncSummary.failedTickers.length > 5 ? '…' : ''}
+                      {syncSummary.failedTickers.length > 5 ? '�' : ''}
                     </div>
                   )}
                   {syncSummary.sheet.enabled ? null : (
@@ -919,11 +1252,11 @@ export const Settings: React.FC = () => {
               <div>
                 <div className="text-sm font-bold text-slate-900">Copertura prezzi (portafoglio attivo)</div>
                 <div className="text-xs text-slate-600">
-                  Dal {coverage.earliestCoveredDate || 'N/D'} al {coverage.latestCoveredDate || 'N/D'} - Ticker coperti: {coverage.okCount}/{coverage.total}
+                  Dal {coverageSummary.earliest || coverage.earliestCoveredDate || 'N/D'} al {coverageSummary.latest || coverage.latestCoveredDate || 'N/D'} - Ticker coperti: {coverageSummary.okCount}/{coverageSummary.total}
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                {coverage.okCount < (coverage.total || 1) && (
+                {coverageSummary.okCount < (coverageSummary.total || 1) && (
                   <span className="text-xs font-bold text-amber-600 bg-amber-100 px-2 py-1 rounded-lg">Dati incompleti</span>
                 )}
                 <InfoPopover
@@ -934,8 +1267,8 @@ export const Settings: React.FC = () => {
                       <ul className="list-disc list-inside space-y-1">
                         <li>La tabella mostra per ogni strumento il range di date per cui abbiamo prezzi salvati nel database.</li>
                         <li>Se vedi PARZIALE/INCOMPLETO, i grafici (ritorni annuali, drawdown, CAGR) possono risultare incompleti o N/D.</li>
-                        <li>Per estendere lo storico: usa “Scarica storico prezzi” oppure importa un CSV prezzi dal tuo provider.</li>
-                        <li>Lo strumento mostrato (ticker) è il listing usato per i prezzi; se è sbagliato, correggilo in “Listings & FX”.</li>
+                        <li>Per estendere lo storico: usa �Scarica storico prezzi� oppure importa un CSV prezzi dal tuo provider.</li>
+                        <li>Lo strumento mostrato (ticker) � il listing usato per i prezzi; se � sbagliato, correggilo in �Listings & FX�.</li>
                         <li>Consiglio: per SIX/CHF usa un listing .SW e importa prezzi in CHF (SIX-first).</li>
                       </ul>
                       <div className="flex flex-wrap gap-2 pt-1 text-xs">
@@ -965,53 +1298,224 @@ export const Settings: React.FC = () => {
                   <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
                     <tr>
                       <th className="px-3 py-2 text-left">Strumento</th>
-                      <th className="px-3 py-2 text-left">Dal</th>
-                      <th className="px-3 py-2 text-left">Al</th>
+                      <th className="px-3 py-2 text-left">Provider</th>
+                      <th className="px-3 py-2 text-left">Symbol</th>
+                      <th className="px-3 py-2 text-left">Copertura</th>
                       <th className="px-3 py-2 text-left">Stato</th>
                       <th className="px-3 py-2 text-left">Azioni</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {coverage.perTicker.map((row, index) => (
-                      <tr key={`${row.ticker}-${row.instrumentId ?? index}`} className="border-t border-borderSoft">
-                        <td className="px-3 py-2">
-                          <div className="flex flex-col">
-                            <span className="font-semibold text-slate-900">{row.ticker}</span>
-                            <span className="text-xs text-slate-600">
-                              ISIN: {row.isin || '—'}{row.name ? ` - ${row.name}` : ''}
+                    {coverage.perTicker.map((row, index) => {
+                                            const instrument = resolveInstrumentForRow(row);
+                      const rowConfig = getRowConfig(row.ticker);
+                      const rawConfig = config.priceTickerConfig?.[row.ticker] || {};
+                      const provider = rowConfig.provider as PriceProviderType;
+                      const isNeedsMapping = Boolean(rowConfig.needsMapping);
+                      const isExcluded = !isNeedsMapping && (rowConfig.excluded || provider === 'MANUAL');
+                      const effectiveSymbol = provider === 'SHEETS'
+                        ? rowConfig.sheetSymbol
+                        : provider === 'EODHD'
+                          ? resolveEodhdSymbol(rowConfig.eodhdSymbol, instrument?.type)
+                          : '--';
+                      const statusLabel = isNeedsMapping ? 'MAPPING' : isExcluded ? (provider === 'MANUAL' ? 'MANUAL' : 'ESCLUSO') : row.status;
+                      const statusClass = isNeedsMapping
+                        ? 'bg-red-100 text-red-700'
+                        : isExcluded
+                          ? 'bg-slate-100 text-slate-600'
+                          : row.status === 'OK'
+                            ? 'bg-green-100 text-green-700'
+                            : row.status === 'PARZIALE'
+                              ? 'bg-amber-100 text-amber-700'
+                              : 'bg-red-100 text-red-700';
+                      const eodhdBadge = getEodhdBadge(eodhdTests[row.ticker]?.status);
+                      const sheetBadge = getSheetBadge(sheetTests[row.ticker]);
+                      const sheetReason = sheetTests[row.ticker]?.reason;
+
+                      return (
+                        <tr key={`${row.ticker}-${row.instrumentId ?? index}`} className="border-t border-borderSoft align-top">
+                          <td className="px-3 py-2">
+                            <div className="flex flex-col">
+                              <span className="font-semibold text-slate-900">{row.ticker}</span>
+                              <span className="text-xs text-slate-600">
+                                ISIN: {row.isin || '�'}{row.name ? ` - ${row.name}` : ''}
+                              </span>
+                              {!isExcluded && row.status !== 'OK' && (
+                                <button
+                                  type="button"
+                                  className="text-xs font-bold text-[#0052a3] hover:text-blue-500 text-left mt-1"
+                                  onClick={() => handleOpenListingsFromCoverage(row)}
+                                  aria-label={`Apri in Listings & FX per ${row.ticker}`}
+                                >
+                                  Apri in Listings &amp; FX
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <div className="flex flex-col gap-2">
+                              <select
+                                className="border border-borderSoft rounded-lg px-2 py-1 text-xs text-slate-800 bg-white shadow-inner"
+                                value={provider}
+                                onChange={e => updateTickerConfig(row.ticker, { provider: e.target.value as PriceProviderType })}
+                              >
+                                <option value="EODHD">EODHD</option>
+                                <option value="SHEETS">Sheets</option>
+                                <option value="MANUAL">Manual (CSV)</option>
+                              </select>
+                              <label className="inline-flex items-center gap-2 text-[11px] text-slate-500">
+                                <input
+                                  type="checkbox"
+                                  checked={Boolean(rawConfig.exclude)}
+                                  onChange={() => updateTickerConfig(row.ticker, { exclude: !rawConfig.exclude })}
+                                />
+                                Escludi dal sync/backfill
+                              </label>
+                            </div>
+                          </td>
+                          <td className="px-3 py-2">
+                            {provider === 'EODHD' && (
+                              <div className="space-y-1">
+                                <input
+                                  className="w-full border border-borderSoft rounded-lg px-2 py-1 text-xs text-slate-800 bg-white shadow-inner"
+                                  placeholder={row.ticker}
+                                  value={rawConfig.eodhdSymbol || ''}
+                                  onChange={e => handleEodhdSymbolChange(row, e.target.value)}
+                                />
+                                <div className="text-[11px] text-slate-500">Usato: <span className="font-semibold">{effectiveSymbol}</span></div>
+                                {eodhdSymbolErrors[row.ticker] && (
+                                  <div className="text-[10px] text-red-600">{eodhdSymbolErrors[row.ticker]}</div>
+                                )}
+                              </div>
+                            )}
+                            {provider === 'SHEETS' && (
+                              <div className="space-y-1">
+                                <input
+                                  className="w-full border border-borderSoft rounded-lg px-2 py-1 text-xs text-slate-800 bg-white shadow-inner"
+                                  placeholder={row.ticker}
+                                  value={rawConfig.sheetSymbol || ''}
+                                  onChange={e => updateTickerConfig(row.ticker, { sheetSymbol: e.target.value })}
+                                />
+                                <div className="text-[11px] text-slate-500">Usato: <span className="font-semibold">{effectiveSymbol}</span></div>
+                              </div>
+                            )}
+                            {provider === 'MANUAL' && (
+                              <div className="text-xs text-slate-500">Manuale (CSV)</div>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 text-slate-700">
+                            <div className="text-xs">Dal {row.from}</div>
+                            <div className="text-xs">Al {row.to}</div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <span className={`text-xs font-bold px-2 py-1 rounded-lg ${statusClass}`}>
+                              {statusLabel}
                             </span>
-                          </div>
-                        </td>
-                        <td className="px-3 py-2 text-slate-700">{row.from}</td>
-                        <td className="px-3 py-2 text-slate-700">{row.to}</td>
-                        <td className="px-3 py-2">
-                          <span className={`text-xs font-bold px-2 py-1 rounded-lg ${
-                            row.status === 'OK'
-                              ? 'bg-green-100 text-green-700'
-                              : row.status === 'PARZIALE'
-                                ? 'bg-amber-100 text-amber-700'
-                                : 'bg-red-100 text-red-700'
-                          }`}>
-                            {row.status}
-                          </span>
-                        </td>
-                        <td className="px-3 py-2">
-                          {row.status !== 'OK' && (
-                            <button
-                              type="button"
-                              className="text-xs font-bold text-[#0052a3] hover:text-blue-500"
-                              onClick={() => handleOpenListingsFromCoverage(row)}
-                              aria-label={`Apri in Listings & FX per ${row.ticker}`}
-                            >
-                              Apri in Listings &amp; FX
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                          </td>
+                          <td className="px-3 py-2">
+                            <div className="flex flex-col gap-2">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <button
+                                  type="button"
+                                  onClick={() => handleTestEodhd(row.ticker)}
+                                  disabled={eodhdTesting[row.ticker]}
+                                  className="text-xs font-bold text-[#0052a3] hover:text-blue-500"
+                                >
+                                  {eodhdTesting[row.ticker] ? 'Test EODHD...' : 'Test EODHD (singolo)'}
+                                </button>
+                                {eodhdTests[row.ticker]?.url && (
+                                  <button
+                                    type="button"
+                                    onClick={() => window.open(eodhdTests[row.ticker]?.url, '_blank')}
+                                    className="text-[10px] font-bold text-slate-600 underline"
+                                  >
+                                    Apri risposta raw
+                                  </button>
+                                )}
+                                {eodhdBadge && (
+                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${eodhdBadge.className}`}>
+                                    {eodhdBadge.label}
+                                  </span>
+                                )}
+                                {eodhdTests[row.ticker]?.status === 'OK' && (
+                                  <button
+                                    type="button"
+                                    className="text-[10px] font-bold text-emerald-700 underline"
+                                    onClick={() => handleSetEodhdSymbol(row.ticker, eodhdTests[row.ticker]?.symbol || rowConfig.eodhdSymbol)}
+                                  >
+                                    Imposta come symbol EODHD
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleResetTickerPrices(row.ticker)}
+                                  className="text-[10px] font-bold text-slate-600 underline"
+                                >
+                                  Svuota cache locale
+                                </button>
+                              </div>
+                              {eodhdTests[row.ticker] && (
+                                <div className="text-[10px] text-slate-500 mt-1">
+                                  {eodhdTests[row.ticker]?.httpStatus ? `HTTP ${eodhdTests[row.ticker]?.httpStatus}` : ''}
+                                  {eodhdTests[row.ticker]?.contentType ? ` • ${eodhdTests[row.ticker]?.contentType}` : ''}
+                                  {eodhdTests[row.ticker]?.message ? ` • ${eodhdTests[row.ticker]?.message}` : ''}
+                                  {eodhdTests[row.ticker]?.sample ? ` • ${eodhdTests[row.ticker]?.sample}` : ''}
+                                  {eodhdTests[row.ticker]?.parseError ? ` • parseError: ${eodhdTests[row.ticker]?.parseError}` : ''}
+                                </div>
+                              )}
+                              {eodhdTests[row.ticker]?.rawPreview && eodhdTests[row.ticker]?.status !== 'OK' && (
+                                <div className="text-[10px] text-amber-700 mt-1 whitespace-pre-wrap">
+                                  {eodhdTests[row.ticker]?.rawPreview}
+                                </div>
+                              )}
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <button
+                                  type="button"
+                                  onClick={() => handleTestSheet(row.ticker)}
+                                  disabled={sheetTesting[row.ticker]}
+                                  className="text-xs font-bold text-[#0052a3] hover:text-blue-500"
+                                >
+                                  {sheetTesting[row.ticker] ? 'Test Sheet...' : 'Test Sheet'}
+                                </button>
+                                {sheetBadge && (
+                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${sheetBadge.className}`}>
+                                    {sheetBadge.label}
+                                  </span>
+                                )}
+                                {sheetTests[row.ticker]?.status === 'ok' && (
+                                  <button
+                                    type="button"
+                                    className="text-[10px] font-bold text-emerald-700 underline"
+                                    onClick={() => handleUseSheetLatest(row.ticker, sheetTests[row.ticker]?.symbol || rowConfig.sheetSymbol)}
+                                  >
+                                    Usa Sheet per latest
+                                  </button>
+                                )}
+                              </div>
+                              {sheetReason && (
+                                <div className="text-[10px] text-amber-700">{sheetReason}</div>
+                              )}
+                              {sheetTests[row.ticker]?.status === 'ok' && sheetTests[row.ticker]?.price && (
+                                <div className="text-[10px] text-slate-600">
+                                  Sheet latest: {sheetTests[row.ticker]?.price?.close}{' '}
+                                  {sheetTests[row.ticker]?.price?.currency || ''} {sheetTests[row.ticker]?.price?.date || ''}
+                                </div>
+                              )}
+                              <button
+                                type="button"
+                                className="text-[10px] font-bold text-red-600 hover:text-red-700"
+                                onClick={() => handleResetTickerPrices(row.ticker)}
+                              >
+                                Reset prezzi ticker
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
                     {coverage.perTicker.length === 0 && (
                       <tr>
-                        <td className="px-3 py-2 text-slate-500 text-sm" colSpan={5}>Nessun ticker da mostrare.</td>
+                        <td className="px-3 py-2 text-slate-500 text-sm" colSpan={6}>Nessun ticker da mostrare.</td>
                       </tr>
                     )}
                   </tbody>
@@ -1043,14 +1547,14 @@ export const Settings: React.FC = () => {
                       isSixFirst
                         ? 'Stai usando il listing SIX in CHF. I prezzi devono essere importati/aggiornati in CHF. FX non necessario.'
                         : needsFx
-                          ? 'Il listing selezionato è in valuta estera. Per mostrare valori in CHF servono tassi FX (USD→CHF, EUR→CHF, GBP→CHF).'
+                          ? 'Il listing selezionato � in valuta estera. Per mostrare valori in CHF servono tassi FX (USD?CHF, EUR?CHF, GBP?CHF).'
                           : 'Listing OK'
                     }
                   >
                     <span className="material-symbols-outlined text-[16px]">
                       {isSixFirst ? 'check_circle' : needsFx ? 'warning' : 'info'}
                     </span>
-                    {isSixFirst ? 'SIX-first attivo ✅' : needsFx ? 'Listing estero (serve FX) ⚠️' : 'Listing OK'}
+                    {isSixFirst ? 'SIX-first attivo ?' : needsFx ? 'Listing estero (serve FX) ??' : 'Listing OK'}
                     {needsFx && (
                       <button
                         type="button"
@@ -1072,7 +1576,7 @@ export const Settings: React.FC = () => {
                       <li>Scegli il listing che userai per i prezzi e lo storico (es. SIX: .SW).</li>
                       <li>I prezzi importati devono avere la stessa valuta del listing selezionato (es. listing CHF -&gt; CSV CHF).</li>
                       <li>Se selezioni un listing estero (USD/EUR/GBP), per vedere tutto in CHF devi importare anche i tassi FX (USD-&gt;CHF, ecc.).</li>
-                      <li>Salva sempre il listing preferito prima di importare prezzi, così l'import finisce sul ticker corretto.</li>
+                      <li>Salva sempre il listing preferito prima di importare prezzi, cos� l'import finisce sul ticker corretto.</li>
                       <li>Se la search non trova SIX, aggiungi manualmente un listing SW (.SW) in CHF (SIX-first).</li>
                       </ul>
                       <div className="flex flex-wrap gap-2 pt-1 text-xs">
@@ -1091,7 +1595,7 @@ export const Settings: React.FC = () => {
                           Importa FX (CSV)
                         </button>
                         <details className="text-slate-600 text-xs">
-                          <summary className="cursor-pointer text-[#0052a3] font-bold">Cos’è SIX-first?</summary>
+                          <summary className="cursor-pointer text-[#0052a3] font-bold">Cos�� SIX-first?</summary>
                           <div className="mt-1">
                             Usa un listing SIX (.SW) in CHF per evitare conversioni FX sui prezzi. Importa prezzi direttamente in CHF per allineare reporting e base currency.
                           </div>
@@ -1150,7 +1654,7 @@ export const Settings: React.FC = () => {
                   renderContent={() => (
                     <div className="text-sm space-y-1">
                       <p>Inserisci le percentuali per area (somma ~100%).</p>
-                      <p>Se non definite, la Dashboard mostrerà “Non definito”.</p>
+                      <p>Se non definite, la Dashboard mostrer� �Non definito�.</p>
                     </div>
                   )}
                 />
@@ -1216,7 +1720,7 @@ export const Settings: React.FC = () => {
                         />
                         <span className="text-sm font-bold text-slate-900">{l.symbol}</span>
                       </div>
-                      <span className="text-xs text-slate-600">{l.exchangeCode} • {l.currency}</span>
+                      <span className="text-xs text-slate-600">{l.exchangeCode} � {l.currency}</span>
                       {l.name && <span className="text-xs text-slate-500">{l.name}</span>}
                     </label>
                   ))}
@@ -1414,7 +1918,7 @@ export const Settings: React.FC = () => {
         </h2>
         <p className="text-sm text-red-700/70 mb-6 leading-relaxed">
           Se l'applicazione non visualizza i dati corretti o hai conflitti con versioni precedenti, puoi resettare il database.
-          Questo cancellerà tutto e ricaricherà i dati demo.
+          Questo canceller� tutto e ricaricher� i dati demo.
         </p>
         <button
           onClick={handleReset}
@@ -1426,6 +1930,13 @@ export const Settings: React.FC = () => {
     </div>
   );
 };
+
+
+
+
+
+
+
 
 
 

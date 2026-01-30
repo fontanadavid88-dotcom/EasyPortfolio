@@ -1,9 +1,14 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { TransactionType, Currency, Transaction, AssetType, AssetClass, Instrument, RegionKey } from '../types';
+import { TransactionType, Currency, Transaction, AssetType, AssetClass, Instrument, RegionKey, InstrumentListing } from '../types';
 import clsx from 'clsx';
-import { getAssetClassLabel, inferAssetClass } from '../services/financeUtils';
+import { getAssetClassLabel, getCanonicalTicker, inferAssetClass } from '../services/financeUtils';
+import { resolveListingsByIsin } from '../services/eodhdSearchService';
+import { getPriceCoverage, resolvePriceSyncConfig, CoverageRow, getMarketCloseAroundDate, MarketCloseAroundResult } from '../services/priceService';
+import { buildPriceTickerConfigWithDefault, planAutoAttachListing } from '../services/priceAttach';
+import { isIsin, normalizeIsin, normalizeTicker, resolveEodhdSymbol, hasExchangeSuffix } from '../services/symbolUtils';
 
 interface GroupedAsset {
     ticker: string;
@@ -90,13 +95,53 @@ export const Transactions: React.FC = () => {
         []
     );
 
+    const settings = useLiveQuery(
+        () => db.settings.where('portfolioId').equals(currentPortfolioId).first(),
+        [currentPortfolioId]
+    );
+
     // -- Global State --
     const [expandedTicker, setExpandedTicker] = useState<string | null>(null);
+    const [coverageRows, setCoverageRows] = useState<CoverageRow[]>([]);
+    const [assetAttachNotice, setAssetAttachNotice] = useState<string>("");
+    const [assetInputNotice, setAssetInputNotice] = useState<string>("");
+    const navigate = useNavigate();
+
+    const priceTickers = useMemo(() => {
+        if (!instruments) return [];
+        const unique = new Set<string>();
+        instruments.forEach(inst => {
+            if (inst.type === AssetType.Cash) return;
+            const ticker = getCanonicalTicker(inst);
+            if (ticker) unique.add(ticker);
+        });
+        return Array.from(unique);
+    }, [instruments]);
+
+    useEffect(() => {
+        if (!settings) {
+            setCoverageRows([]);
+            return;
+        }
+        if (priceTickers.length === 0) {
+            setCoverageRows([]);
+            return;
+        }
+        const minHistoryDate = settings.minHistoryDate || "2020-01-01";
+        getPriceCoverage(currentPortfolioId, priceTickers, minHistoryDate)
+            .then(result => setCoverageRows(result.perTicker))
+            .catch(() => setCoverageRows([]));
+    }, [settings, priceTickers, currentPortfolioId, prices]);
+
+    const coverageByTicker = useMemo(() => {
+        return new Map(coverageRows.map(row => [row.ticker, row]));
+    }, [coverageRows]);
 
     // -- Add Asset Modal State --
     const [isAssetModalOpen, setAssetModalOpen] = useState(false);
     const [assetForm, setAssetForm] = useState({
         ticker: '',
+        isin: '',
         name: '',
         type: AssetType.Stock,
         assetClass: AssetClass.STOCK,
@@ -106,6 +151,26 @@ export const Transactions: React.FC = () => {
         date: new Date().toISOString().split('T')[0],
         currency: Currency.USD
     });
+    const [isinLookupStatus, setIsinLookupStatus] = useState<'idle' | 'loading' | 'resolved' | 'multiple' | 'none' | 'error'>('idle');
+    const [isinLookupMessage, setIsinLookupMessage] = useState('');
+    const [isinCandidates, setIsinCandidates] = useState<InstrumentListing[]>([]);
+    const [isinResolvedSymbol, setIsinResolvedSymbol] = useState('');
+    const [assetMarketHint, setAssetMarketHint] = useState<{ status: 'idle' | 'loading' | MarketCloseAroundResult['status']; data?: MarketCloseAroundResult | null; message?: string }>({ status: 'idle' });
+    const [txMarketHint, setTxMarketHint] = useState<{ status: 'idle' | 'loading' | MarketCloseAroundResult['status']; data?: MarketCloseAroundResult | null; message?: string }>({ status: 'idle' });
+    const [forceAssetEodhd, setForceAssetEodhd] = useState(false);
+    const [forceTxEodhd, setForceTxEodhd] = useState(false);
+    const assetMarketHintReq = useRef(0);
+    const txMarketHintReq = useRef(0);
+
+    const numberValue = (value: number) => (Number.isFinite(value) ? value : "");
+    const parseNumberInput = (value: string) => { const trimmed = value.trim(); if (!trimmed) return NaN; const parsed = parseFloat(trimmed); return Number.isFinite(parsed) ? parsed : NaN; };
+    const normalizedTicker = normalizeTicker(assetForm.ticker);
+    const normalizedIsin = normalizeIsin(assetForm.isin);
+    const resolvedTicker = resolveEodhdSymbol(normalizedTicker, assetForm.type);
+    const tickerLooksIsin = Boolean(normalizedTicker) && isIsin(normalizedTicker);
+    const isinInvalid = Boolean(normalizedIsin) && !isIsin(normalizedIsin);
+    const missingExchange = Boolean(normalizedTicker) && !tickerLooksIsin && !hasExchangeSuffix(resolvedTicker) && assetForm.type !== AssetType.Crypto;
+    const canSaveAsset = Boolean(resolvedTicker) && !tickerLooksIsin && !isinInvalid && !missingExchange;
     const [tickerSearchResults, setTickerSearchResults] = useState<{ t: string, ex: string }[]>([]);
     const [suppressSuggestions, setSuppressSuggestions] = useState(false);
     const [isTickerDropdownOpen, setTickerDropdownOpen] = useState(false);
@@ -163,6 +228,7 @@ export const Transactions: React.FC = () => {
         setTickerSearchResults(results);
         setTickerDropdownOpen(results.length > 0);
     }, [assetForm.ticker, suppressSuggestions]);
+
 
     useEffect(() => {
         const handleClickOutside = (e: MouseEvent) => {
@@ -360,6 +426,9 @@ export const Transactions: React.FC = () => {
     const handleSaveTransaction = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!activeAssetForTx) return;
+        const qtyValue = Number.isFinite(txForm.qty) ? txForm.qty : 0;
+        const priceValue = Number.isFinite(txForm.price) ? txForm.price : 0;
+        const feesValue = Number.isFinite(txForm.fees) ? txForm.fees : 0;
 
         if (editingTxId) {
             // Update existing
@@ -367,10 +436,10 @@ export const Transactions: React.FC = () => {
                 date: new Date(txForm.date),
                 type: txForm.type,
                 instrumentTicker: activeAssetForTx,
-                quantity: Number(txForm.qty),
-                price: Number(txForm.price),
+                quantity: Number(qtyValue),
+                price: Number(priceValue),
                 currency: txForm.currency,
-                fees: Number(txForm.fees),
+                fees: Number(feesValue),
                 account: 'Default',
                 portfolioId: currentPortfolioId
             });
@@ -380,10 +449,10 @@ export const Transactions: React.FC = () => {
                 date: new Date(txForm.date),
                 type: txForm.type,
                 instrumentTicker: activeAssetForTx,
-                quantity: Number(txForm.qty),
-                price: Number(txForm.price),
+                quantity: Number(qtyValue),
+                price: Number(priceValue),
                 currency: txForm.currency,
-                fees: Number(txForm.fees),
+                fees: Number(feesValue),
                 account: 'Default',
                 portfolioId: currentPortfolioId
             });
@@ -394,9 +463,40 @@ export const Transactions: React.FC = () => {
 
     const handleSaveAsset = async (e: React.FormEvent) => {
         e.preventDefault();
-        const tickerUpper = assetForm.ticker.toUpperCase();
+        if (!canSaveAsset) {
+            setAssetInputNotice("Correggi gli errori prima di salvare.");
+            return;
+        }
+        const tickerUpper = resolvedTicker;
+        const isinValue = normalizedIsin;
+        let attachWarning = "";
+        let preferredListing = undefined as Instrument["preferredListing"];
+        let listings = undefined as Instrument["listings"];
 
-        // 1. Create Instrument
+        if (isinValue) {
+            try {
+                const listingsResult = await resolveListingsByIsin(isinValue, settings?.eodhdApiKey);
+                if (listingsResult.length > 0) {
+                    const plan = planAutoAttachListing({
+                        typedTicker: resolvedTicker,
+                        listings: listingsResult,
+                        preferredExchangesOrder: settings?.preferredExchangesOrder || ["SW", "US", "LSE", "XETRA", "MI", "PA"],
+                        baseCurrency: settings?.baseCurrency || Currency.CHF,
+                        confirmOverride: (message) => window.confirm(message)
+                    });
+                    preferredListing = plan.preferredListing;
+                    listings = plan.listings;
+                    if (plan.warning) attachWarning = plan.warning;
+                } else {
+                    attachWarning = "Nessun listing trovato per questo ISIN. Puoi configurarlo in Settings.";
+                }
+            } catch (err: any) {
+                attachWarning = err?.message || "Lookup listing non riuscito. Puoi configurarlo in Settings.";
+            }
+        } else {
+            attachWarning = "Suggerimento: aggiungi un ISIN per agganciare automaticamente il listing in Settings.";
+        }
+
         await db.instruments.add({
             ticker: tickerUpper,
             name: assetForm.name,
@@ -404,38 +504,74 @@ export const Transactions: React.FC = () => {
             assetClass: assetForm.assetClass,
             currency: assetForm.currency,
             targetAllocation: 0,
+            isin: isinValue || undefined,
+            preferredListing,
+            listings,
             portfolioId: currentPortfolioId
         });
 
-        // 2. Create Initial Transaction (if quantity provided)
-        if (assetForm.quantity > 0) {
+        if (preferredListing) {
+            await db.instrumentListings.put({
+                isin: isinValue || "",
+                exchangeCode: preferredListing.exchangeCode,
+                symbol: preferredListing.symbol,
+                currency: preferredListing.currency,
+                name: preferredListing.name,
+                portfolioId: currentPortfolioId
+            });
+            if (settings) {
+                const { config, changed } = buildPriceTickerConfigWithDefault(
+                    settings.priceTickerConfig,
+                    preferredListing.symbol,
+                    { provider: "EODHD", eodhdSymbol: preferredListing.symbol }
+                );
+                if (changed) {
+                    await db.settings.put({ ...settings, priceTickerConfig: config });
+                }
+            }
+        }
+
+        const qtyValue = Number.isFinite(assetForm.quantity) ? assetForm.quantity : 0;
+        const priceValue = Number.isFinite(assetForm.price) ? assetForm.price : 0;
+        const feesValue = Number.isFinite(assetForm.fees) ? assetForm.fees : 0;
+
+        if (qtyValue > 0) {
             await db.transactions.add({
                 date: new Date(assetForm.date),
                 type: TransactionType.Buy,
                 instrumentTicker: tickerUpper,
-                quantity: Number(assetForm.quantity),
-                price: Number(assetForm.price),
-                fees: Number(assetForm.fees),
+                quantity: Number(qtyValue),
+                price: Number(priceValue),
+                fees: Number(feesValue),
                 currency: assetForm.currency,
-                account: 'Default',
+                account: "Default",
                 portfolioId: currentPortfolioId
             });
         }
 
+        if (attachWarning) {
+            setAssetAttachNotice(attachWarning);
+        }
+
         setAssetForm({
-            ticker: '',
-            name: '',
+            ticker: "",
+            isin: "",
+            name: "",
             type: AssetType.Stock,
             assetClass: AssetClass.STOCK,
             quantity: 0,
             price: 0,
             fees: 0,
-            date: new Date().toISOString().split('T')[0],
+            date: new Date().toISOString().split("T")[0],
             currency: Currency.USD
         });
+        setIsinLookupStatus('idle');
+        setIsinLookupMessage('');
+        setIsinCandidates([]);
+        setIsinResolvedSymbol('');
+        setAssetInputNotice("");
         setAssetModalOpen(false);
     };
-
     const toggleGroup = (ticker: string) => {
         setExpandedTicker(expandedTicker === ticker ? null : ticker);
     };
@@ -455,6 +591,210 @@ export const Transactions: React.FC = () => {
             if (tickerInputRef.current && active === tickerInputRef.current) return;
             setTickerDropdownOpen(false);
         }, 0);
+        if (assetForm.type === AssetType.Crypto) {
+            const resolved = resolveEodhdSymbol(assetForm.ticker, AssetType.Crypto);
+            if (resolved && resolved !== assetForm.ticker) {
+                setAssetForm(prev => ({ ...prev, ticker: resolved }));
+            }
+        }
+    };
+
+    const handleTickerChange = (value: string) => {
+        const trimmed = normalizeTicker(value);
+        if (trimmed && isIsin(trimmed)) {
+            setAssetForm(prev => ({ ...prev, ticker: "", isin: trimmed }));
+            setAssetInputNotice("Sembra un ISIN: spostato nel campo ISIN.");
+            setTickerDropdownOpen(false);
+            return;
+        }
+        if (assetInputNotice) setAssetInputNotice("");
+        setAssetForm(prev => ({ ...prev, ticker: value.toUpperCase() }));
+    };
+
+    const handleIsinChange = (value: string) => {
+        const normalized = normalizeIsin(value);
+        setAssetForm(prev => ({ ...prev, isin: normalized }));
+        setIsinLookupStatus('idle');
+        setIsinLookupMessage('');
+        setIsinCandidates([]);
+        setIsinResolvedSymbol('');
+        if (assetInputNotice) setAssetInputNotice("");
+    };
+
+    const mapListingType = (value?: string): AssetType | null => {
+        const raw = (value || "").toLowerCase();
+        if (!raw) return null;
+        if (raw.includes("crypto")) return AssetType.Crypto;
+        if (raw.includes("etf") || raw.includes("fund")) return AssetType.ETF;
+        if (raw.includes("bond")) return AssetType.Bond;
+        if (raw.includes("commodity")) return AssetType.Commodity;
+        if (raw.includes("cash")) return AssetType.Cash;
+        if (raw.includes("stock") || raw.includes("equity")) return AssetType.Stock;
+        return null;
+    };
+
+    const mapAssetClassForType = (type: AssetType): AssetClass => {
+        switch (type) {
+            case AssetType.Crypto:
+                return AssetClass.CRYPTO;
+            case AssetType.Cash:
+                return AssetClass.CASH;
+            case AssetType.Bond:
+                return AssetClass.BOND;
+            case AssetType.ETF:
+                return AssetClass.ETF_STOCK;
+            case AssetType.Commodity:
+                return AssetClass.ETC;
+            case AssetType.Stock:
+            default:
+                return AssetClass.STOCK;
+        }
+    };
+
+    const applyIsinCandidate = (listing: InstrumentListing) => {
+        if (!listing?.symbol) return;
+        const symbol = listing.symbol;
+        const currentTicker = normalizeTicker(assetForm.ticker);
+        if (currentTicker && currentTicker !== normalizeTicker(symbol)) {
+            const confirm = window.confirm('Il ticker inserito (' + currentTicker + ') e diverso dal listing trovato (' + symbol + '). Vuoi usare ' + symbol + '?');
+            if (!confirm) return;
+        }
+        const inferredType = mapListingType(listing.type) || assetForm.type;
+        const nextAssetClass = mapAssetClassForType(inferredType);
+        setAssetForm(prev => ({
+            ...prev,
+            ticker: symbol,
+            isin: normalizedIsin,
+            name: prev.name?.trim() ? prev.name : (listing.name || prev.name),
+            currency: listing.currency || prev.currency,
+            type: inferredType,
+            assetClass: nextAssetClass
+        }));
+        setIsinResolvedSymbol(symbol);
+        setIsinLookupStatus('resolved');
+        setAssetInputNotice('Risolto da ISIN.');
+    };
+
+    const handleIsinSearch = async () => {
+        const currentIsin = normalizedIsin;
+        if (!currentIsin || !isIsin(currentIsin)) {
+            setIsinLookupStatus('error');
+            setIsinLookupMessage('Inserisci un ISIN valido.');
+            setIsinCandidates([]);
+            setIsinResolvedSymbol('');
+            return;
+        }
+        setIsinLookupStatus('loading');
+        setIsinLookupMessage('');
+        try {
+            const candidates = await resolveListingsByIsin(currentIsin, settings?.eodhdApiKey);
+            if (candidates.length === 0) {
+                setIsinLookupStatus('none');
+                setIsinLookupMessage('Nessun listing trovato per questo ISIN.');
+                setIsinCandidates([]);
+                setIsinResolvedSymbol('');
+                return;
+            }
+            setIsinCandidates(candidates);
+            setIsinResolvedSymbol(candidates[0]?.symbol || '');
+            if (candidates.length === 1) {
+                applyIsinCandidate(candidates[0]);
+                return;
+            }
+            setIsinLookupStatus('multiple');
+        } catch (e: any) {
+            setIsinLookupStatus('error');
+            setIsinLookupMessage(e?.message || 'Lookup ISIN fallito');
+            setIsinCandidates([]);
+            setIsinResolvedSymbol('');
+        }
+    };
+
+    useEffect(() => {
+        if (!isAssetModalOpen) {
+            setAssetMarketHint({ status: 'idle' });
+            return;
+        }
+        if (!resolvedTicker || !assetForm.date || tickerLooksIsin || missingExchange) {
+            setAssetMarketHint({ status: 'idle' });
+            return;
+        }
+        const requestId = ++assetMarketHintReq.current;
+        const controller = new AbortController();
+        setAssetMarketHint({ status: 'loading' });
+        const timeoutId = setTimeout(async () => {
+            try {
+                const result = await getMarketCloseAroundDate(currentPortfolioId, resolvedTicker, assetForm.date, 10, { signal: controller.signal, forceEodhd: forceAssetEodhd });
+                if (requestId !== assetMarketHintReq.current || controller.signal.aborted) return;
+                setAssetMarketHint({ status: result.status, data: result, message: result.message });
+            } catch (err: any) {
+                if (requestId !== assetMarketHintReq.current || controller.signal.aborted) return;
+                setAssetMarketHint({ status: 'error', message: err?.message || undefined });
+            }
+        }, 350);
+        return () => {
+            controller.abort();
+            clearTimeout(timeoutId);
+        };
+    }, [isAssetModalOpen, resolvedTicker, assetForm.date, tickerLooksIsin, missingExchange, currentPortfolioId, forceAssetEodhd]);
+
+    useEffect(() => {
+        if (!isTxModalOpen || !activeAssetForTx || activeAssetForTx === 'CASH' || !txForm.date) {
+            setTxMarketHint({ status: 'idle' });
+            return;
+        }
+        const requestId = ++txMarketHintReq.current;
+        const controller = new AbortController();
+        setTxMarketHint({ status: 'loading' });
+        const timeoutId = setTimeout(async () => {
+            try {
+                const result = await getMarketCloseAroundDate(currentPortfolioId, activeAssetForTx, txForm.date, 10, { signal: controller.signal, forceEodhd: forceTxEodhd });
+                if (requestId !== txMarketHintReq.current || controller.signal.aborted) return;
+                setTxMarketHint({ status: result.status, data: result, message: result.message });
+            } catch (err: any) {
+                if (requestId !== txMarketHintReq.current || controller.signal.aborted) return;
+                setTxMarketHint({ status: 'error', message: err?.message || undefined });
+            }
+        }, 350);
+        return () => {
+            controller.abort();
+            clearTimeout(timeoutId);
+        };
+    }, [isTxModalOpen, activeAssetForTx, txForm.date, currentPortfolioId, forceTxEodhd]);
+
+    const getCoverageBadge = (priceTicker: string) => {
+        const row = coverageByTicker.get(priceTicker);
+        const config = resolvePriceSyncConfig(priceTicker, settings);
+        const provider = config.provider;
+        const isNeedsMapping = Boolean(config.needsMapping);
+        const isExcluded = !isNeedsMapping && (config.excluded || provider === "MANUAL");
+        const statusLabel = isNeedsMapping
+            ? "MAPPING"
+            : isExcluded
+                ? (provider === "MANUAL" ? "MANUAL" : "ESCLUSO")
+                : (row?.status || "INCOMPLETO");
+        const statusClass = isNeedsMapping
+            ? "bg-red-100 text-red-700"
+            : isExcluded
+                ? "bg-slate-100 text-slate-600"
+                : statusLabel === "OK"
+                    ? "bg-green-100 text-green-700"
+                    : statusLabel === "PARZIALE"
+                        ? "bg-amber-100 text-amber-700"
+                        : "bg-red-100 text-red-700";
+        return { statusLabel, statusClass };
+    };
+
+    const handleOpenListingFix = (instrument?: Instrument, fallbackTicker?: string) => {
+        const params = new URLSearchParams();
+        params.set("focus", "listing");
+        if (instrument?.ticker || fallbackTicker) {
+            params.set("ticker", instrument?.ticker || fallbackTicker || "");
+        }
+        if (instrument?.isin) {
+            params.set("isin", instrument.isin);
+        }
+        navigate(`/settings?${params.toString()}`);
     };
 
     return (
@@ -466,7 +806,7 @@ export const Transactions: React.FC = () => {
                     Registro Transazioni
                 </h2>
                 <button
-                    onClick={() => setAssetModalOpen(true)}
+                    onClick={() => { setAssetAttachNotice(''); setAssetInputNotice(''); setIsinLookupStatus('idle'); setIsinLookupMessage(''); setIsinCandidates([]); setIsinResolvedSymbol(''); setAssetModalOpen(true); }}
                     className="text-slate-900 px-5 py-2.5 rounded-xl text-sm font-bold hover:bg-blue-600 transition-all shadow-lg hover:shadow-primary/30 flex items-center gap-2"
                     style={{ backgroundColor: '#0052a3' }}
                 >
@@ -474,6 +814,11 @@ export const Transactions: React.FC = () => {
                     Nuovo Asset
                 </button>
             </div>
+            {assetAttachNotice && (
+                <div className="bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold px-4 py-2 rounded-xl">
+                    {assetAttachNotice}
+                </div>
+            )}
 
             {/* --- MODAL: ADD ASSET & INITIAL BUY --- */}
             {isAssetModalOpen && (
@@ -488,12 +833,12 @@ export const Transactions: React.FC = () => {
                         <form onSubmit={handleSaveAsset} className="p-6 space-y-5">
                             {/* Ticker Section */}
                             <div className="relative">
-                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Ticker / ISIN</label>
+                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Ticker (symbol EODHD)</label>
                                 <input
                                     ref={tickerInputRef}
-                                    placeholder="Es. AAPL" required
+                                    placeholder="Es. AAPL.US o BTC-USD.CC" required
                                     value={assetForm.ticker}
-                                    onChange={e => setAssetForm({ ...assetForm, ticker: e.target.value })}
+                                    onChange={e => handleTickerChange(e.target.value)}
                                     onFocus={() => setTickerDropdownOpen(tickerSearchResults.length > 0 && !suppressSuggestions)}
                                     onBlur={handleTickerBlur}
                                     onKeyDown={e => {
@@ -504,6 +849,9 @@ export const Transactions: React.FC = () => {
                                     className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none uppercase font-mono text-sm text-slate-900"
                                     autoComplete="off"
                                 />
+                                <div className="text-[11px] text-slate-500 mt-1">
+                                    Formato richiesto: SYMBOL.EXCHANGE (es. AAPL.US, VWRL.AS). Cripto: BTC-USD.CC.
+                                </div>
                                 {/* Search Preview Dropdown */}
                                 {isTickerDropdownOpen && tickerSearchResults.length > 0 && (
                                     <div
@@ -523,8 +871,85 @@ export const Transactions: React.FC = () => {
                                         ))}
                                     </div>
                                 )}
+                            {assetInputNotice && (
+                                <div className="text-[11px] text-amber-600 mt-1">{assetInputNotice}</div>
+                            )}
+                            {tickerLooksIsin && (
+                                <div className="text-[11px] text-red-600 mt-1">Sembra un ISIN: incollalo nel campo ISIN.</div>
+                            )}
+                            {missingExchange && (
+                                <div className="text-[11px] text-red-600 mt-1">Manca l'exchange (es. .US, .SW, .AS).</div>
+                            )}
+                            {assetForm.type === AssetType.Crypto && resolvedTicker && resolvedTicker !== normalizedTicker && (
+                                <div className="text-[11px] text-emerald-700 mt-1">Auto: {resolvedTicker}</div>
+                            )}
                             </div>
 
+                            <div>
+                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">ISIN (opzionale)</label>
+                                <input
+                                    placeholder="Es. IE00B4L5Y983"
+                                    value={assetForm.isin}
+                                    onChange={e => handleIsinChange(e.target.value)}
+                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none uppercase font-mono text-sm text-slate-900"
+                                    autoComplete="off"
+                                />
+                                <div className="text-[11px] text-slate-500 mt-1">
+                                    Aiuta ad agganciare automaticamente listing e prezzi da EODHD.
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={handleIsinSearch}
+                                    disabled={!normalizedIsin || isinInvalid || isinLookupStatus === 'loading'}
+                                    className="mt-2 text-[11px] font-bold text-[#0052a3] hover:text-blue-600 disabled:opacity-50"
+                                >
+                                    {isinLookupStatus === 'loading' ? 'Cerca su EODHD...' : 'Cerca su EODHD'}
+                                </button>
+                                {isinInvalid && (
+                                    <div className="text-[11px] text-red-600 mt-1">ISIN non valido. Usa formato es: IE00B4L5Y983.</div>
+                                )}
+                                {isinLookupStatus === 'loading' && (
+                                    <div className="text-[11px] text-slate-500 mt-1">Risoluzione ISIN in corso...</div>
+                                )}
+                                {isinLookupStatus === 'resolved' && isinResolvedSymbol && (
+                                    <div className="text-[11px] text-emerald-700 mt-1">Risolto da ISIN: {isinResolvedSymbol}</div>
+                                )}
+                                {isinLookupStatus === 'multiple' && isinCandidates.length > 0 && (
+                                    <div className="mt-2 space-y-2">
+                                        <div className="text-[11px] text-slate-500">Piu listing trovati: seleziona quello corretto.</div>
+                                        <select
+                                            className="w-full border border-borderSoft rounded-lg px-2 py-1 text-xs text-slate-800 bg-white shadow-inner"
+                                            value={isinResolvedSymbol}
+                                            onChange={e => setIsinResolvedSymbol(e.target.value)}
+                                        >
+                                            {isinCandidates.map(candidate => (
+                                                <option key={candidate.symbol} value={candidate.symbol}>
+                                                    {candidate.symbol} {candidate.exchangeCode ? '(' + candidate.exchangeCode + ')' : ''} {candidate.name || ''}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <button
+                                            type="button"
+                                            className="text-[11px] font-bold text-[#0052a3] hover:text-blue-600"
+                                            onClick={() => { const selected = isinCandidates.find(c => c.symbol === isinResolvedSymbol); if (selected) applyIsinCandidate(selected); }}
+                                        >
+                                            Usa questo symbol
+                                        </button>
+                                    </div>
+                                )}
+                                {(isinLookupStatus === 'none' || isinLookupStatus === 'error') && isinLookupMessage && (
+                                    <div className="text-[11px] text-amber-700 mt-1">
+                                        {isinLookupMessage}{' '}
+                                        <button
+                                            type="button"
+                                            className="underline text-[#0052a3] font-bold"
+                                            onClick={() => navigate('/settings?focus=listing&isin=' + normalizedIsin)}
+                                        >
+                                            Apri Listings & FX
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
                             <div>
                                 <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Nome Strumento</label>
                                 <input
@@ -581,8 +1006,8 @@ export const Transactions: React.FC = () => {
                                     <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Quantità</label>
                                     <input
                                         type="number" placeholder="0" step="0.0001" required
-                                        value={assetForm.quantity}
-                                        onChange={e => setAssetForm({ ...assetForm, quantity: parseFloat(e.target.value) })}
+                                        value={numberValue(assetForm.quantity)}
+                                        onChange={e => setAssetForm({ ...assetForm, quantity: parseNumberInput(e.target.value) })}
                                         className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
                                     />
                                 </div>
@@ -593,17 +1018,55 @@ export const Transactions: React.FC = () => {
                                     <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Prezzo Acquisto</label>
                                     <input
                                         type="number" placeholder="0.00" step="0.01" required
-                                        value={assetForm.price}
-                                        onChange={e => setAssetForm({ ...assetForm, price: parseFloat(e.target.value) })}
+                                        value={numberValue(assetForm.price)}
+                                        onChange={e => setAssetForm({ ...assetForm, price: parseNumberInput(e.target.value) })}
                                         className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
                                     />
+                                    {assetMarketHint.status === 'loading' && (
+                                        <div className="text-[11px] text-slate-500 mt-1">Carico prezzo di mercato...</div>
+                                    )}
+                                    {(assetMarketHint.status === 'exact' || assetMarketHint.status === 'fallback') && assetMarketHint.data && (
+                                        <div className="text-[11px] text-slate-600 mt-1">
+                                            {assetMarketHint.status === 'exact' ? 'Prezzo di mercato (close) ' : 'Nessun close per la data selezionata. Ultimo close disponibile '}
+                                            ({assetMarketHint.data.dateUsed}): {assetMarketHint.data.close} {assetMarketHint.data.currency || ''} 
+                                            <span className="text-slate-400">[fonte: {assetMarketHint.data.source === 'cache' ? 'cache locale' : 'EODHD'}]</span> 
+                                            <button
+                                                type="button"
+                                                className="underline font-bold text-[#0052a3]"
+                                                onClick={() => setAssetForm(prev => ({ ...prev, price: assetMarketHint.data?.close ?? prev.price }))}
+                                            >
+                                                Usa questo prezzo
+                                            </button>
+                                        </div>
+                                    )}
+                                    {assetMarketHint.status === 'not_found' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">Simbolo non coperto da EODHD.</div>
+                                    )}
+                                    {assetMarketHint.status === 'no_data' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">Nessun dato disponibile nel range.</div>
+                                    )}
+                                    {assetMarketHint.status === 'invalid_payload' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">Risposta non valida dal provider EODHD.</div>
+                                    )}
+                                    {assetMarketHint.status === 'aborted' && null}
+                                    {assetMarketHint.status === 'error' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">{assetMarketHint.message === 'Missing EODHD key' ? 'Chiave EODHD mancante: aggiungila nelle impostazioni.' : 'Prezzo di mercato non disponibile al momento.'}</div>
+                                    )}
+                                    <label className="mt-2 inline-flex items-center gap-2 text-[11px] text-slate-500">
+                                        <input
+                                            type="checkbox"
+                                            checked={forceAssetEodhd}
+                                            onChange={e => setForceAssetEodhd(e.target.checked)}
+                                        />
+                                        Forza EODHD (ignora cache)
+                                    </label>
                                 </div>
                                 <div>
                                     <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Commissioni</label>
                                     <input
                                         type="number" placeholder="0.00" step="0.01"
-                                        value={assetForm.fees}
-                                        onChange={e => setAssetForm({ ...assetForm, fees: parseFloat(e.target.value) })}
+                                        value={numberValue(assetForm.fees)}
+                                        onChange={e => setAssetForm({ ...assetForm, fees: parseNumberInput(e.target.value) })}
                                         className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
                                     />
                                 </div>
@@ -665,10 +1128,48 @@ export const Transactions: React.FC = () => {
                                         type="number" placeholder="0.00"
                                         className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
                                         step="0.01"
-                                        value={txForm.price}
-                                        onChange={e => setTxForm({ ...txForm, price: parseFloat(e.target.value) })}
+                                        value={numberValue(txForm.price)}
+                                        onChange={e => setTxForm({ ...txForm, price: parseNumberInput(e.target.value) })}
                                         required
                                     />
+                                    {txMarketHint.status === 'loading' && (
+                                        <div className="text-[11px] text-slate-500 mt-1">Carico prezzo di mercato...</div>
+                                    )}
+                                    {(txMarketHint.status === 'exact' || txMarketHint.status === 'fallback') && txMarketHint.data && (
+                                        <div className="text-[11px] text-slate-600 mt-1">
+                                            {txMarketHint.status === 'exact' ? 'Prezzo di mercato (close) ' : 'Nessun close per la data selezionata. Ultimo close disponibile '}
+                                            ({txMarketHint.data.dateUsed}): {txMarketHint.data.close} {txMarketHint.data.currency || ''} 
+                                            <span className="text-slate-400">[fonte: {txMarketHint.data.source === 'cache' ? 'cache locale' : 'EODHD'}]</span> 
+                                            <button
+                                                type="button"
+                                                className="underline font-bold text-[#0052a3]"
+                                                onClick={() => setTxForm(prev => ({ ...prev, price: txMarketHint.data?.close ?? prev.price }))}
+                                            >
+                                                Usa questo prezzo
+                                            </button>
+                                        </div>
+                                    )}
+                                    {txMarketHint.status === 'not_found' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">Simbolo non coperto da EODHD.</div>
+                                    )}
+                                    {txMarketHint.status === 'no_data' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">Nessun dato disponibile nel range.</div>
+                                    )}
+                                    {txMarketHint.status === 'invalid_payload' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">Risposta non valida dal provider EODHD.</div>
+                                    )}
+                                    {txMarketHint.status === 'aborted' && null}
+                                    {txMarketHint.status === 'error' && (
+                                        <div className="text-[11px] text-amber-700 mt-1">{txMarketHint.message === 'Missing EODHD key' ? 'Chiave EODHD mancante: aggiungila nelle impostazioni.' : 'Prezzo di mercato non disponibile al momento.'}</div>
+                                    )}
+                                    <label className="mt-2 inline-flex items-center gap-2 text-[11px] text-slate-500">
+                                        <input
+                                            type="checkbox"
+                                            checked={forceTxEodhd}
+                                            onChange={e => setForceTxEodhd(e.target.checked)}
+                                        />
+                                        Forza EODHD (ignora cache)
+                                    </label>
                                 </div>
                                 <div>
                                     <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Quantità</label>
@@ -676,8 +1177,8 @@ export const Transactions: React.FC = () => {
                                         type="number" placeholder="0"
                                         className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
                                         step="0.0001"
-                                        value={txForm.qty}
-                                        onChange={e => setTxForm({ ...txForm, qty: parseFloat(e.target.value) })}
+                                        value={numberValue(txForm.qty)}
+                                        onChange={e => setTxForm({ ...txForm, qty: parseNumberInput(e.target.value) })}
                                         required
                                     />
                                 </div>
@@ -690,8 +1191,8 @@ export const Transactions: React.FC = () => {
                                         type="number" placeholder="0.00"
                                         className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
                                         step="0.01"
-                                        value={txForm.fees}
-                                        onChange={e => setTxForm({ ...txForm, fees: parseFloat(e.target.value) })}
+                                        value={numberValue(txForm.fees)}
+                                        onChange={e => setTxForm({ ...txForm, fees: parseNumberInput(e.target.value) })}
                                     />
                                 </div>
                                 <div>
@@ -825,6 +1326,8 @@ export const Transactions: React.FC = () => {
                     const instrumentName = instrument?.name || group.ticker;
                     const instrumentIsin = instrument?.isin;
                     const displayCurrency = instrument?.currency || group.currency;
+                    const priceTicker = instrument ? getCanonicalTicker(instrument) : group.ticker;
+                    const coverageBadge = group.ticker !== "CASH" && priceTicker ? getCoverageBadge(priceTicker) : null;
                     return (
                     <div key={group.ticker} className="bg-white rounded-xl shadow-lg border border-borderSoft overflow-hidden transition-all hover:border-primary/30">
 
@@ -844,16 +1347,35 @@ export const Transactions: React.FC = () => {
                                     }
                                 </div>
                                 <div>
-                                    <h3 className="font-bold text-slate-900 text-sm">{instrumentName}</h3>
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                        <h3 className="font-bold text-slate-900 text-sm">{instrumentName}</h3>
+                                        {coverageBadge && (
+                                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-lg ${coverageBadge.statusClass}`}>
+                                                {coverageBadge.statusLabel}
+                                            </span>
+                                        )}
+                                    </div>
                                     <p className="text-xs text-slate-500">
-                                        {group.ticker}{instrumentIsin ? ` • ISIN ${instrumentIsin}` : ''}
+                                        {group.ticker}{instrumentIsin ? ` • ISIN ${instrumentIsin}` : ""}
                                     </p>
                                     <p className="text-xs text-slate-500">
-                                        {assetLabel ? `${assetLabel} - ` : ''}Media: {group.avgPrice.toFixed(2)} {displayCurrency}
+                                        {assetLabel ? `${assetLabel} - ` : ""}Media: {group.avgPrice.toFixed(2)} {displayCurrency}
                                     </p>
                                     <p className="text-xs text-slate-500">
                                         Investito: {group.invested.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })} {displayCurrency} · Quote: {group.quantity.toLocaleString()}
                                     </p>
+                                    {group.ticker !== "CASH" && (
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleOpenListingFix(instrument, group.ticker);
+                                            }}
+                                            className="text-[11px] font-bold text-[#0052a3] hover:text-blue-500 mt-1"
+                                        >
+                                            Fix listing/prezzi
+                                        </button>
+                                    )}
                                 </div>
                             </div>
 
@@ -962,6 +1484,9 @@ export const Transactions: React.FC = () => {
         </div>
     );
 };
+
+
+
 
 
 
