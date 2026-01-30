@@ -15,9 +15,10 @@ View your app in AI Studio: https://ai.studio/apps/drive/1K_4zP_gCiwEpqIRATO8uBr
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. Set `EODHD_API_KEY` in [.env.local](.env.local) for the server-side proxy.
 3. Run the app:
-   `npm run dev`
+   - UI only: `npm run dev` (http://localhost:5173)
+   - UI + /api/*: `npm run dev:vercel` (http://localhost:3000)
 
 ## Production (Vercel)
 
@@ -25,7 +26,7 @@ This app uses server-side proxies for price and sheet data to avoid CORS and kee
 
 - Set `EODHD_API_KEY` in Vercel Environment Variables (server-side only, not `VITE_*`).
 - The frontend calls `/api/eodhd-proxy` and `/api/sheets` (do not call EODHD or Google Sheets directly).
-- For local testing with proxies, use `npm run vercel:dev` (safe by default) and set `EODHD_API_KEY` in `.env.local`.
+- For local testing with proxies, use `npm run dev:vercel` and set `EODHD_API_KEY` in `.env.local`.
 
 ## Troubleshooting vercel dev 502 (Windows)
 

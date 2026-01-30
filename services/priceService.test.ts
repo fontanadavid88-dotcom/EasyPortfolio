@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { buildCoverageRows } from './priceService';
-import { AssetType, Currency, Instrument } from '../types';
+import { buildCoverageRows, resolvePriceSyncConfig, mapEodhdHistoryRows } from './priceService';
+import { AppSettings, AssetType, Currency, Instrument } from '../types';
 
 describe('buildCoverageRows', () => {
   it('maps coverage rows to instruments and fills defaults', () => {
@@ -49,5 +49,35 @@ describe('buildCoverageRows', () => {
     expect(rows[2].isin).toBeNull();
     expect(rows[2].from).toBe('N/D');
     expect(rows[2].to).toBe('N/D');
+  });
+});
+
+describe('resolvePriceSyncConfig', () => {
+  it('keeps manual provider override', () => {
+    const settings: AppSettings = {
+      baseCurrency: Currency.CHF,
+      eodhdApiKey: '',
+      googleSheetUrl: '',
+      priceTickerConfig: {
+        'AAPL.US': { provider: 'MANUAL', eodhdSymbol: 'AAPL.US' }
+      }
+    };
+
+    const cfg = resolvePriceSyncConfig('AAPL.US', settings);
+    expect(cfg.provider).toBe('MANUAL');
+    expect(cfg.excluded).toBe(false);
+    expect(cfg.eodhdSymbol).toBe('AAPL.US');
+  });
+});
+
+describe('mapEodhdHistoryRows', () => {
+  it('parses numeric close from string', () => {
+    const rows = mapEodhdHistoryRows('AAPL.US', [
+      { date: '2024-01-02', close: '131.52' }
+    ]);
+
+    expect(rows.length).toBe(1);
+    expect(rows[0].close).toBeCloseTo(131.52);
+    expect(typeof rows[0].close).toBe('number');
   });
 });

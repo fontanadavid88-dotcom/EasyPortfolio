@@ -13,20 +13,12 @@ const readHeader = (req: any, name: string): string => {
   return lower ? String(lower) : '';
 };
 
-const buildPayload = (hasEodhdKey: boolean) => ({
-  ok: true,
-  time: new Date().toISOString(),
-  node: proc?.version ?? '',
-  execArgv: proc?.execArgv ?? [],
-  nodeOptions: proc?.env?.NODE_OPTIONS ?? '',
-  hasEodhdKey
-});
-
 export default function handler(req?: unknown, res?: any): Response | void {
-  const envKey = (proc?.env?.EODHD_API_KEY as string | undefined) || '';
+  const envNames = ['EODHD_API_KEY', 'VITE_EODHD_API_KEY'] as const;
+  const envKey = envNames.map(name => proc?.env?.[name] as string | undefined).find(Boolean) || '';
   const clientKey = readHeader(req, 'x-eodhd-key') || readHeader(req, 'x-eodhd-api-key');
   const hasEodhdKey = Boolean((envKey || clientKey).trim());
-  const body = JSON.stringify(buildPayload(hasEodhdKey));
+  const body = JSON.stringify({ ok: true, hasEodhdKey });
 
   if (res && typeof res.status === 'function' && typeof res.send === 'function') {
     res.status(200).setHeader('content-type', 'application/json; charset=utf-8');

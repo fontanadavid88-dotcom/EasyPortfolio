@@ -61,6 +61,16 @@ export interface InstrumentListing {
   type?: string;
 }
 
+export type PriceProviderType = 'EODHD' | 'SHEETS' | 'MANUAL';
+
+export interface PriceTickerConfig {
+  exclude?: boolean;
+  needsMapping?: boolean;
+  provider?: PriceProviderType;
+  eodhdSymbol?: string;
+  sheetSymbol?: string;
+}
+
 export interface Transaction {
   id?: number;
   portfolioId?: string;
@@ -107,6 +117,7 @@ export interface AppSettings {
   minHistoryDate?: string;
   priceBackfillScope?: 'current' | 'all';
   preferredExchangesOrder?: string[]; // es. ['SW','US','LSE','XETRA','MI','PA']
+  priceTickerConfig?: Record<string, PriceTickerConfig>;
 }
 
 // --- NEW ANALYTICS TYPES ---
