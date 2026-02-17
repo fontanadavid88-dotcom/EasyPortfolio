@@ -1,16 +1,21 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { db, getCurrentPortfolioId, setCurrentPortfolioId } from '../db';
-import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary, resolvePriceSyncConfig, testSheetLatestPrice, SheetTestResult, toNum, fetchJsonWithDiagnostics, getResolvedSymbol } from '../services/priceService';
+import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary, resolvePriceSyncConfig, testSheetLatestPrice, SheetTestResult, getResolvedSymbol, getEodhdQuotaInfo, EodhdQuotaInfo, getEodhdDailyBudgetStatus } from '../services/priceService';
+import { AutoGapScope, getAutoGapFillEnabled, setAutoGapFillEnabled, getAutoGapFillScope, setAutoGapFillScope, getAutoSyncMeta, setAutoSyncMeta } from '../services/autoSyncService';
+import { fetchJsonWithDiagnostics, toNum, FetchJsonDiagnostics } from '../services/diagnostics';
 import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
 import { importFxCsv, FxRateRow } from '../services/fxService';
+import { fetchAppsScriptPing, fetchAssetsMap, fetchMacro, applyAssetsMapToSettings, applyMacroRowsToDexie, syncFxRates, AppsScriptFxRow } from '../services/appsScriptService';
 import { isIsin, normalizeTicker, resolveEodhdSymbol, hasExchangeSuffix } from '../services/symbolUtils';
-import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType } from '../types';
+import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType, Transaction } from '../types';
+import { createUuid } from '../services/idUtils';
 import { InfoPopover } from '../components/InfoPopover';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { format, subDays } from 'date-fns';
 import { useLocation } from 'react-router-dom';
 import { resetSymbolMigrationFlag, runSymbolMigrationOnce } from '../services/symbolMigration';
+import clsx from 'clsx';
 
 type InstrumentListingRow = {
   id?: number;
@@ -28,6 +33,8 @@ export const Settings: React.FC = () => {
   const [config, setConfig] = useState<AppSettings>({
     eodhdApiKey: '',
     googleSheetUrl: '',
+    appsScriptUrl: '',
+    appsScriptApiKey: '',
     baseCurrency: Currency.CHF,
     minHistoryDate: '2020-01-01',
     priceBackfillScope: 'current',
@@ -51,7 +58,8 @@ export const Settings: React.FC = () => {
   const [saveNotice, setSaveNotice] = useState('');
   const [eodhdTests, setEodhdTests] = useState<Record<string, { status: string; symbol?: string; message?: string; httpStatus?: number; sample?: string; contentType?: string; rawPreview?: string; parseError?: string; url?: string }>>({});
   const [eodhdSymbolErrors, setEodhdSymbolErrors] = useState<Record<string, string>>({});
-  const [bulkEodhdTesting, setBulkEodhdTesting] = useState(false);
+  const [isTestingAll, setIsTestingAll] = useState(false);
+  const [testAllProgress, setTestAllProgress] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
   const [sheetTests, setSheetTests] = useState<Record<string, SheetTestResult & { symbol?: string }>>({});
   const [eodhdTesting, setEodhdTesting] = useState<Record<string, boolean>>({});
   const [sheetTesting, setSheetTesting] = useState<Record<string, boolean>>({});
@@ -64,7 +72,7 @@ export const Settings: React.FC = () => {
   const [portfolios, setPortfolios] = useState<{ id?: number; portfolioId: string; name: string }[]>([]);
   const [newPortfolioName, setNewPortfolioName] = useState('');
   const [instruments, setInstruments] = useState<Instrument[]>([]);
-  const [selectedInstrumentId, setSelectedInstrumentId] = useState<number | undefined>(undefined);
+  const [selectedInstrumentId, setSelectedInstrumentId] = useState<string | undefined>(undefined);
   const [isinInput, setIsinInput] = useState('');
   const [recommendedListings, setRecommendedListings] = useState<InstrumentListing[]>([]);
   const [otherListings, setOtherListings] = useState<InstrumentListing[]>([]);
@@ -80,14 +88,42 @@ export const Settings: React.FC = () => {
   const [regionAllocation, setRegionAllocation] = useState<Partial<Record<RegionKey, number>>>({});
   const [proxyHealth, setProxyHealth] = useState<{ ok: boolean; hasEodhdKey: boolean; error?: string } | null>(null);
   const [proxyHealthLoading, setProxyHealthLoading] = useState(false);
+  const [quotaLoading, setQuotaLoading] = useState(false);
+  const [quotaInfo, setQuotaInfo] = useState<EodhdQuotaInfo | null>(null);
+  const [quotaError, setQuotaError] = useState('');
+  const [quotaDiag, setQuotaDiag] = useState<FetchJsonDiagnostics | null>(null);
+  const [quotaUpdatedAt, setQuotaUpdatedAt] = useState<string>('');
+  const [appsScriptLoading, setAppsScriptLoading] = useState<{ ping?: boolean; assets?: boolean; macro?: boolean; fx?: boolean }>({});
+  const [appsScriptTests, setAppsScriptTests] = useState<Record<string, { status: 'ok' | 'err' | 'disabled'; message?: string; count?: number; sample?: string; diag?: FetchJsonDiagnostics }>>({});
+  const [fxSyncNotice, setFxSyncNotice] = useState<{ status: 'ok' | 'warn' | 'err'; message: string } | null>(null);
+  const [autoGapEnabled, setAutoGapEnabled] = useState<boolean>(() => getAutoGapFillEnabled(currentPortfolioId));
+  const [autoGapScope, setAutoGapScopeState] = useState<AutoGapScope>(() => getAutoGapFillScope());
+  const [autoGapRunning, setAutoGapRunning] = useState(false);
+  const [autoGapStatus, setAutoGapStatus] = useState('');
+  const [autoSyncMeta, setAutoSyncMetaState] = useState(() => getAutoSyncMeta(currentPortfolioId));
+  const [budgetStatus, setBudgetStatus] = useState(() => getEodhdDailyBudgetStatus());
   const instrumentListings = useLiveQuery(
     () => db.instrumentListings.where('portfolioId').equals(currentPortfolioId).toArray(),
     [currentPortfolioId],
     []
   ) as InstrumentListingRow[];
   const fxRates = useLiveQuery(() => db.fxRates.toArray(), [], []) as FxRateRowWithId[];
+  const missingInstrumentTransactions = useLiveQuery(
+    () => db.transactions
+      .where('portfolioId')
+      .equals(currentPortfolioId)
+      .filter(tx => !tx.instrumentId)
+      .toArray(),
+    [currentPortfolioId],
+    []
+  ) as Transaction[];
+  const [txRepairSelection, setTxRepairSelection] = useState<Record<number, string>>({});
 
   useEffect(() => {
+    setAutoGapEnabled(getAutoGapFillEnabled(currentPortfolioId));
+    setAutoSyncMetaState(getAutoSyncMeta(currentPortfolioId));
+    setBudgetStatus(getEodhdDailyBudgetStatus());
+    setAutoGapScopeState(getAutoGapFillScope());
     db.settings.where('portfolioId').equals(currentPortfolioId).first().then(s => {
       if (s) {
         setConfig(prev => ({
@@ -105,10 +141,27 @@ export const Settings: React.FC = () => {
     db.portfolios.toArray().then(setPortfolios);
     db.instruments.where('portfolioId').equals(currentPortfolioId).toArray().then(res => {
       setInstruments(res as Instrument[]);
-      if (res.length > 0) setSelectedInstrumentId(res[0].id);
+      if (res.length > 0) setSelectedInstrumentId(String(res[0].id));
       if (res.length > 0 && res[0].regionAllocation) setRegionAllocation(res[0].regionAllocation);
     });
   }, [currentPortfolioId]);
+
+  const instrumentByKey = useMemo(() => {
+    const map = new Map<string, Instrument>();
+    instruments.forEach(inst => {
+      if (inst.symbol) map.set(inst.symbol, inst);
+      if (inst.ticker) map.set(inst.ticker, inst);
+    });
+    return map;
+  }, [instruments]);
+  const getInstrumentByIdString = (id?: string) => {
+    if (!id) return undefined;
+    return instruments.find(inst => String(inst.id) === id);
+  };
+
+  const missingTxRows = useMemo(() => {
+    return (missingInstrumentTransactions || []).filter(tx => !tx.instrumentId);
+  }, [missingInstrumentTransactions]);
   useEffect(() => {
     const params = new URLSearchParams(location.search || "");
     if (params.get("focus") !== "listing") return;
@@ -120,11 +173,12 @@ export const Settings: React.FC = () => {
     const instrument = instruments.find(i => {
       if (isinParam && i.isin === isinParam) return true;
       if (!tickerParam) return false;
-      return i.ticker === tickerParam
+      return i.symbol === tickerParam
+        || i.ticker === tickerParam
         || i.preferredListing?.symbol === tickerParam
         || i.listings?.some(l => l.symbol === tickerParam);
     });
-    if (instrument?.id) setSelectedInstrumentId(instrument.id);
+    if (instrument?.id) setSelectedInstrumentId(String(instrument.id));
     const nextIsin = instrument?.isin || (isinParam ? isinParam : "");
     if (nextIsin) setIsinInput(nextIsin);
     listingsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -160,6 +214,98 @@ export const Settings: React.FC = () => {
     }, 300);
     return () => clearTimeout(timeoutId);
   }, [config.eodhdApiKey]);
+
+  const handleQuotaCheck = async () => {
+    if (quotaLoading) return;
+    setQuotaLoading(true);
+    setQuotaError('');
+    try {
+      const result = await getEodhdQuotaInfo(config);
+      setQuotaDiag(result.diag);
+      if (result.ok) {
+        setQuotaInfo(result.info);
+        setQuotaError('');
+      } else {
+        setQuotaInfo(null);
+        setQuotaError(result.error);
+      }
+      setQuotaUpdatedAt(new Date().toISOString());
+    } catch (e: any) {
+      setQuotaInfo(null);
+      setQuotaError(e?.message || 'Errore quota EODHD');
+    } finally {
+      setQuotaLoading(false);
+    }
+  };
+
+  const setAppsScriptTestResult = (kind: string, result: { status: 'ok' | 'err' | 'disabled'; message?: string; count?: number; sample?: string; diag?: FetchJsonDiagnostics }) => {
+    setAppsScriptTests(prev => ({ ...prev, [kind]: result }));
+  };
+
+  const handleAppsScriptPing = async () => {
+    setAppsScriptLoading(prev => ({ ...prev, ping: true }));
+    try {
+      const result = await fetchAppsScriptPing(config);
+      if (!result.ok) {
+        setAppsScriptTestResult('ping', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
+        return;
+      }
+      setAppsScriptTestResult('ping', { status: 'ok', message: 'OK', diag: result.diag.diag });
+    } finally {
+      setAppsScriptLoading(prev => ({ ...prev, ping: false }));
+    }
+  };
+
+  const handleAppsScriptAssets = async () => {
+    setAppsScriptLoading(prev => ({ ...prev, assets: true }));
+    try {
+      const result = await fetchAssetsMap(config);
+      if (!result.ok) {
+        setAppsScriptTestResult('assets', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
+        return;
+      }
+      const sample = result.data.slice(0, 2).map(row => `${row.ticker} -> ${row.sheetSymbol || ''} ${row.currency || ''}`).join(' | ');
+      setAppsScriptTestResult('assets', { status: 'ok', count: result.data.length, sample, diag: result.diag.diag });
+      const updated = applyAssetsMapToSettings(config, result.data);
+      if (updated.changed) {
+        await db.settings.put({ ...updated.settings, id: settingsId, portfolioId: currentPortfolioId });
+        setConfig(updated.settings);
+      }
+    } finally {
+      setAppsScriptLoading(prev => ({ ...prev, assets: false }));
+    }
+  };
+
+  const handleAppsScriptMacro = async () => {
+    setAppsScriptLoading(prev => ({ ...prev, macro: true }));
+    try {
+      const result = await fetchMacro(config);
+      if (!result.ok) {
+        setAppsScriptTestResult('macro', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
+        return;
+      }
+      const count = await applyMacroRowsToDexie(result.data, currentPortfolioId, db);
+      const sample = result.data.slice(0, 2).map(row => `${row.id}: ${row.value}`).join(' | ');
+      setAppsScriptTestResult('macro', { status: 'ok', count, sample, diag: result.diag.diag });
+    } finally {
+      setAppsScriptLoading(prev => ({ ...prev, macro: false }));
+    }
+  };
+
+  const handleAppsScriptFx = async () => {
+    setAppsScriptLoading(prev => ({ ...prev, fx: true }));
+    try {
+      const result = await syncFxRates(config, 'apps_script');
+      if (!result.ok) {
+        setAppsScriptTestResult('fx', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag?.diag });
+        return;
+      }
+      const sample = (result.rows || []).slice(0, 3).map((row: AppsScriptFxRow) => `${row.baseCurrency}/${row.quoteCurrency} ${row.date} ${row.rate}`).join(' | ');
+      setAppsScriptTestResult('fx', { status: 'ok', count: result.count, sample, diag: result.diag?.diag });
+    } finally {
+      setAppsScriptLoading(prev => ({ ...prev, fx: false }));
+    }
+  };
 
   const handleSave = async () => {
     await db.settings.put({ ...config, id: settingsId, portfolioId: currentPortfolioId });
@@ -315,21 +461,25 @@ export const Settings: React.FC = () => {
     };
 
   const handleTestEodhdAll = async () => {
-    if (bulkEodhdTesting) return;
-    setBulkEodhdTesting(true);
+    if (isTestingAll) return;
+    const tickers = coverage.perTicker.map(row => row.ticker).filter(Boolean);
+    setIsTestingAll(true);
+    setTestAllProgress({ done: 0, total: tickers.length });
     try {
-      for (const row of coverage.perTicker) {
-        const cfg = getRowConfig(row.ticker);
-        if (cfg.needsMapping) {
-          setEodhdTests(prev => ({ ...prev, [row.ticker]: { status: 'MAP', symbol: cfg.eodhdSymbol, message: 'Needs mapping' } }));
-          continue;
+      let done = 0;
+      for (const ticker of tickers) {
+        try {
+          await handleTestEodhd(ticker);
+        } catch (e: any) {
+          setEodhdTests(prev => ({ ...prev, [ticker]: { status: 'ERR', symbol: getRowConfig(ticker).eodhdSymbol, message: e?.message || String(e) } }));
+        } finally {
+          done += 1;
+          setTestAllProgress({ done, total: tickers.length });
         }
-        if (cfg.excluded || cfg.provider !== 'EODHD') continue;
-        await handleTestEodhd(row.ticker);
         await sleep(150);
       }
     } finally {
-      setBulkEodhdTesting(false);
+      setIsTestingAll(false);
     }
   };
   const handleSetEodhdSymbol = async (ticker: string, symbol: string) => {
@@ -378,15 +528,36 @@ export const Settings: React.FC = () => {
   const handleSync = async () => {
     setLoading(true);
     setSyncSummary(null);
+    setFxSyncNotice(null);
     try {
       const result = await syncPrices(config.eodhdApiKey);
       setSyncSummary(result);
-      if (result.status === 'ok') {
-        alert('Prezzi aggiornati con successo!');
-      } else if (result.status === 'partial') {
-        alert('Aggiornamento parziale: alcuni ticker non sono stati aggiornati.');
+      let fxNotice: { status: 'ok' | 'warn' | 'err'; message: string } | null = null;
+      const appsScriptEnabled = Boolean(config.appsScriptUrl?.trim() && config.appsScriptApiKey?.trim());
+      if (!appsScriptEnabled) {
+        fxNotice = { status: 'warn', message: 'FX non aggiornato: Apps Script disabilitato.' };
       } else {
-        alert('Aggiornamento fallito: nessun ticker aggiornato.');
+        try {
+          const fxResult = await syncFxRates(config, 'apps_script');
+          if (!fxResult.ok) {
+            fxNotice = { status: fxResult.error === 'DISABILITATO' ? 'warn' : 'err', message: `FX non aggiornato: ${fxResult.error}.` };
+          } else {
+            fxNotice = { status: 'ok', message: `FX aggiornati: ${fxResult.count ?? 0} righe.` };
+          }
+        } catch (e: any) {
+          fxNotice = { status: 'err', message: `FX non aggiornato: ${e?.message || 'errore Apps Script'}.` };
+        }
+      }
+      setFxSyncNotice(fxNotice);
+      const fxSuffix = fxNotice && fxNotice.status !== 'ok' ? `\n${fxNotice.message}` : '';
+      if (result.status === 'ok') {
+        alert(`Prezzi aggiornati con successo!${fxSuffix}`);
+      } else if (result.status === 'partial') {
+        alert(`Aggiornamento parziale: alcuni ticker non sono stati aggiornati.${fxSuffix}`);
+      } else if (result.status === 'quota_exhausted') {
+        alert(`Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili.${fxSuffix}`);
+      } else {
+        alert(`Aggiornamento fallito: nessun ticker aggiornato.${fxSuffix}`);
       }
     } catch (e: any) {
       alert(e?.message || 'Errore aggiornamento prezzi.');
@@ -401,7 +572,7 @@ export const Settings: React.FC = () => {
     try {
       const tickers = await getTickersForBackfill(currentPortfolioId, config.priceBackfillScope || 'current');
       const minDate = config.minHistoryDate || '2020-01-01';
-      await backfillPricesForPortfolio(
+      const result = await backfillPricesForPortfolio(
         currentPortfolioId,
         tickers,
         minDate,
@@ -412,10 +583,19 @@ export const Settings: React.FC = () => {
             setBfStatus(`${p.phase === 'backfill' ? 'Backfill' : 'Forward'} ${p.index}/${p.total} ${p.ticker}${p.error ? ' - ' + p.error : ''}`);
           }
         },
-        config.eodhdApiKey
+        config.eodhdApiKey,
+        { mode: 'MANUAL_FULL' }
       );
       await loadCoverage();
-      alert('Storico aggiornato');
+      setBudgetStatus(getEodhdDailyBudgetStatus());
+      if (result.status === 'quota_exhausted') {
+        setBfStatus('Quota EODHD esaurita (402). Backfill interrotto.');
+        alert('Quota EODHD esaurita (402). Backfill interrotto.');
+      } else if (result.status === 'ok') {
+        alert('Storico aggiornato');
+      } else {
+        alert(result.message || 'Backfill non completato');
+      }
     } catch (e: any) {
       alert(e?.message || e);
     } finally {
@@ -423,8 +603,68 @@ export const Settings: React.FC = () => {
     }
   };
 
+  type AutoSyncMetaState = ReturnType<typeof getAutoSyncMeta>;
+
+  const updateAutoSyncMeta = (patch: Partial<AutoSyncMetaState>) => {
+    const next = { ...getAutoSyncMeta(currentPortfolioId), ...patch };
+    setAutoSyncMetaState(next);
+    setAutoSyncMeta(currentPortfolioId, next);
+  };
+
+  const handleToggleAutoGap = (enabled: boolean) => {
+    setAutoGapEnabled(enabled);
+    setAutoGapFillEnabled(currentPortfolioId, enabled);
+  };
+
+  const handleAutoGapScopeChange = (scope: AutoGapScope) => {
+    setAutoGapScopeState(scope);
+    setAutoGapFillScope(scope);
+  };
+
+  const handleAutoGapNow = async () => {
+    if (autoGapRunning) return;
+    setAutoGapRunning(true);
+    setAutoGapStatus('Avvio gap-fill...');
+    try {
+      const tickers = await getTickersForBackfill(currentPortfolioId, config.priceBackfillScope || 'current');
+      const minDate = config.minHistoryDate || '2020-01-01';
+      const result = await backfillPricesForPortfolio(
+        currentPortfolioId,
+        tickers,
+        minDate,
+        (p) => {
+          if (p.phase === 'done') {
+            setAutoGapStatus('Completato');
+          } else {
+            setAutoGapStatus(`${p.phase === 'backfill' ? 'Gap-fill' : 'Forward'} ${p.index}/${p.total} ${p.ticker}${p.error ? ' - ' + p.error : ''}`);
+          }
+        },
+        config.eodhdApiKey,
+        { mode: 'AUTO_GAPS', maxApiCallsPerRun: 10, maxLookbackDays: 30, staleThresholdDays: 7, sleepMs: 400 }
+      );
+      await loadCoverage();
+      setBudgetStatus(getEodhdDailyBudgetStatus());
+      updateAutoSyncMeta({
+        lastRun: new Date().toISOString(),
+        gapsUpdated: result.updatedTickers?.length || 0,
+        gapsSkipped: result.skipped || 0,
+        stoppedByBudget: result.stoppedByBudget,
+        gapError: result.message
+      });
+      if (result.status === 'quota_exhausted') {
+        setAutoGapStatus('Quota EODHD esaurita (402). Gap-fill interrotto.');
+      } else if (result.status === 'error') {
+        setAutoGapStatus(result.message || 'Gap-fill non completato');
+      }
+    } catch (e: any) {
+      setAutoGapStatus(e?.message || 'Errore gap-fill');
+    } finally {
+      setAutoGapRunning(false);
+    }
+  };
+
   const handleReset = async () => {
-    if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione � irreversibile. Vuoi procedere?')) {
+    if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione ï¿½ irreversibile. Vuoi procedere?')) {
       await (db as any).delete();
       window.location.reload();
     }
@@ -461,12 +701,44 @@ export const Settings: React.FC = () => {
       const json = JSON.parse(text);
       if (!json || typeof json !== 'object') throw new Error('Formato JSON non valido');
 
-      if (!confirm('Importare il backup sovrascriver� i dati attuali. Procedere?')) return;
+      if (!confirm('Importare il backup sovrascriverï¿½ i dati attuali. Procedere?')) return;
 
-      const txs = (json.transactions || []).map((t: any) => ({
-        ...t,
-        date: t.date ? new Date(t.date) : new Date()
-      }));
+      const rawInstruments = Array.isArray(json.instruments) ? json.instruments : [];
+      const importedInstruments: Instrument[] = rawInstruments.map((inst: any) => {
+        const symbol = String(inst.symbol || inst.ticker || '').trim();
+        const ticker = String(inst.ticker || symbol || '').trim();
+        return {
+          ...inst,
+          id: typeof inst.id === 'string' && inst.id ? inst.id : createUuid(),
+          symbol,
+          ticker
+        } as Instrument;
+      });
+      const instrumentByKey = new Map<string, Instrument>();
+      importedInstruments.forEach(inst => {
+        if (inst.symbol) instrumentByKey.set(inst.symbol, inst);
+        if (inst.ticker) instrumentByKey.set(inst.ticker, inst);
+      });
+
+      const txs = (json.transactions || []).map((t: any) => {
+        const instrumentId = t.instrumentId ? String(t.instrumentId)
+          : (t.instrumentTicker ? instrumentByKey.get(t.instrumentTicker)?.id : undefined);
+        const instrument = instrumentId
+          ? importedInstruments.find(inst => inst.id === instrumentId)
+          : undefined;
+        const instrumentTicker = instrument?.symbol || instrument?.ticker || t.instrumentTicker;
+        return {
+          ...t,
+          date: t.date ? new Date(t.date) : new Date(),
+          instrumentId,
+          instrumentTicker
+        };
+      });
+      const importedPrices = (json.prices || []).map((p: any) => {
+        const instrumentId = p.instrumentId ? String(p.instrumentId)
+          : (p.ticker ? instrumentByKey.get(p.ticker)?.id : undefined);
+        return { ...p, instrumentId };
+      });
 
       await db.transaction('rw', [db.portfolios, db.settings, db.instruments, db.transactions, db.prices, db.macro], async () => {
         await db.portfolios.clear();
@@ -478,9 +750,9 @@ export const Settings: React.FC = () => {
 
         if (json.portfolios) await db.portfolios.bulkAdd(json.portfolios);
         if (json.settings) await db.settings.bulkAdd(json.settings);
-        if (json.instruments) await db.instruments.bulkAdd(json.instruments);
+        if (importedInstruments.length) await db.instruments.bulkAdd(importedInstruments);
         if (txs) await db.transactions.bulkAdd(txs);
-        if (json.prices) await db.prices.bulkAdd(json.prices);
+        if (importedPrices.length) await db.prices.bulkAdd(importedPrices);
         if (json.macro) await db.macro.bulkAdd(json.macro);
       });
 
@@ -503,6 +775,8 @@ export const Settings: React.FC = () => {
       baseCurrency: Currency.CHF,
       eodhdApiKey: '',
       googleSheetUrl: '',
+      appsScriptUrl: '',
+      appsScriptApiKey: '',
       minHistoryDate: '2020-01-01',
       priceBackfillScope: 'current',
       preferredExchangesOrder: config.preferredExchangesOrder,
@@ -558,6 +832,31 @@ export const Settings: React.FC = () => {
     }
   };
 
+  const getRepairSelection = (tx: Transaction) => {
+    if (!tx.id) return '';
+    if (txRepairSelection[tx.id]) return txRepairSelection[tx.id];
+    if (tx.instrumentTicker) {
+      return instrumentByKey.get(tx.instrumentTicker)?.id || '';
+    }
+    return '';
+  };
+
+  const handleRepairTransaction = async (tx: Transaction) => {
+    if (!tx.id) return;
+    const selectedId = getRepairSelection(tx);
+    if (!selectedId) return;
+    const instrument = instruments.find(inst => String(inst.id) === selectedId);
+    await db.transactions.update(tx.id, {
+      instrumentId: selectedId,
+      instrumentTicker: instrument?.symbol || instrument?.ticker || tx.instrumentTicker
+    });
+    setTxRepairSelection(prev => {
+      const next = { ...prev };
+      delete next[tx.id!];
+      return next;
+    });
+  };
+
   const handleApplyListing = async () => {
     if (!selectedInstrumentId) {
       setListingMessage('Seleziona uno strumento');
@@ -567,7 +866,7 @@ export const Settings: React.FC = () => {
       setListingMessage('Seleziona un listing');
       return;
     }
-    const instrument = await db.instruments.get(selectedInstrumentId);
+    const instrument = getInstrumentByIdString(selectedInstrumentId);
     if (!instrument) {
       setListingMessage('Strumento non trovato');
       return;
@@ -577,7 +876,7 @@ export const Settings: React.FC = () => {
         ([...(instrument.listings || []), selectedListing] as InstrumentListing[]).map(l => [l.symbol, l])
       ).values()
     );
-    await db.instruments.update(selectedInstrumentId, {
+    await db.instruments.update(instrument.ticker, {
       isin: isinInput.trim() || instrument.isin,
       preferredListing: selectedListing,
       listings: mergedListings
@@ -604,11 +903,18 @@ export const Settings: React.FC = () => {
         const [date, closeStr, currencyCol, tickerCol] = line.split(',').map(s => s.trim());
         const close = parseFloat(closeStr);
         if (!date || !isFinite(close)) continue;
-        const ticker = tickerCol || selectedListing?.symbol || instruments.find(i => i.id === selectedInstrumentId)?.ticker;
+        const ticker = tickerCol
+          || selectedListing?.symbol
+          || instruments.find(i => String(i.id) === selectedInstrumentId)?.symbol
+          || instruments.find(i => String(i.id) === selectedInstrumentId)?.ticker;
         const currency = (currencyCol as Currency) || selectedListing?.currency || Currency.USD;
         if (!ticker) continue;
+        const instrumentMatch = instruments.find(i => i.symbol === ticker || i.ticker === ticker);
+        const instrumentId = selectedInstrumentId
+          || (instrumentMatch?.id ? String(instrumentMatch.id) : undefined);
         await db.prices.put({
           ticker,
+          instrumentId,
           date,
           close,
           currency,
@@ -643,7 +949,7 @@ export const Settings: React.FC = () => {
         setRegionAllocation({});
         return;
       }
-      const inst = await db.instruments.get(selectedInstrumentId);
+      const inst = getInstrumentByIdString(selectedInstrumentId);
       setRegionAllocation(inst?.regionAllocation || {});
     };
     loadRegion();
@@ -669,9 +975,11 @@ export const Settings: React.FC = () => {
     if (!selectedInstrumentId) return;
     const sum = Object.values(regionAllocation || {}).reduce((s, v) => s + (v || 0), 0);
     if (sum < 99.5 || sum > 100.5) {
-      if (!confirm('La somma delle percentuali non � 100%. Procedere lo stesso?')) return;
+      if (!confirm('La somma delle percentuali non ï¿½ 100%. Procedere lo stesso?')) return;
     }
-    await db.instruments.update(selectedInstrumentId, { regionAllocation });
+    const regionTarget = getInstrumentByIdString(selectedInstrumentId);
+    if (!regionTarget?.ticker) return;
+    await db.instruments.update(regionTarget.ticker, { regionAllocation });
     alert('Distribuzione geografica salvata');
   };
 
@@ -693,13 +1001,14 @@ export const Settings: React.FC = () => {
 
   const resolveInstrumentForTicker = (ticker: string) => {
     return instruments.find(i => i.preferredListing?.symbol === ticker)
+      || instruments.find(i => i.symbol === ticker)
       || instruments.find(i => i.ticker === ticker)
       || instruments.find(i => i.listings?.some(l => l.symbol === ticker));
   };
 
   const resolveInstrumentForRow = (row: CoverageRow) => {
     if (row.instrumentId != null) {
-      return instruments.find(i => i.id === Number(row.instrumentId));
+      return instruments.find(i => String(i.id) === row.instrumentId);
     }
     return resolveInstrumentForTicker(row.ticker)
       || (row.isin ? instruments.find(i => i.isin === row.isin) : undefined);
@@ -708,7 +1017,7 @@ export const Settings: React.FC = () => {
   const handleOpenListingsFromCoverage = (row: CoverageRow) => {
     const instrument = resolveInstrumentForRow(row);
     if (instrument?.id) {
-      setSelectedInstrumentId(instrument.id);
+      setSelectedInstrumentId(String(instrument.id));
     }
     const nextIsin = instrument?.isin || row.isin;
     if (nextIsin) {
@@ -763,15 +1072,26 @@ export const Settings: React.FC = () => {
       ? 'OK'
       : syncSummary.status === 'partial'
         ? 'Parziale'
-        : 'Fallito'
+        : syncSummary.status === 'quota_exhausted'
+          ? 'Quota'
+          : 'Errore'
     : '';
   const syncStatusClass = syncSummary
     ? syncSummary.status === 'ok'
       ? 'bg-green-100 text-green-700'
       : syncSummary.status === 'partial'
         ? 'bg-amber-100 text-amber-700'
-        : 'bg-red-100 text-red-700'
+        : syncSummary.status === 'quota_exhausted'
+          ? 'bg-red-100 text-red-700'
+          : 'bg-red-100 text-red-700'
     : '';
+
+  const autoSyncLabel = autoSyncMeta?.lastRun
+    ? new Date(autoSyncMeta.lastRun).toLocaleString('it-IT')
+    : 'N/D';
+  const gapFillLabel = autoSyncMeta?.gapsUpdated !== undefined
+    ? `${autoSyncMeta.gapsUpdated} upd${autoSyncMeta.gapsSkipped ? ` · skip ${autoSyncMeta.gapsSkipped}` : ''}${autoSyncMeta.stoppedByBudget ? ' · budget' : ''}${autoSyncMeta.gapError ? ' · err' : ''}`
+    : 'N/D';
 
   const excludedTickers = useMemo(() => {
     const set = new Set<string>();
@@ -804,9 +1124,15 @@ export const Settings: React.FC = () => {
     const sheetsHasErrors = sheetsConfigured && Object.values(sheetTests).some(result => result.status === 'error' || result.status === 'disabled');
     const sheetsStatus: 'disabled' | 'ok' | 'err' = !sheetsConfigured ? 'disabled' : sheetsHasErrors ? 'err' : 'ok';
     const eodhdStatus: 'ok' | 'err' = proxyHealth?.ok && proxyHealth?.hasEodhdKey ? 'ok' : 'err';
-    const globalStatus = eodhdStatus === 'ok' && (sheetsStatus === 'ok' || sheetsStatus === 'disabled') ? 'OK' : 'PARZIALE';
-    return { eodhdStatus, sheetsStatus, globalStatus };
-  }, [config.googleSheetUrl, sheetTests, proxyHealth]);
+    const appsScriptEnabled = Boolean(config.appsScriptUrl?.trim() && config.appsScriptApiKey?.trim());
+    const appsScriptHasErrors = Object.values(appsScriptTests).some(result => result?.status === 'err');
+    const appsScriptStatus: 'disabled' | 'ok' | 'err' = !appsScriptEnabled ? 'disabled' : appsScriptHasErrors ? 'err' : 'ok';
+    const globalOk = eodhdStatus === 'ok'
+      && (sheetsStatus === 'ok' || sheetsStatus === 'disabled')
+      && (appsScriptStatus === 'ok' || appsScriptStatus === 'disabled');
+    const globalStatus = globalOk ? 'OK' : 'PARZIALE';
+    return { eodhdStatus, sheetsStatus, globalStatus, appsScriptStatus, appsScriptEnabled };
+  }, [config.googleSheetUrl, sheetTests, proxyHealth, config.appsScriptUrl, config.appsScriptApiKey, appsScriptTests]);
 
   const listingUsage = useMemo(() => {
     const usage = new Map<string, { count: number; names: string[] }>();
@@ -861,7 +1187,7 @@ export const Settings: React.FC = () => {
     const usage = listingUsage.get(row.symbol);
     const hasRefs = Boolean(usage?.count);
     const confirmMessage = hasRefs
-      ? `Il listing ${row.symbol} � ancora usato da ${usage?.count} strumento/i. Verr� rimosso dai riferimenti. Continuare?`
+      ? `Il listing ${row.symbol} ï¿½ ancora usato da ${usage?.count} strumento/i. Verrï¿½ rimosso dai riferimenti. Continuare?`
       : `Eliminare il listing ${row.symbol}?`;
     if (!confirm(confirmMessage)) return;
     await db.transaction('rw', [db.instrumentListings, db.instruments], async () => {
@@ -874,8 +1200,8 @@ export const Settings: React.FC = () => {
       for (const inst of related) {
         const nextListings = (inst.listings || []).filter(l => l.symbol !== row.symbol);
         const nextPreferred = inst.preferredListing?.symbol === row.symbol ? nextListings[0] : inst.preferredListing;
-        if (inst.id) {
-          await db.instruments.update(inst.id, {
+        if (inst.ticker) {
+          await db.instruments.update(inst.ticker, {
             listings: nextListings.length > 0 ? nextListings : undefined,
             preferredListing: nextPreferred
           });
@@ -1077,10 +1403,56 @@ export const Settings: React.FC = () => {
                       <span className={`font-bold px-2 py-1 rounded-full ${sourcesStatus.sheetsStatus === 'disabled' ? 'bg-slate-100 text-slate-600' : sourcesStatus.sheetsStatus === 'ok' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
                         Sheets {sourcesStatus.sheetsStatus === 'disabled' ? 'disabilitato' : sourcesStatus.sheetsStatus === 'ok' ? 'OK' : 'ERR'}
                       </span>
+                      <span className={`font-bold px-2 py-1 rounded-full ${sourcesStatus.appsScriptStatus === 'disabled' ? 'bg-slate-100 text-slate-600' : sourcesStatus.appsScriptStatus === 'ok' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                        Apps Script {sourcesStatus.appsScriptStatus === 'disabled' ? 'disabilitato' : sourcesStatus.appsScriptStatus === 'ok' ? 'OK' : 'ERR'}
+                      </span>
                       <span className={`font-bold px-2 py-1 rounded-full ${sourcesStatus.globalStatus === 'OK' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
                         Stato: {sourcesStatus.globalStatus}
                       </span>
                     </div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+                      <button
+                        type="button"
+                        onClick={handleQuotaCheck}
+                        className="font-bold text-[#0052a3] hover:text-blue-600"
+                        disabled={quotaLoading}
+                      >
+                        {quotaLoading ? 'Controllo quota...' : 'Controlla quota EODHD'}
+                      </button>
+                      {quotaDiag && (
+                        <button
+                          type="button"
+                          onClick={() => window.open('/api/eodhd-proxy?path=%2Fapi%2Fuser&fmt=json', '_blank')}
+                          className="font-bold text-slate-600 underline"
+                        >
+                          Apri risposta raw
+                        </button>
+                      )}
+                      {quotaUpdatedAt && (
+                        <span className="text-slate-400">Aggiornato: {new Date(quotaUpdatedAt).toLocaleTimeString()}</span>
+                      )}
+                    </div>
+                    {quotaInfo && (
+                      <div className="text-xs text-slate-600 mt-1">
+                        <span>Chiamate: {quotaInfo.apiRequests ?? 'N/D'}{quotaInfo.dailyRateLimit !== undefined ? `/${quotaInfo.dailyRateLimit}` : ''}</span>
+                        {quotaInfo.remaining !== undefined && (
+                          <span className={`ml-2 font-bold ${quotaInfo.remaining > 5 ? 'text-emerald-700' : quotaInfo.remaining > 0 ? 'text-amber-700' : 'text-red-700'}`}>
+                            Restanti: {quotaInfo.remaining}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {!quotaInfo && quotaDiag && (
+                      <div className="text-xs text-slate-600 mt-1">
+                        HTTP {quotaDiag.httpStatus} â€¢ {quotaDiag.contentType || 'n/a'}
+                      </div>
+                    )}
+                    {quotaError && (
+                      <div className="text-xs text-red-700 mt-1">{quotaError}</div>
+                    )}
+                    {quotaDiag?.rawPreview && quotaError && (
+                      <div className="text-[10px] text-amber-700 mt-1 whitespace-pre-wrap">{quotaDiag.rawPreview}</div>
+                    )}
                     <div className="text-xs text-slate-600">Valuta base: {config.baseCurrency}</div>
                     <div className="text-xs text-slate-600">Exchange preferiti: {(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(', ')}</div>
                   <div className="text-xs text-slate-600">Backfill: dal {config.minHistoryDate || '2020-01-01'} ({(config.priceBackfillScope || 'current') === 'all' ? 'Completo' : 'Solo correnti'})</div>
@@ -1140,6 +1512,122 @@ export const Settings: React.FC = () => {
             </div>
 
             <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold uppercase text-slate-500">Apps Script</span>
+                  {sourcesStatus.appsScriptStatus === 'disabled' ? (
+                    <span className="text-xs font-bold text-slate-500">Disabilitato</span>
+                  ) : sourcesStatus.appsScriptStatus === 'ok' ? (
+                    <span className="text-xs font-bold text-green-600">OK</span>
+                  ) : (
+                    <span className="text-xs font-bold text-red-600">Errore</span>
+                  )}
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Apps Script URL (exec)</label>
+                  <input
+                    type="text"
+                    className="w-full border border-borderSoft bg-white p-2 rounded-lg text-sm text-slate-800"
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    value={config.appsScriptUrl || ''}
+                    onChange={e => setConfig({ ...config, appsScriptUrl: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Apps Script API key</label>
+                  <input
+                    type="password"
+                    className="w-full border border-borderSoft bg-white p-2 rounded-lg text-sm text-slate-800"
+                    placeholder="API key"
+                    value={config.appsScriptApiKey || ''}
+                    onChange={e => setConfig({ ...config, appsScriptApiKey: e.target.value })}
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2 items-center text-xs">
+                <button
+                  type="button"
+                  onClick={handleAppsScriptPing}
+                  disabled={appsScriptLoading.ping}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  {appsScriptLoading.ping ? 'Test Ping...' : 'Test Ping'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAppsScriptAssets}
+                  disabled={appsScriptLoading.assets}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  {appsScriptLoading.assets ? 'Test Asset Map...' : 'Test Asset Map'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAppsScriptMacro}
+                  disabled={appsScriptLoading.macro}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  {appsScriptLoading.macro ? 'Test Macro...' : 'Test Macro'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAppsScriptFx}
+                  disabled={appsScriptLoading.fx}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  {appsScriptLoading.fx ? 'Test FX...' : 'Test FX'}
+                </button>
+              </div>
+              {appsScriptTests.assets && (
+                <div className="text-[11px] text-slate-600">
+                  Asset Map: {appsScriptTests.assets.status.toUpperCase()}
+                  {appsScriptTests.assets.count !== undefined ? ` â€¢ count=${appsScriptTests.assets.count}` : ''}
+                  {appsScriptTests.assets.sample ? ` â€¢ ${appsScriptTests.assets.sample}` : ''}
+                </div>
+              )}
+              {appsScriptTests.macro && (
+                <div className="text-[11px] text-slate-600">
+                  Macro: {appsScriptTests.macro.status.toUpperCase()}
+                  {appsScriptTests.macro.count !== undefined ? ` â€¢ count=${appsScriptTests.macro.count}` : ''}
+                  {appsScriptTests.macro.sample ? ` â€¢ ${appsScriptTests.macro.sample}` : ''}
+                </div>
+              )}
+              {appsScriptTests.fx && (
+                <div className="text-[11px] text-slate-600">
+                  FX: {appsScriptTests.fx.status.toUpperCase()}
+                  {appsScriptTests.fx.count !== undefined ? ` â€¢ count=${appsScriptTests.fx.count}` : ''}
+                  {appsScriptTests.fx.sample ? ` â€¢ ${appsScriptTests.fx.sample}` : ''}
+                </div>
+              )}
+              {appsScriptTests.ping && (
+                <div className="text-[11px] text-slate-600">
+                  Ping: {appsScriptTests.ping.status.toUpperCase()}
+                  {appsScriptTests.ping.message ? ` â€¢ ${appsScriptTests.ping.message}` : ''}
+                </div>
+              )}
+              {appsScriptTests.assets?.diag && appsScriptTests.assets.status === 'err' && (
+                <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
+                  HTTP {appsScriptTests.assets.diag.httpStatus} â€¢ {appsScriptTests.assets.diag.contentType || 'n/a'}
+                  {appsScriptTests.assets.diag.rawPreview ? ` â€¢ ${appsScriptTests.assets.diag.rawPreview}` : ''}
+                </div>
+              )}
+              {appsScriptTests.macro?.diag && appsScriptTests.macro.status === 'err' && (
+                <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
+                  HTTP {appsScriptTests.macro.diag.httpStatus} â€¢ {appsScriptTests.macro.diag.contentType || 'n/a'}
+                  {appsScriptTests.macro.diag.rawPreview ? ` â€¢ ${appsScriptTests.macro.diag.rawPreview}` : ''}
+                </div>
+              )}
+              {appsScriptTests.fx?.diag && appsScriptTests.fx.status === 'err' && (
+                <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
+                  HTTP {appsScriptTests.fx.diag.httpStatus} â€¢ {appsScriptTests.fx.diag.contentType || 'n/a'}
+                  {appsScriptTests.fx.diag.rawPreview ? ` â€¢ ${appsScriptTests.fx.diag.rawPreview}` : ''}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
               <div className="text-sm font-bold text-slate-900">Prezzi &amp; Backfill</div>
               <div className="text-xs text-slate-600">
                 Copertura: {coverageSummary.okCount}/{coverageSummary.total} tickers - {coverageSummary.earliest || coverage.earliestCoveredDate || 'N/D'} - {coverageSummary.latest || coverage.latestCoveredDate || 'N/D'}
@@ -1182,10 +1670,12 @@ export const Settings: React.FC = () => {
                 <button
                   type="button"
                   onClick={handleTestEodhdAll}
-                  disabled={bulkEodhdTesting}
+                  disabled={!config.eodhdApiKey?.trim() || isTestingAll}
                   className="text-xs font-bold text-[#0052a3] hover:text-blue-600 disabled:opacity-60"
                 >
-                  {bulkEodhdTesting ? 'Test EODHD (tutti)...' : 'Test EODHD (tutti)'}
+                  {isTestingAll
+                    ? `Test EODHD (tutti)... ${testAllProgress.done}/${testAllProgress.total}`
+                    : 'Test EODHD (tutti)'}
                 </button>
                 <button
                   type="button"
@@ -1208,17 +1698,65 @@ export const Settings: React.FC = () => {
                     <span className="text-slate-500">Sync:</span>{' '}
                     <span className={`px-2 py-0.5 rounded-full font-bold ${syncStatusClass}`}>{syncStatusLabel}</span>
                   </div>
+                  {fxSyncNotice && (
+                    <div className={fxSyncNotice.status === 'ok' ? 'text-emerald-700' : fxSyncNotice.status === 'warn' ? 'text-amber-700' : 'text-red-700'}>
+                      FX: {fxSyncNotice.message}
+                    </div>
+                  )}
                   {syncSummary.failedTickers.length > 0 && (
                     <div className="text-amber-700">
                       Errori: {syncSummary.failedTickers.slice(0, 5).map(f => f.ticker).join(', ')}
-                      {syncSummary.failedTickers.length > 5 ? '�' : ''}
+                      {syncSummary.failedTickers.length > 5 ? 'ï¿½' : ''}
                     </div>
                   )}
-                  {syncSummary.sheet.enabled ? null : (
-                    <div className="text-slate-500">Sheets disabilitato: {syncSummary.sheet.reason}</div>
-                  )}
+                    {syncSummary.sheet.enabled ? null : (
+                      <div className="text-slate-500">Sheets disabilitato: {syncSummary.sheet.reason}</div>
+                    )}
+                    {syncSummary.status === 'quota_exhausted' && (
+                      <div className="text-red-700">
+                        Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili. Riprova dopo il reset o valuta upgrade.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+              <div className="border-t border-borderSoft pt-3 mt-2 space-y-2 text-xs text-slate-600">
+                <div className="flex flex-wrap gap-4 items-center">
+                  <label className="flex items-center gap-2 text-xs font-bold text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={autoGapEnabled}
+                      onChange={e => handleToggleAutoGap(e.target.checked)}
+                    />
+                    Auto riempi buchi all’avvio
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-500">Scope:</span>
+                    <select
+                      value={autoGapScope}
+                      onChange={e => handleAutoGapScopeChange(e.target.value as AutoGapScope)}
+                      className="border border-borderSoft rounded-md px-2 py-1 text-xs bg-white text-slate-700"
+                    >
+                      <option value="current">Solo portafoglio attivo</option>
+                      <option value="allPortfolios">Tutti i portafogli</option>
+                    </select>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleAutoGapNow}
+                    disabled={autoGapRunning || !config.eodhdApiKey?.trim()}
+                    className="text-xs font-bold text-[#0052a3] hover:text-blue-600 disabled:opacity-60"
+                  >
+                    {autoGapRunning ? 'Gap-fill in corso...' : 'Esegui gap-fill ora'}
+                  </button>
                 </div>
-              )}
+                <div className="text-[11px] text-slate-500">
+                  Ultimo auto-sync: {autoSyncLabel} · Gap-fill: {gapFillLabel} · Budget oggi usato: {budgetStatus.used}
+                </div>
+                {autoGapStatus && (
+                  <div className="text-[11px] text-slate-600">{autoGapStatus}</div>
+                )}
+              </div>
             </div>
 
             <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
@@ -1267,8 +1805,8 @@ export const Settings: React.FC = () => {
                       <ul className="list-disc list-inside space-y-1">
                         <li>La tabella mostra per ogni strumento il range di date per cui abbiamo prezzi salvati nel database.</li>
                         <li>Se vedi PARZIALE/INCOMPLETO, i grafici (ritorni annuali, drawdown, CAGR) possono risultare incompleti o N/D.</li>
-                        <li>Per estendere lo storico: usa �Scarica storico prezzi� oppure importa un CSV prezzi dal tuo provider.</li>
-                        <li>Lo strumento mostrato (ticker) � il listing usato per i prezzi; se � sbagliato, correggilo in �Listings & FX�.</li>
+                        <li>Per estendere lo storico: usa ï¿½Scarica storico prezziï¿½ oppure importa un CSV prezzi dal tuo provider.</li>
+                        <li>Lo strumento mostrato (ticker) ï¿½ il listing usato per i prezzi; se ï¿½ sbagliato, correggilo in ï¿½Listings & FXï¿½.</li>
                         <li>Consiglio: per SIX/CHF usa un listing .SW e importa prezzi in CHF (SIX-first).</li>
                       </ul>
                       <div className="flex flex-wrap gap-2 pt-1 text-xs">
@@ -1338,7 +1876,7 @@ export const Settings: React.FC = () => {
                             <div className="flex flex-col">
                               <span className="font-semibold text-slate-900">{row.ticker}</span>
                               <span className="text-xs text-slate-600">
-                                ISIN: {row.isin || '�'}{row.name ? ` - ${row.name}` : ''}
+                                ISIN: {row.isin || 'ï¿½'}{row.name ? ` - ${row.name}` : ''}
                               </span>
                               {!isExcluded && row.status !== 'OK' && (
                                 <button
@@ -1457,10 +1995,10 @@ export const Settings: React.FC = () => {
                               {eodhdTests[row.ticker] && (
                                 <div className="text-[10px] text-slate-500 mt-1">
                                   {eodhdTests[row.ticker]?.httpStatus ? `HTTP ${eodhdTests[row.ticker]?.httpStatus}` : ''}
-                                  {eodhdTests[row.ticker]?.contentType ? ` • ${eodhdTests[row.ticker]?.contentType}` : ''}
-                                  {eodhdTests[row.ticker]?.message ? ` • ${eodhdTests[row.ticker]?.message}` : ''}
-                                  {eodhdTests[row.ticker]?.sample ? ` • ${eodhdTests[row.ticker]?.sample}` : ''}
-                                  {eodhdTests[row.ticker]?.parseError ? ` • parseError: ${eodhdTests[row.ticker]?.parseError}` : ''}
+                                  {eodhdTests[row.ticker]?.contentType ? ` â€¢ ${eodhdTests[row.ticker]?.contentType}` : ''}
+                                  {eodhdTests[row.ticker]?.message ? ` â€¢ ${eodhdTests[row.ticker]?.message}` : ''}
+                                  {eodhdTests[row.ticker]?.sample ? ` â€¢ ${eodhdTests[row.ticker]?.sample}` : ''}
+                                  {eodhdTests[row.ticker]?.parseError ? ` â€¢ parseError: ${eodhdTests[row.ticker]?.parseError}` : ''}
                                 </div>
                               )}
                               {eodhdTests[row.ticker]?.rawPreview && eodhdTests[row.ticker]?.status !== 'OK' && (
@@ -1547,7 +2085,7 @@ export const Settings: React.FC = () => {
                       isSixFirst
                         ? 'Stai usando il listing SIX in CHF. I prezzi devono essere importati/aggiornati in CHF. FX non necessario.'
                         : needsFx
-                          ? 'Il listing selezionato � in valuta estera. Per mostrare valori in CHF servono tassi FX (USD?CHF, EUR?CHF, GBP?CHF).'
+                          ? 'Il listing selezionato ï¿½ in valuta estera. Per mostrare valori in CHF servono tassi FX (USD?CHF, EUR?CHF, GBP?CHF).'
                           : 'Listing OK'
                     }
                   >
@@ -1576,7 +2114,7 @@ export const Settings: React.FC = () => {
                       <li>Scegli il listing che userai per i prezzi e lo storico (es. SIX: .SW).</li>
                       <li>I prezzi importati devono avere la stessa valuta del listing selezionato (es. listing CHF -&gt; CSV CHF).</li>
                       <li>Se selezioni un listing estero (USD/EUR/GBP), per vedere tutto in CHF devi importare anche i tassi FX (USD-&gt;CHF, ecc.).</li>
-                      <li>Salva sempre il listing preferito prima di importare prezzi, cos� l'import finisce sul ticker corretto.</li>
+                      <li>Salva sempre il listing preferito prima di importare prezzi, cosï¿½ l'import finisce sul ticker corretto.</li>
                       <li>Se la search non trova SIX, aggiungi manualmente un listing SW (.SW) in CHF (SIX-first).</li>
                       </ul>
                       <div className="flex flex-wrap gap-2 pt-1 text-xs">
@@ -1595,7 +2133,7 @@ export const Settings: React.FC = () => {
                           Importa FX (CSV)
                         </button>
                         <details className="text-slate-600 text-xs">
-                          <summary className="cursor-pointer text-[#0052a3] font-bold">Cos�� SIX-first?</summary>
+                          <summary className="cursor-pointer text-[#0052a3] font-bold">Cosï¿½ï¿½ SIX-first?</summary>
                           <div className="mt-1">
                             Usa un listing SIX (.SW) in CHF per evitare conversioni FX sui prezzi. Importa prezzi direttamente in CHF per allineare reporting e base currency.
                           </div>
@@ -1613,12 +2151,12 @@ export const Settings: React.FC = () => {
                   className="border border-borderSoft rounded-lg px-3 py-2 text-sm text-slate-800 bg-white shadow-inner"
                   ref={listingSelectRef}
                   value={selectedInstrumentId ?? ''}
-                  onChange={e => setSelectedInstrumentId(e.target.value ? Number(e.target.value) : undefined)}
+                  onChange={e => setSelectedInstrumentId(e.target.value || undefined)}
                 >
                   {instruments.map((i, idx) => {
-                    const key = i.id ?? `${i.ticker || 'inst'}-${idx}`;
+                    const key = i.id ? String(i.id) : `${i.ticker || 'inst'}-${idx}`;
                     return (
-                      <option key={key} value={i.id ?? ''}>{i.ticker}{i.name ? ` - ${i.name}` : ''}</option>
+                      <option key={key} value={i.id ? String(i.id) : ''}>{i.symbol || i.ticker}{i.name ? ` - ${i.name}` : ''}</option>
                     );
                   })}
                   {instruments.length === 0 && <option>Nessuno strumento</option>}
@@ -1654,7 +2192,7 @@ export const Settings: React.FC = () => {
                   renderContent={() => (
                     <div className="text-sm space-y-1">
                       <p>Inserisci le percentuali per area (somma ~100%).</p>
-                      <p>Se non definite, la Dashboard mostrer� �Non definito�.</p>
+                      <p>Se non definite, la Dashboard mostrerï¿½ ï¿½Non definitoï¿½.</p>
                     </div>
                   )}
                 />
@@ -1720,7 +2258,7 @@ export const Settings: React.FC = () => {
                         />
                         <span className="text-sm font-bold text-slate-900">{l.symbol}</span>
                       </div>
-                      <span className="text-xs text-slate-600">{l.exchangeCode} � {l.currency}</span>
+                      <span className="text-xs text-slate-600">{l.exchangeCode} ï¿½ {l.currency}</span>
                       {l.name && <span className="text-xs text-slate-500">{l.name}</span>}
                     </label>
                   ))}
@@ -1825,7 +2363,7 @@ export const Settings: React.FC = () => {
                       const usageLabel = usedCount ? `${usedCount} str.` : '-';
                       return (
                         <tr key={`${row.symbol}-${row.exchangeCode}-${row.id ?? 'row'}`} className="border-t border-borderSoft">
-                          <td className="px-3 py-2 font-semibold">{row.symbol}</td>
+                          <td className="px-3 py-2 font-bold text-slate-700">{row.symbol}</td>
                           <td className="px-3 py-2 text-slate-700">{row.exchangeCode}</td>
                           <td className="px-3 py-2 text-slate-700">{row.currency}</td>
                           <td className="px-3 py-2" title={usage?.names?.join(', ') || ''}>
@@ -1876,7 +2414,7 @@ export const Settings: React.FC = () => {
                   <tbody>
                     {fxPairs.map(pair => (
                       <tr key={pair.key} className="border-t border-borderSoft">
-                        <td className="px-3 py-2 font-semibold">{pair.key}</td>
+                        <td className="px-3 py-2 font-bold text-slate-700">{pair.key}</td>
                         <td className="px-3 py-2 text-slate-700">{pair.from || 'N/D'} - {pair.to || 'N/D'}</td>
                         <td className="px-3 py-2 text-slate-700">{pair.count}</td>
                         <td className="px-3 py-2">
@@ -1910,6 +2448,79 @@ export const Settings: React.FC = () => {
         </div>
       </div>
 
+      {/* REPAIR IMPORTED TRANSACTIONS */}
+      <div className="bg-slate-50 border border-borderSoft rounded-2xl p-6 space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-bold text-slate-900">Ripara transazioni importate</div>
+            <div className="text-xs text-slate-600">Senza strumento: {missingTxRows.length}</div>
+          </div>
+        </div>
+        {missingTxRows.length === 0 ? (
+          <div className="text-xs text-slate-500">Nessuna transazione da riparare.</div>
+        ) : (
+          <div className="border border-borderSoft rounded-xl overflow-auto bg-white">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
+                <tr>
+                  <th className="px-3 py-2 text-left">Data</th>
+                  <th className="px-3 py-2 text-left">Ticker import</th>
+                  <th className="px-3 py-2 text-left">Tipo</th>
+                  <th className="px-3 py-2 text-right">Qta</th>
+                  <th className="px-3 py-2 text-left">Strumento</th>
+                  <th className="px-3 py-2 text-right">Azione</th>
+                </tr>
+              </thead>
+              <tbody>
+                {missingTxRows.map(tx => {
+                  const selection = getRepairSelection(tx);
+                  const txDate = tx.date ? new Date(tx.date).toLocaleDateString('it-IT') : 'N/D';
+                  return (
+                    <tr key={tx.id ?? `${txDate}-${tx.instrumentTicker || 'no-ticker'}`} className="border-t border-borderSoft">
+                      <td className="px-3 py-2 text-slate-700">{txDate}</td>
+                      <td className="px-3 py-2 font-semibold">{tx.instrumentTicker || 'â€”'}</td>
+                      <td className="px-3 py-2">{tx.type}</td>
+                      <td className="px-3 py-2 text-right">{Number(tx.quantity || 0).toLocaleString('it-CH')}</td>
+                      <td className="px-3 py-2">
+                        <select
+                          className="border border-borderSoft rounded-lg px-2 py-1 text-xs bg-white"
+                          value={selection}
+                          onChange={e => {
+                            if (!tx.id) return;
+                            setTxRepairSelection(prev => ({ ...prev, [tx.id!]: e.target.value }));
+                          }}
+                        >
+                          <option value="">Seleziona...</option>
+                          {instruments.map(inst => {
+                            const label = `${inst.symbol || inst.ticker}${inst.name ? ` - ${inst.name}` : ''}${inst.isin ? ` â€¢ ${inst.isin}` : ''}`;
+                            return (
+                              <option key={String(inst.id)} value={String(inst.id)}>{label}</option>
+                            );
+                          })}
+                        </select>
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          type="button"
+                          className={clsx(
+                            'px-3 py-1 rounded text-[11px] font-bold',
+                            selection ? 'bg-[#0052a3] text-white' : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                          )}
+                          onClick={() => handleRepairTransaction(tx)}
+                          disabled={!selection}
+                        >
+                          Assegna
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
       {/* DANGER ZONE */}
       <div className="bg-red-50 p-8 rounded-2xl shadow-sm border border-red-200">
         <h2 className="text-lg font-bold text-red-700 mb-2 flex items-center gap-2">
@@ -1918,7 +2529,7 @@ export const Settings: React.FC = () => {
         </h2>
         <p className="text-sm text-red-700/70 mb-6 leading-relaxed">
           Se l'applicazione non visualizza i dati corretti o hai conflitti con versioni precedenti, puoi resettare il database.
-          Questo canceller� tutto e ricaricher� i dati demo.
+          Questo cancellerï¿½ tutto e ricaricherï¿½ i dati demo.
         </p>
         <button
           onClick={handleReset}
@@ -1930,6 +2541,14 @@ export const Settings: React.FC = () => {
     </div>
   );
 };
+
+
+
+
+
+
+
+
 
 
 
