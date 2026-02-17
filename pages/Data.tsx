@@ -615,6 +615,152 @@ export const Data: React.FC = () => {
     });
   }, [fxRates, fxPairs]);
 
+  const topIssues = useMemo(() => {
+    const items: {
+      key: string;
+      title: string;
+      detail: string;
+      meaning: string;
+      action: string;
+      primary: { label: string; href: string };
+      secondary?: { label: string; href: string };
+    }[] = [];
+
+    const pushItem = (item: typeof items[number]) => {
+      if (items.length >= 3) return;
+      if (items.some(existing => existing.key === item.key)) return;
+      items.push(item);
+    };
+
+    const rebalanceIssues = (
+      (rebalanceQuality as any)?.summary?.issues
+      || (rebalanceQuality as any)?.issues
+      || []
+    ) as Array<{
+      type?: string;
+      ticker?: string;
+      priceTicker?: string;
+      fxBase?: string;
+      fxQuote?: string;
+    }>;
+    const priceMissing = Array.from(new Set(rebalanceIssues.filter(i => i.type === 'priceMissing').map(i => i.priceTicker || i.ticker)));
+    const priceStale = Array.from(new Set(rebalanceIssues.filter(i => i.type === 'priceStale').map(i => i.priceTicker || i.ticker)));
+    const fxMissing = Array.from(new Set(rebalanceIssues.filter(i => i.type === 'fxMissing').map(i => `${i.fxBase || 'FX'}/${i.fxQuote || 'CHF'}`)));
+    const fxStale = Array.from(new Set(rebalanceIssues.filter(i => i.type === 'fxStale').map(i => `${i.fxBase || 'FX'}/${i.fxQuote || 'CHF'}`)));
+    const currencyMismatch = Array.from(new Set(rebalanceIssues.filter(i => i.type === 'currencyMismatch').map(i => i.priceTicker || i.ticker)));
+
+    const gapTickers = priceChecksSummary.filter(row => row.stats.gaps > 0).map(row => row.ticker);
+    const fxGapPairs = fxChecksSummary.filter(row => row.stats.gaps > 0).map(row => row.pair);
+
+    if (priceMissing.length) {
+      pushItem({
+        key: 'priceMissing',
+        title: 'Prezzi mancanti',
+        detail: priceMissing.slice(0, 3).join(', '),
+        meaning: 'Mancano prezzi alla valuation date per alcuni strumenti.',
+        action: 'Aggiorna i prezzi o scarica lo storico.',
+        primary: { label: 'Vai a Settings (Aggiorna/Storico)', href: '#/settings' },
+        secondary: { label: 'Apri tab Prezzi', href: '#/data?tab=prices' }
+      });
+    }
+
+    if (fxMissing.length) {
+      pushItem({
+        key: 'fxMissing',
+        title: 'FX mancante',
+        detail: fxMissing.slice(0, 3).join(', '),
+        meaning: 'Mancano tassi FX necessari alla conversione in CHF.',
+        action: 'Importa FX o aggiorna da Apps Script.',
+        primary: { label: 'Vai a Settings (FX)', href: '#/settings' },
+        secondary: { label: 'Apri tab FX', href: '#/data?tab=fx' }
+      });
+    }
+
+    if (priceStale.length) {
+      pushItem({
+        key: 'priceStale',
+        title: 'Prezzi datati',
+        detail: priceStale.slice(0, 3).join(', '),
+        meaning: 'Ultimo prezzo troppo vecchio per una valutazione affidabile.',
+        action: 'Aggiorna i prezzi di oggi.',
+        primary: { label: 'Vai a Settings (Aggiorna)', href: '#/settings' },
+        secondary: { label: 'Apri tab Prezzi', href: '#/data?tab=prices' }
+      });
+    }
+
+    if (fxStale.length) {
+      pushItem({
+        key: 'fxStale',
+        title: 'FX datato',
+        detail: fxStale.slice(0, 3).join(', '),
+        meaning: 'I tassi FX sono vecchi rispetto alla valuation date.',
+        action: 'Aggiorna i tassi FX.',
+        primary: { label: 'Vai a Settings (FX)', href: '#/settings' },
+        secondary: { label: 'Apri tab FX', href: '#/data?tab=fx' }
+      });
+    }
+
+    if (currencyMismatch.length) {
+      pushItem({
+        key: 'currencyMismatch',
+        title: 'Valuta non coerente',
+        detail: currencyMismatch.slice(0, 3).join(', '),
+        meaning: 'La valuta del prezzo non coincide con quella dello strumento.',
+        action: 'Verifica il listing e reimporta i prezzi.',
+        primary: { label: 'Apri tab Prezzi', href: '#/data?tab=prices' },
+        secondary: { label: 'Vai a Settings', href: '#/settings' }
+      });
+    }
+
+    if (gapTickers.length) {
+      pushItem({
+        key: 'priceGaps',
+        title: 'Gap prezzi',
+        detail: gapTickers.slice(0, 3).join(', '),
+        meaning: 'La serie prezzi ha buchi significativi.',
+        action: 'Scarica storico o importa prezzi mancanti.',
+        primary: { label: 'Vai a Settings (Storico)', href: '#/settings' },
+        secondary: { label: 'Apri tab Prezzi', href: '#/data?tab=prices' }
+      });
+    }
+
+    if (fxGapPairs.length) {
+      pushItem({
+        key: 'fxGaps',
+        title: 'Gap FX',
+        detail: fxGapPairs.slice(0, 3).join(', '),
+        meaning: 'La serie FX ha buchi che impattano il NAV.',
+        action: 'Importa FX o aggiorna i tassi.',
+        primary: { label: 'Vai a Settings (FX)', href: '#/settings' },
+        secondary: { label: 'Apri tab FX', href: '#/data?tab=fx' }
+      });
+    }
+
+    return items;
+  }, [rebalanceQuality, priceChecksSummary, fxChecksSummary]);
+
+  const hasTopIssues = topIssues.length > 0;
+  const technicalDetails = useMemo(() => {
+    const rebalanceIssues = rebalanceQuality?.summary.issues || [];
+    const rebalanceCount = rebalanceIssues.length;
+    const priceIssueTotal = priceChecksSummary.reduce((sum, row) => sum + row.issueCount, 0);
+    const fxIssueTotal = fxChecksSummary.reduce((sum, row) => sum + row.issueCount, 0);
+    return {
+      rebalanceCount,
+      priceIssueTotal,
+      fxIssueTotal,
+      missingPriceDays: navChecks?.missingPriceDays ?? 0,
+      backfillTotal: navChecks?.backfillTotal ?? 0,
+      hasData: rebalanceCount > 0 || priceIssueTotal > 0 || fxIssueTotal > 0 || Boolean(navChecks)
+    };
+  }, [rebalanceQuality, priceChecksSummary, fxChecksSummary, navChecks]);
+
+  const getStatusBadge = (issueCount: number, stats: { gaps: number; invalid: number }) => {
+    if (issueCount === 0) return { label: 'OK', className: 'bg-emerald-100 text-emerald-800', title: 'OK: nessun problema rilevato' };
+    if (stats.gaps > 0 || stats.invalid > 0) return { label: 'INCOMPLETO', className: 'bg-amber-100 text-amber-800', title: 'Incompleto: gap o dati invalidi' };
+    return { label: 'PARZIALE', className: 'bg-slate-100 text-slate-700', title: 'Parziale: anomalie non bloccanti' };
+  };
+
   return (
     <div className="space-y-6 pb-20 animate-fade-in text-textPrimary">
       <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-lg">
@@ -637,6 +783,59 @@ export const Data: React.FC = () => {
           />
         </div>
         <p className="text-xs text-slate-500 mt-1">Visibile solo in DEV. Controlla prezzi, FX e qualita dati.</p>
+
+        <div className="mt-4">
+          {hasTopIssues ? (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-3 text-xs text-amber-900">
+              <div className="font-bold text-amber-900">Top 3 problemi</div>
+              {topIssues.map(issue => (
+                <div key={issue.key} className="bg-white/70 border border-amber-100 rounded-lg p-3">
+                  <div className="font-semibold text-amber-900">{issue.title}</div>
+                  <div className="text-amber-800">{issue.detail}</div>
+                  <div className="mt-2 text-amber-900">
+                    <div><span className="font-semibold">Significato:</span> {issue.meaning}</div>
+                    <div><span className="font-semibold">Azione:</span> {issue.action}</div>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <a
+                      href={issue.primary.href}
+                      className="inline-flex items-center gap-2 bg-[#0052a3] text-white px-3 py-1.5 rounded-lg text-[11px] font-bold shadow-sm hover:bg-blue-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                    >
+                      {issue.primary.label}
+                    </a>
+                    {issue.secondary && (
+                      <a
+                        href={issue.secondary.href}
+                        className="inline-flex items-center gap-2 bg-white border border-amber-200 text-amber-800 px-3 py-1.5 rounded-lg text-[11px] font-bold hover:bg-amber-100 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                      >
+                        {issue.secondary.label}
+                      </a>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="inline-flex items-center gap-2 text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-3 py-2 rounded-lg">
+              <span className="material-symbols-outlined text-[16px]">check_circle</span>
+              OK: nessun problema critico rilevato
+            </div>
+          )}
+
+          {technicalDetails.hasData && (
+            <details className="mt-3 text-xs text-slate-600">
+              <summary className="cursor-pointer font-semibold text-slate-700">Dettagli tecnici</summary>
+              <div className="mt-2 bg-slate-50 border border-borderSoft rounded-lg p-3 space-y-1">
+                <div>Issues rebalance: <span className="font-semibold">{technicalDetails.rebalanceCount}</span></div>
+                <div>Issues prezzi: <span className="font-semibold">{technicalDetails.priceIssueTotal}</span></div>
+                <div>Issues FX: <span className="font-semibold">{technicalDetails.fxIssueTotal}</span></div>
+                <div>Missing price days: <span className="font-semibold">{technicalDetails.missingPriceDays}</span></div>
+                <div>Backfill sintetici: <span className="font-semibold">{technicalDetails.backfillTotal}</span></div>
+              </div>
+            </details>
+          )}
+        </div>
+
         <div className="flex gap-2 mt-4">
           {(['prices', 'fx', 'checks'] as TabKey[]).map(key => (
             <button
@@ -1207,49 +1406,77 @@ export const Data: React.FC = () => {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs">
               <div className="font-bold text-slate-500 uppercase mb-2">Price checks</div>
-              <table className="w-full">
-                <thead className="text-[10px] uppercase text-slate-400">
-                  <tr>
-                    <th className="text-left py-1">Ticker</th>
-                    <th className="text-right py-1">Issues</th>
-                    <th className="text-right py-1">Gaps</th>
-                    <th className="text-right py-1">Outliers</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {priceChecksSummary.slice(0, 20).map(row => (
-                    <tr key={row.ticker}>
-                      <td className="py-1">{row.ticker}</td>
-                      <td className="py-1 text-right">{row.issueCount}</td>
-                      <td className="py-1 text-right">{row.stats.gaps}</td>
-                      <td className="py-1 text-right">{row.stats.outliers}</td>
+              <div className="max-h-64 overflow-auto">
+                <table className="w-full">
+                  <thead className="text-[10px] uppercase text-slate-400 sticky top-0 bg-slate-50">
+                    <tr>
+                      <th className="text-left py-1">Ticker</th>
+                      <th className="text-right py-1">Issues</th>
+                      <th className="text-right py-1">Gaps</th>
+                      <th className="text-right py-1">Outliers</th>
+                      <th className="text-right py-1">Status</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {priceChecksSummary.slice(0, 20).map(row => {
+                      const status = getStatusBadge(row.issueCount, row.stats);
+                      return (
+                        <tr key={row.ticker}>
+                          <td className="py-1">{row.ticker}</td>
+                          <td className="py-1 text-right">{row.issueCount}</td>
+                          <td className="py-1 text-right">{row.stats.gaps}</td>
+                          <td className="py-1 text-right">{row.stats.outliers}</td>
+                          <td className="py-1 text-right">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${status.className}`}
+                              title={status.title}
+                            >
+                              {status.label}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
             <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs">
               <div className="font-bold text-slate-500 uppercase mb-2">FX checks</div>
-              <table className="w-full">
-                <thead className="text-[10px] uppercase text-slate-400">
-                  <tr>
-                    <th className="text-left py-1">Pair</th>
-                    <th className="text-right py-1">Issues</th>
-                    <th className="text-right py-1">Gaps</th>
-                    <th className="text-right py-1">Outliers</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {fxChecksSummary.slice(0, 20).map(row => (
-                    <tr key={row.pair}>
-                      <td className="py-1">{row.pair}</td>
-                      <td className="py-1 text-right">{row.issueCount}</td>
-                      <td className="py-1 text-right">{row.stats.gaps}</td>
-                      <td className="py-1 text-right">{row.stats.outliers}</td>
+              <div className="max-h-64 overflow-auto">
+                <table className="w-full">
+                  <thead className="text-[10px] uppercase text-slate-400 sticky top-0 bg-slate-50">
+                    <tr>
+                      <th className="text-left py-1">Pair</th>
+                      <th className="text-right py-1">Issues</th>
+                      <th className="text-right py-1">Gaps</th>
+                      <th className="text-right py-1">Outliers</th>
+                      <th className="text-right py-1">Status</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {fxChecksSummary.slice(0, 20).map(row => {
+                      const status = getStatusBadge(row.issueCount, row.stats);
+                      return (
+                        <tr key={row.pair}>
+                          <td className="py-1">{row.pair}</td>
+                          <td className="py-1 text-right">{row.issueCount}</td>
+                          <td className="py-1 text-right">{row.stats.gaps}</td>
+                          <td className="py-1 text-right">{row.stats.outliers}</td>
+                          <td className="py-1 text-right">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${status.className}`}
+                              title={status.title}
+                            >
+                              {status.label}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>
