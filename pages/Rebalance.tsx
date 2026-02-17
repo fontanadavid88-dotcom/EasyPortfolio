@@ -195,6 +195,50 @@ export const Rebalance: React.FC = () => {
 
     const isRebalanceBlocked = unvaluedTickers.length > 0;
 
+    const issueHighlights = useMemo(() => {
+        const issues = rebalanceQuality?.issues || [];
+        const priceMissing = Array.from(new Set(
+            issues.filter(i => i.type === 'priceMissing').map(i => i.priceTicker || i.ticker)
+        )).slice(0, 3);
+        const priceStaleIssues = issues.filter(i => i.type === 'priceStale');
+        const priceStaleTickers = Array.from(new Set(priceStaleIssues.map(i => i.priceTicker || i.ticker))).slice(0, 3);
+        const oldestPriceDate = priceStaleIssues
+            .map(i => i.priceDate)
+            .filter(Boolean)
+            .sort()
+            .shift();
+        const fxIssues = issues.filter(i => i.type === 'fxMissing' || i.type === 'fxStale');
+        const fxPairs = Array.from(new Set(
+            fxIssues.map(i => `${i.fxBase || 'FX'}→${i.fxQuote || 'CHF'}`)
+        )).slice(0, 3);
+        const fxOldestDate = fxIssues
+            .map(i => i.fxDate)
+            .filter(Boolean)
+            .sort()
+            .shift();
+
+        const items = [];
+        if (priceMissing.length) {
+            items.push({
+                title: 'Prezzo mancante',
+                detail: `Ticker: ${priceMissing.join(', ')}`
+            });
+        }
+        if (fxPairs.length) {
+            items.push({
+                title: 'FX mancante/stale',
+                detail: `${fxPairs.join(', ')}${fxOldestDate ? ` · ultimo ${fxOldestDate}` : ''}`
+            });
+        }
+        if (priceStaleTickers.length) {
+            items.push({
+                title: 'Copertura insufficiente',
+                detail: `${priceStaleTickers.join(', ')}${oldestPriceDate ? ` · ultimo prezzo ${oldestPriceDate}` : ''}`
+            });
+        }
+        return items.slice(0, 3);
+    }, [rebalanceQuality]);
+
     // 3. Group by Macro and calculate deviations for visualization
     const groupedPlan = useMemo(() => {
         if (!rebalancingPlan || !instruments) return {};
@@ -521,12 +565,32 @@ export const Rebalance: React.FC = () => {
                     <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800 flex flex-col gap-2">
                         <div className="font-bold">Alcuni strumenti hanno dati incompleti. Il rebalance e limitato.</div>
                         <div>Ticker senza valutazione: {unvaluedTickers.join(', ')}</div>
+                        {issueHighlights.length > 0 && (
+                            <div className="mt-1 space-y-1">
+                                {issueHighlights.map((item, idx) => (
+                                    <div key={`${item.title}-${idx}`} className="flex items-start gap-2">
+                                        <span className="mt-0.5 h-1.5 w-1.5 rounded-full bg-amber-600" />
+                                        <div>
+                                            <div className="font-semibold">{item.title}</div>
+                                            <div className="text-amber-700">{item.detail}</div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                         <div>
                             <a
                                 href="#/data?tab=checks"
-                                className="inline-flex items-center gap-1 text-amber-700 font-bold hover:underline"
+                                className="inline-flex items-center gap-1 text-amber-700 font-bold hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
                             >
                                 Vai a Data Inspector
+                            </a>
+                            <span className="mx-2 text-amber-600">·</span>
+                            <a
+                                href="#/settings"
+                                className="inline-flex items-center gap-1 text-amber-700 font-bold hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                            >
+                                Vai a Settings → Sync/FX
                             </a>
                         </div>
                     </div>
