@@ -5,7 +5,7 @@ import { AssetType, Currency, Instrument, PricePoint, Transaction, TransactionTy
 import case1 from '../__fixtures__/case1_single_asset.json';
 import case3 from '../__fixtures__/case3_missing_price.json';
 
-const instr: Instrument = { id: 'inst-test', ticker: 'TEST', symbol: 'TEST', name: 'Test', type: AssetType.Stock, currency: Currency.USD };
+const instr: Instrument = { id: 1, ticker: 'TEST', symbol: 'TEST', name: 'Test', type: AssetType.Stock, currency: Currency.USD };
 
 describe('financeUtils daily series', () => {
   it('forward-fills missing prices between trading days', () => {

@@ -39,6 +39,7 @@ export enum TransactionType {
 export interface Instrument {
   id?: number;
   portfolioId?: string;
+  symbol?: string;
   ticker: string; // E.g., 'AAPL.US'
   name: string;
   type: AssetType;
@@ -74,6 +75,7 @@ export interface PriceTickerConfig {
 export interface Transaction {
   id?: number;
   portfolioId?: string;
+  instrumentId?: string;
   date: Date;
   instrumentTicker?: string; // Null for pure Cash deposit/withdrawal
   type: TransactionType;
@@ -113,6 +115,8 @@ export interface AppSettings {
   baseCurrency: Currency;
   eodhdApiKey: string;
   googleSheetUrl: string;
+  appsScriptUrl?: string;
+  appsScriptApiKey?: string;
   portfolioId?: string;
   minHistoryDate?: string;
   priceBackfillScope?: 'current' | 'all';
