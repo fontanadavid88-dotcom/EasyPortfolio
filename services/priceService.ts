@@ -1,14 +1,47 @@
-import { db, getCurrentPortfolioId } from '../db';
+﻿import { db, getCurrentPortfolioId } from '../db';
 import { AppSettings, AssetType, Currency, Instrument, PricePoint, PriceProviderType, PriceTickerConfig, TransactionType } from '../types';
-import { format, subDays, addDays, differenceInCalendarDays } from 'date-fns';
+import { format, subDays, addDays } from 'date-fns';
 import Dexie from 'dexie';
 import { isValidEodhdSymbol, resolveEodhdSymbol } from './symbolUtils';
+import { fetchJsonWithDiagnostics, FetchJsonDiagnostics, toNum } from './diagnostics';
+import { applyAssetsMapToSettings, buildAssetsMapIndex, fetchAssetsMap, getPriceFromAssetsMap, AppsScriptAssetRow } from './appsScriptService';
+import { addDaysYmd, diffDaysYmd, subDaysYmd } from './dateUtils';
+import { COVERAGE_TOLERANCE_DAYS } from './constants';
 
 const EODHD_PROXY_ENDPOINT = '/api/eodhd-proxy';
+const EODHD_DIRECT_BASE = 'https://eodhd.com';
 const PROXY_ERROR_MESSAGE = 'Impossibile raggiungere proxy API';
 const DEFAULT_PROVIDER: PriceProviderType = 'EODHD';
 const EODHD_SYNC_DELAY_MS = 250;
+const EODHD_BACKFILL_MAX_DAYS = 90;
+const EODHD_MAX_REQUESTS_PER_SESSION = 20;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+let eodhdRequestsUsed = 0;
+let eodhdQueue: Promise<void> = Promise.resolve();
+let eodhdProxyAvailable: boolean | null = null;
+
+const isProxyMissingResponse = (diag: FetchJsonDiagnostics): boolean => {
+  if (diag.httpStatus !== 404) return false;
+  const ct = (diag.contentType || '').toLowerCase();
+  if (ct.includes('text/html')) return true;
+  const preview = (diag.rawPreview || '').trim().toLowerCase();
+  return preview.startsWith('<!doctype html') || preview.startsWith('<html') || preview.includes('cannot get') || preview.includes('not found');
+};
+
+const enqueueEodhdRequest = async <T>(fn: () => Promise<T>): Promise<T> => {
+  if (eodhdRequestsUsed >= EODHD_MAX_REQUESTS_PER_SESSION) {
+    throw new Error('EODHD_LIMIT_REACHED');
+  }
+  eodhdRequestsUsed += 1;
+  const task = eodhdQueue.then(async () => {
+    const result = await fn();
+    await sleep(EODHD_SYNC_DELAY_MS);
+    return result;
+  });
+  eodhdQueue = task.then(() => undefined, () => undefined);
+  return task;
+};
 
 const buildEodhdHeaders = (apiKey?: string) => {
   const trimmed = apiKey?.trim();
@@ -23,52 +56,116 @@ const buildEodhdProxyUrl = (path: string, params: Record<string, string>) => {
   return `${EODHD_PROXY_ENDPOINT}?${search.toString()}`;
 };
 
-export const toNum = (value: unknown): number | null => {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  let normalized = trimmed.replace(/\s+/g, '');
-  if (normalized.includes(',') && !normalized.includes('.')) {
-    normalized = normalized.replace(',', '.');
-  } else {
-    normalized = normalized.replace(/,/g, '');
-  }
-  const parsed = Number.parseFloat(normalized);
-  return Number.isFinite(parsed) ? parsed : null;
+const buildEodhdDirectUrl = (path: string, params: Record<string, string>, apiKey?: string) => {
+  const url = new URL(`${EODHD_DIRECT_BASE}${path}`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value) url.searchParams.append(key, value);
+  });
+  if (apiKey) url.searchParams.set('api_token', apiKey);
+  return url.toString();
 };
 
-export type FetchJsonDiagnostics = {
+class EodhdError extends Error {
   httpStatus: number;
-  ok: boolean;
   contentType?: string;
-  rawPreview: string;
-  parseError?: string;
-  json?: unknown;
+  rawPreview?: string;
+
+  constructor(message: string, diag: FetchJsonDiagnostics) {
+    super(message);
+    this.name = 'EodhdError';
+    this.httpStatus = diag.httpStatus;
+    this.contentType = diag.contentType;
+    this.rawPreview = diag.rawPreview;
+  }
+}
+
+const isEodhdError = (value: unknown): value is EodhdError => {
+  return value instanceof EodhdError;
 };
 
-export const fetchJsonWithDiagnostics = async (
-  url: string,
-  options?: RequestInit
-): Promise<FetchJsonDiagnostics> => {
-  const res = await fetch(url, options);
-  const raw = await res.text();
-  const rawPreview = raw.slice(0, 500);
-  let json: unknown = undefined;
-  let parseError: string | undefined;
-  try {
-    json = raw ? JSON.parse(raw) : null;
-  } catch (err) {
-    parseError = err instanceof Error ? err.message : String(err);
-  }
-  return {
-    httpStatus: res.status,
-    ok: res.ok,
-    contentType: res.headers.get('content-type') || undefined,
-    rawPreview,
-    parseError,
-    json
+type EodhdFetchMode = 'proxy' | 'direct';
+
+type EodhdFetchResult = {
+  diag: FetchJsonDiagnostics;
+  url: string;
+  mode: EodhdFetchMode;
+  proxyMissing?: boolean;
+};
+
+const fetchEodhdJson = async (
+  path: string,
+  params: Record<string, string>,
+  apiKey?: string,
+  options?: { signal?: AbortSignal; useQueue?: boolean }
+): Promise<EodhdFetchResult> => {
+  const trimmedKey = apiKey?.trim() || '';
+  const run = async (): Promise<EodhdFetchResult> => {
+    if (eodhdProxyAvailable !== false) {
+      const proxyUrl = buildEodhdProxyUrl(path, params);
+      const headers = buildEodhdHeaders(trimmedKey);
+      const diag = await fetchJsonWithDiagnostics(proxyUrl, headers ? { headers, signal: options?.signal } : { signal: options?.signal });
+      if (!diag.ok && isProxyMissingResponse(diag)) {
+        eodhdProxyAvailable = false;
+        if (trimmedKey) {
+          const directUrl = buildEodhdDirectUrl(path, params, trimmedKey);
+          const directDiag = await fetchJsonWithDiagnostics(directUrl, { signal: options?.signal });
+          return { diag: directDiag, url: directUrl, mode: 'direct', proxyMissing: true };
+        }
+        return { diag, url: proxyUrl, mode: 'proxy', proxyMissing: true };
+      }
+      if (diag.ok) eodhdProxyAvailable = true;
+      return { diag, url: proxyUrl, mode: 'proxy' };
+    }
+    const directUrl = buildEodhdDirectUrl(path, params, trimmedKey);
+    const diag = await fetchJsonWithDiagnostics(directUrl, { signal: options?.signal });
+    return { diag, url: directUrl, mode: 'direct' };
   };
+
+  if (options?.useQueue === false) return run();
+  return enqueueEodhdRequest(run);
+};
+
+export type EodhdQuotaInfo = {
+  dailyRateLimit?: number;
+  apiRequests?: number;
+  requestsPerMinute?: number;
+  requestsPerDay?: number;
+  remaining?: number;
+};
+
+export const getEodhdQuotaInfo = async (
+  settings: AppSettings
+): Promise<{ ok: true; info: EodhdQuotaInfo; diag: FetchJsonDiagnostics } | { ok: false; error: string; diag: FetchJsonDiagnostics }> => {
+  const result = await fetchEodhdJson('/api/user', { fmt: 'json' }, settings.eodhdApiKey, { useQueue: false });
+  const diag = result.diag;
+  if (!diag.ok && result.proxyMissing) {
+    return { ok: false, error: PROXY_ERROR_MESSAGE, diag };
+  }
+  if (diag.httpStatus === 402) {
+    return { ok: false, error: 'Quota esaurita / piano non sufficiente', diag };
+  }
+  if (!diag.ok) {
+    return { ok: false, error: `HTTP ${diag.httpStatus}`, diag };
+  }
+  if (!diag.json || Array.isArray(diag.json) || typeof diag.json !== 'object') {
+    return { ok: false, error: 'Risposta non valida', diag };
+  }
+  const obj = diag.json as Record<string, unknown>;
+  const dailyRateLimit = toNum(obj.dailyRateLimit ?? obj.daily_rate_limit ?? obj.rateLimit ?? obj.rate_limit);
+  const apiRequests = toNum(obj.apiRequests ?? obj.api_requests ?? obj.requests ?? obj.api_usage);
+  const requestsPerMinute = toNum(obj.requestsPerMinute ?? obj.requests_per_minute);
+  const requestsPerDay = toNum(obj.requestsPerDay ?? obj.requests_per_day);
+  const remaining = dailyRateLimit !== null && apiRequests !== null ? dailyRateLimit - apiRequests : null;
+  const info: EodhdQuotaInfo = {};
+  if (dailyRateLimit !== null) info.dailyRateLimit = dailyRateLimit;
+  if (apiRequests !== null) info.apiRequests = apiRequests;
+  if (requestsPerMinute !== null) info.requestsPerMinute = requestsPerMinute;
+  if (requestsPerDay !== null) info.requestsPerDay = requestsPerDay;
+  if (remaining !== null) info.remaining = remaining;
+  if (Object.keys(info).length === 0) {
+    return { ok: false, error: 'Risposta non valida', diag };
+  }
+  return { ok: true, info, diag };
 };
 
 interface PriceProvider {
@@ -80,27 +177,42 @@ export interface CoverageRow {
   ticker: string;
   isin?: string | null;
   name?: string | null;
-  instrumentId?: string | number;
+  instrumentId?: string;
   from: string;
   to: string;
   status: 'OK' | 'INCOMPLETO' | 'PARZIALE';
 }
 
 export type SyncPricesSummary = {
-  status: 'ok' | 'partial' | 'failed';
+  status: 'ok' | 'partial' | 'error' | 'quota_exhausted';
   updatedTickers: string[];
   failedTickers: { ticker: string; reason: string }[];
   sheet: { enabled: boolean; reason?: string };
+  message?: string;
+  quota?: { ticker: string; httpStatus: number; contentType?: string; rawPreview?: string };
+};
+
+export type BackfillMode = 'MANUAL_FULL' | 'AUTO_GAPS';
+
+export type BackfillOptions = {
+  mode?: BackfillMode;
+  maxApiCallsPerRun?: number;
+  maxLookbackDays?: number;
+  staleThresholdDays?: number;
+  sleepMs?: number;
+  portfolioScope?: 'current' | 'allPortfolios';
+  maxDailyCalls?: number;
 };
 
 const resolveInstrumentForTicker = (instruments: Instrument[], ticker: string): Instrument | undefined => {
   return instruments.find(i => i.preferredListing?.symbol === ticker)
+    || instruments.find(i => i.symbol === ticker)
     || instruments.find(i => i.ticker === ticker)
     || instruments.find(i => i.listings?.some(l => l.symbol === ticker));
 };
 
 const getCanonicalTickerFromInstrument = (instrument: Instrument): string => {
-  return instrument.preferredListing?.symbol || instrument.ticker;
+  return instrument.preferredListing?.symbol || instrument.symbol || instrument.ticker;
 };
 
 export const getTickerConfig = (settings: AppSettings | null | undefined, ticker: string): PriceTickerConfig => {
@@ -139,11 +251,81 @@ export const getResolvedSymbol = (
   return isValidEodhdSymbol(resolved, assetType) ? resolved : null;
 };
 
+export const resolveCoverageStartDate = (minHistoryDate: string, firstTransactionDate?: string): string => {
+  if (!firstTransactionDate) return minHistoryDate;
+  return firstTransactionDate > minHistoryDate ? firstTransactionDate : minHistoryDate;
+};
+
+export const resolveSyncStartDate = (
+  earliestDateNeeded: string,
+  minPriceDate?: string,
+  maxPriceDate?: string
+): string => {
+  if (minPriceDate && minPriceDate > earliestDateNeeded) return earliestDateNeeded;
+  if (maxPriceDate) return addDaysYmd(maxPriceDate, 1);
+  return earliestDateNeeded;
+};
+
+export const buildPointsForSave = (
+  points: PricePoint[],
+  params: { ticker: string; instrumentId?: string; currency?: Currency; portfolioId: string }
+): PricePoint[] => {
+  return points.map(p => ({
+    ...p,
+    ticker: params.ticker,
+    instrumentId: params.instrumentId,
+    currency: (params.currency || p.currency) as any,
+    portfolioId: params.portfolioId
+  }));
+};
+
+export const resolveBackfillSymbol = (
+  ticker: string,
+  cfg: PriceTickerConfig,
+  assetType?: AssetType
+): string => {
+  const raw = cfg.eodhdSymbol?.trim() || ticker;
+  return resolveEodhdSymbol(raw, assetType);
+};
+
+export const isAutoGapCandidate = (
+  lastDate: string | undefined,
+  today: string,
+  staleThresholdDays: number
+): boolean => {
+  if (!lastDate) return true;
+  const cutoff = subDaysYmd(today, staleThresholdDays);
+  return lastDate <= cutoff;
+};
+
+export const computeAutoGapRange = (
+  lastDate: string | undefined,
+  today: string,
+  maxLookbackDays: number
+): { from: string; to: string } => {
+  const minFrom = subDaysYmd(today, maxLookbackDays);
+  if (!lastDate) return { from: minFrom, to: today };
+  const nextDay = addDaysYmd(lastDate, 1);
+  return { from: nextDay < minFrom ? minFrom : nextDay, to: today };
+};
+
+export const limitTickersByBudget = (
+  tickers: string[],
+  maxApiCallsPerRun?: number,
+  maxDailyCalls?: number,
+  dailyUsed = 0
+): { tickers: string[]; stoppedByBudget: boolean } => {
+  const runLimit = maxApiCallsPerRun !== undefined ? Math.max(0, maxApiCallsPerRun) : tickers.length;
+  const dailyLimit = maxDailyCalls !== undefined ? Math.max(0, maxDailyCalls - dailyUsed) : tickers.length;
+  const cap = Math.min(runLimit, dailyLimit);
+  return { tickers: tickers.slice(0, cap), stoppedByBudget: tickers.length > cap };
+};
+
 export const buildCoverageRows = (
   tickers: string[],
   ranges: Record<string, { firstDate?: string; lastDate?: string }>,
   instruments: Instrument[],
-  minHistoryDate: string,
+  startTargetDate: string,
   today: string
 ): CoverageRow[] => {
   return tickers.map((rawTicker) => {
@@ -152,10 +334,10 @@ export const buildCoverageRows = (
     const from = range.firstDate || 'N/D';
     const to = range.lastDate || 'N/D';
     const okStart = range.firstDate
-      ? differenceInCalendarDays(new Date(range.firstDate), new Date(minHistoryDate)) <= 7
+      ? diffDaysYmd(range.firstDate, startTargetDate) <= COVERAGE_TOLERANCE_DAYS
       : false;
     const okEnd = range.lastDate
-      ? differenceInCalendarDays(new Date(today), new Date(range.lastDate)) <= 7
+      ? diffDaysYmd(today, range.lastDate) <= COVERAGE_TOLERANCE_DAYS
       : false;
     const status: CoverageRow['status'] = okStart && okEnd ? 'OK' : okStart || okEnd ? 'PARZIALE' : 'INCOMPLETO';
     const instrument = rawTicker ? resolveInstrumentForTicker(instruments, rawTicker) : undefined;
@@ -164,7 +346,7 @@ export const buildCoverageRows = (
       ticker,
       isin: instrument?.isin ?? null,
       name: instrument?.name ?? null,
-      instrumentId: instrument?.id,
+      instrumentId: instrument?.id ? String(instrument.id) : undefined,
       from,
       to,
       status
@@ -183,15 +365,18 @@ class EodhdPriceProvider implements PriceProvider {
   async getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null> {
     try {
       // For real implementation, use EODHD real-time or EOD endpoint
-      const headers = buildEodhdHeaders(this.apiKey);
-      const url = buildEodhdProxyUrl(`/api/real-time/${encodeURIComponent(ticker)}`, { fmt: 'json' });
-      const diag = await fetchJsonWithDiagnostics(url, headers ? { headers } : undefined);
+      const result = await fetchEodhdJson(`/api/real-time/${encodeURIComponent(ticker)}`, { fmt: 'json' }, this.apiKey);
+      const diag = result.diag;
+      if (!diag.ok && result.proxyMissing) {
+        throw new Error(PROXY_ERROR_MESSAGE);
+      }
       if (!diag.ok) {
+        if (diag.httpStatus === 402) throw new EodhdError('quota_exhausted', diag);
         if (diag.httpStatus >= 500) throw new Error(PROXY_ERROR_MESSAGE);
-        throw new Error(`EODHD ${diag.httpStatus}`);
+        throw new EodhdError(`EODHD ${diag.httpStatus}`, diag);
       }
       if (!diag.json || typeof diag.json !== 'object') {
-        throw new Error('invalid_payload');
+        throw new EodhdError('invalid_payload', diag);
       }
       const data = diag.json as Record<string, unknown>;
       const rawClose = data?.adjusted_close ?? data?.close;
@@ -205,6 +390,7 @@ class EodhdPriceProvider implements PriceProvider {
       };
     } catch (e: any) {
       if (e?.message === PROXY_ERROR_MESSAGE) throw e;
+      if (e?.message === 'EODHD_LIMIT_REACHED') throw e;
       if (e instanceof TypeError) throw new Error(PROXY_ERROR_MESSAGE);
       console.error('EODHD Latest Error', e);
       return null;
@@ -213,15 +399,19 @@ class EodhdPriceProvider implements PriceProvider {
 
   async getHistory(ticker: string, from: string, to: string): Promise<PricePoint[]> {
     try {
-      const url = buildEodhdProxyUrl(`/api/eod/${encodeURIComponent(ticker)}`, { from, to, fmt: 'json' });
-      const headers = buildEodhdHeaders(this.apiKey);
-      const diag = await fetchJsonWithDiagnostics(url, headers ? { headers } : undefined);
+      const result = await fetchEodhdJson(`/api/eod/${encodeURIComponent(ticker)}`, { from, to, fmt: 'json' }, this.apiKey);
+      const diag = result.diag;
+      const url = result.url;
+      if (!diag.ok && result.proxyMissing) {
+        throw new Error(PROXY_ERROR_MESSAGE);
+      }
       if (!diag.ok) {
+        if (diag.httpStatus === 402) throw new EodhdError('quota_exhausted', diag);
         if (diag.httpStatus === 404) {
           console.warn('[EODHD] 404', { ticker, symbol: ticker, url });
         }
         if (diag.httpStatus >= 500) throw new Error(PROXY_ERROR_MESSAGE);
-        throw new Error(`EODHD ${diag.httpStatus}`);
+        throw new EodhdError(`EODHD ${diag.httpStatus}`, diag);
       }
       if (!Array.isArray(diag.json)) {
         if (import.meta.env?.DEV) {
@@ -234,12 +424,13 @@ class EodhdPriceProvider implements PriceProvider {
             rawPreview: diag.rawPreview
           });
         }
-        throw new Error(`invalid_payload http=${diag.httpStatus} ct=${diag.contentType || 'n/a'}`);
+        throw new EodhdError(`invalid_payload http=${diag.httpStatus} ct=${diag.contentType || 'n/a'}`, diag);
       }
 
       return mapEodhdHistoryRows(ticker, diag.json);
     } catch (e: any) {
       if (e?.message === PROXY_ERROR_MESSAGE) throw e;
+      if (e?.message === 'EODHD_LIMIT_REACHED') throw e;
       if (e instanceof TypeError) throw new Error(PROXY_ERROR_MESSAGE);
       if (String(e?.message || '').includes('invalid_payload')) throw e;
       console.error('EODHD History Error', e);
@@ -443,17 +634,22 @@ class GoogleSheetsPriceProvider implements PriceProvider {
 }
 
 // 3. Orchestrator
-export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSummary> => {
+export const syncPrices = async (
+  apiKeyOverride?: string,
+  options?: { portfolioId?: string; mode?: 'FULL' | 'LATEST' }
+): Promise<SyncPricesSummary> => {
   const summary: SyncPricesSummary = {
     status: 'ok',
     updatedTickers: [],
     failedTickers: [],
     sheet: { enabled: true }
   };
-  const portfolioId = getCurrentPortfolioId();
-  const settings = await db.settings.where('portfolioId').equals(portfolioId).first();
+  const portfolioId = options?.portfolioId || getCurrentPortfolioId();
+  const mode = options?.mode || 'FULL';
+  const latestOnly = mode === 'LATEST';
+  let settings = await db.settings.where('portfolioId').equals(portfolioId).first();
   if (!settings) {
-    summary.status = 'failed';
+    summary.status = 'error';
     summary.failedTickers.push({ ticker: '*', reason: 'Impostazioni mancanti' });
     summary.sheet = { enabled: false, reason: 'Impostazioni mancanti' };
     return summary;
@@ -463,6 +659,27 @@ export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSum
   const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey;
   const eodhd = new EodhdPriceProvider(eodhdKey);
   const sheet = new GoogleSheetsPriceProvider(settings.googleSheetUrl);
+  const appsScriptEnabled = Boolean(settings.appsScriptUrl?.trim() && settings.appsScriptApiKey?.trim());
+  let appsScriptIndex = new Map<string, AppsScriptAssetRow>();
+  let appsScriptError: string | null = null;
+
+  if (appsScriptEnabled) {
+    try {
+      const assetsResult = await fetchAssetsMap(settings);
+      if (assetsResult.ok) {
+        appsScriptIndex = buildAssetsMapIndex(assetsResult.data);
+        const updated = applyAssetsMapToSettings(settings, assetsResult.data);
+        if (updated.changed) {
+          await db.settings.put({ ...updated.settings, id: settings.id, portfolioId });
+          settings = updated.settings;
+        }
+      } else {
+        appsScriptError = assetsResult.error;
+      }
+    } catch (e: any) {
+      appsScriptError = e?.message || 'Apps Script non disponibile';
+    }
+  }
   let sheetResult: SheetFetchResult = { rows: [] };
   try {
     sheetResult = await sheet.getSheetRows();
@@ -474,6 +691,7 @@ export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSum
   }
 
   const today = format(new Date(), 'yyyy-MM-dd');
+  const eodhdLimitFrom = format(subDays(new Date(), EODHD_BACKFILL_MAX_DAYS), 'yyyy-MM-dd');
   const allTx = await db.transactions.where('portfolioId').equals(portfolioId).sortBy('date');
   const earliestDateNeeded = allTx.length > 0
     ? format(subDays(allTx[0].date, 7), 'yyyy-MM-dd')
@@ -483,49 +701,84 @@ export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSum
   for (const instr of instruments) {
     if (instr.type === 'Cash') continue;
     const priceTicker = getCanonicalTickerFromInstrument(instr);
-      const priceCurrency = instr.preferredListing?.currency || instr.currency;
-      const tickerConfig = resolvePriceSyncConfig(priceTicker, settings);
-      if (tickerConfig.excluded || tickerConfig.provider === 'MANUAL' || tickerConfig.needsMapping) continue;
-      const resolvedSymbol = getResolvedSymbol(priceTicker, settings, tickerConfig.provider, instr.type);
-      if (tickerConfig.provider === 'EODHD' && !resolvedSymbol) {
-        if (!failedSet.has(priceTicker)) {
-          summary.failedTickers.push({ ticker: priceTicker, reason: 'Symbol EODHD non valido' });
-          failedSet.add(priceTicker);
-        }
-        continue;
+    const priceCurrency = instr.preferredListing?.currency || instr.currency;
+    const tickerConfig = resolvePriceSyncConfig(priceTicker, settings);
+    if (latestOnly && tickerConfig.provider !== 'SHEETS') continue;
+    if (tickerConfig.excluded || tickerConfig.provider === 'MANUAL' || tickerConfig.needsMapping) continue;
+    const resolvedSymbol = tickerConfig.provider === 'EODHD'
+      ? getResolvedSymbol(priceTicker, settings, 'EODHD', instr.type)
+      : null;
+    if (import.meta.env?.DEV) {
+      const lookupKey = tickerConfig.provider === 'SHEETS'
+        ? (tickerConfig.sheetSymbol || priceTicker)
+        : (resolvedSymbol || tickerConfig.eodhdSymbol || priceTicker);
+      console.log('[price-sync]', { ticker: priceTicker, provider: tickerConfig.provider, lookupKey });
+    }
+    if (tickerConfig.provider === 'EODHD' && !resolvedSymbol) {
+      if (!failedSet.has(priceTicker)) {
+        summary.failedTickers.push({ ticker: priceTicker, reason: 'Symbol EODHD non valido' });
+        failedSet.add(priceTicker);
       }
+      continue;
+    }
 
-    const existing = await db.prices
-      .where('[ticker+date]')
-      .between([priceTicker, Dexie.minKey], [priceTicker, Dexie.maxKey])
-      .and(p => p.portfolioId === portfolioId)
-      .sortBy('date');
+    const existing = instr.id
+      ? await db.prices
+        .where('[instrumentId+date]')
+        .between([String(instr.id), Dexie.minKey], [String(instr.id), Dexie.maxKey])
+        .and(p => p.portfolioId === portfolioId)
+        .sortBy('date')
+      : await db.prices
+        .where('[ticker+date]')
+        .between([priceTicker, Dexie.minKey], [priceTicker, Dexie.maxKey])
+        .and(p => p.portfolioId === portfolioId)
+        .sortBy('date');
 
     const minPriceDate = existing[0]?.date;
     const maxPriceDate = existing[existing.length - 1]?.date;
 
-    let startDate = earliestDateNeeded;
-    if (minPriceDate && minPriceDate > earliestDateNeeded) {
-      startDate = earliestDateNeeded;
-    } else if (maxPriceDate) {
-      startDate = format(new Date(maxPriceDate), 'yyyy-MM-dd');
-    }
+    const startDate = resolveSyncStartDate(earliestDateNeeded, minPriceDate, maxPriceDate);
 
-    if (startDate === today) continue;
+    if (tickerConfig.provider === 'EODHD' && startDate >= today) continue;
 
     let newPoints: PricePoint[] = [];
     let eodhdError = '';
+    let sheetError = '';
     let didEodhdRequest = false;
 
-      if (tickerConfig.provider === 'EODHD') {
-        try {
-          didEodhdRequest = true;
-          if (!resolvedSymbol) throw new Error('Symbol EODHD non valido');
-          newPoints = await eodhd.getHistory(resolvedSymbol, startDate, today);
-        } catch (e: any) {
-          eodhdError = e?.message || 'Errore EODHD';
-          if (String(eodhdError).includes('404')) {
-            const url = buildEodhdProxyUrl(`/api/eod/${encodeURIComponent(tickerConfig.eodhdSymbol)}`, { from: startDate, to: today, fmt: 'json' });
+    if (tickerConfig.provider === 'EODHD') {
+      try {
+        didEodhdRequest = true;
+        if (!resolvedSymbol) throw new Error('Symbol EODHD non valido');
+        const effectiveStart = startDate < eodhdLimitFrom ? eodhdLimitFrom : startDate;
+        if (effectiveStart !== today) {
+          newPoints = await eodhd.getHistory(resolvedSymbol, effectiveStart, today);
+        }
+      } catch (e: any) {
+        if (e?.message === 'EODHD_LIMIT_REACHED') {
+          summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
+          summary.message = 'Limite EODHD sessione raggiunto (20 richieste).';
+          break;
+        }
+        if (isEodhdError(e) && e.httpStatus === 402) {
+          summary.status = 'quota_exhausted';
+          summary.message = 'Quota EODHD esaurita (402). Sync interrotta.';
+          summary.quota = {
+            ticker: priceTicker,
+            httpStatus: e.httpStatus,
+            contentType: e.contentType,
+            rawPreview: e.rawPreview
+          };
+          break;
+        }
+        eodhdError = e?.message || 'Errore EODHD';
+        if (eodhdError === PROXY_ERROR_MESSAGE) {
+          summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
+          summary.message = PROXY_ERROR_MESSAGE;
+          break;
+        }
+        if (String(eodhdError).includes('404')) {
+          const url = buildEodhdProxyUrl(`/api/eod/${encodeURIComponent(tickerConfig.eodhdSymbol)}`, { from: startDate, to: today, fmt: 'json' });
           console.warn('[EODHD] 404', { ticker: priceTicker, symbol: resolvedSymbol, url });
         }
         if (!failedSet.has(priceTicker)) {
@@ -536,32 +789,71 @@ export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSum
     }
 
     if (newPoints.length === 0) {
-      if (tickerConfig.provider === 'SHEETS' || (!eodhdError && summary.sheet.enabled)) {
+      if (tickerConfig.provider === 'SHEETS') {
+        if (appsScriptEnabled && appsScriptIndex.size > 0) {
+          const mapped = getPriceFromAssetsMap(appsScriptIndex, priceTicker);
+          if (mapped) {
+            newPoints.push({
+              ticker: priceTicker,
+              date: mapped.date || today,
+              close: mapped.close,
+              currency: priceCurrency || mapped.currency
+            });
+          } else {
+            const row = appsScriptIndex.get(priceTicker);
+            sheetError = row ? 'Apps Script: prezzo non valido' : 'Apps Script: ticker non trovato';
+          }
+        } else if (appsScriptEnabled) {
+          sheetError = appsScriptError ? `Apps Script: ${appsScriptError}` : 'Apps Script: nessun dato';
+        } else {
+          sheetError = 'Apps Script non configurato';
+        }
+
+        if (newPoints.length === 0 && summary.sheet.enabled) {
+          const latest = await sheet.getLatestPrice(tickerConfig.sheetSymbol);
+          if (latest && latest.close) {
+            newPoints.push({
+              ticker: priceTicker,
+              date: latest.date || today,
+              close: latest.close,
+              currency: priceCurrency || (latest.currency as any)
+            });
+            sheetError = '';
+          }
+        }
+      } else if (!eodhdError && summary.sheet.enabled) {
         const latest = await sheet.getLatestPrice(tickerConfig.sheetSymbol);
         if (latest && latest.close) {
           newPoints.push({
             ticker: priceTicker,
             date: latest.date || today,
             close: latest.close,
-            currency: priceCurrency || (latest.currency as any) || Currency.USD
+            currency: priceCurrency || (latest.currency as any)
           });
         }
       }
     }
 
     if (newPoints.length > 0) {
-      const pointsToSave = newPoints.map(p => ({
-        ...p,
+      const pointsToSave = buildPointsForSave(newPoints, {
         ticker: priceTicker,
-        currency: priceCurrency || p.currency || Currency.USD
-      }));
-      await db.prices.bulkPut(pointsToSave.map(p => ({ ...p, portfolioId })));
+        instrumentId: String(instr.id),
+        currency: priceCurrency,
+        portfolioId
+      });
+      await db.prices.bulkPut(pointsToSave);
       summary.updatedTickers.push(priceTicker);
     } else if (!failedSet.has(priceTicker)) {
-      if (tickerConfig.provider === 'SHEETS' && !summary.sheet.enabled) {
-        summary.failedTickers.push({ ticker: priceTicker, reason: `Sheets: ${summary.sheet.reason || 'non disponibile'}` });
+      if (tickerConfig.provider === 'SHEETS') {
+        if (sheetError) {
+          summary.failedTickers.push({ ticker: priceTicker, reason: sheetError });
+        } else if (!summary.sheet.enabled) {
+          summary.failedTickers.push({ ticker: priceTicker, reason: `Sheets: ${summary.sheet.reason || 'non disponibile'}` });
+        } else {
+          summary.failedTickers.push({ ticker: priceTicker, reason: 'Sheets: prezzo non trovato' });
+        }
       } else {
-        const reason = eodhdError || (tickerConfig.provider === 'SHEETS' ? 'Sheets: prezzo non trovato' : 'Nessun dato disponibile');
+        const reason = eodhdError || 'Nessun dato disponibile';
         summary.failedTickers.push({ ticker: priceTicker, reason });
       }
       failedSet.add(priceTicker);
@@ -571,11 +863,9 @@ export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSum
     }
   }
 
+  if (summary.status === 'quota_exhausted') return summary;
   if (summary.failedTickers.length > 0) {
-    summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'failed';
-  }
-  if (!summary.sheet.enabled && summary.status === 'ok') {
-    summary.status = 'partial';
+    summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
   }
 
   return summary;
@@ -585,25 +875,41 @@ export const syncPrices = async (apiKeyOverride?: string): Promise<SyncPricesSum
 export const getTickersForBackfill = async (portfolioId: string, scope: 'current' | 'all'): Promise<string[]> => {
   const tx = await db.transactions.where('portfolioId').equals(portfolioId).toArray();
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
-  const canonicalByTicker = new Map(instruments.map(i => [i.ticker, getCanonicalTickerFromInstrument(i)]));
+  const canonicalByTicker = new Map<string, string>();
+  const instrumentById = new Map<string, Instrument>();
+  instruments.forEach(inst => {
+    const canonical = getCanonicalTickerFromInstrument(inst);
+    if (inst.ticker) canonicalByTicker.set(inst.ticker, canonical);
+    if (inst.symbol) canonicalByTicker.set(inst.symbol, canonical);
+    instrumentById.set(String(inst.id), inst);
+  });
   const mapCanonical = (ticker: string) => canonicalByTicker.get(ticker) || ticker;
+  const resolveTxTicker = (t: { instrumentId?: string; instrumentTicker?: string }) => {
+    if (t.instrumentId) {
+      const inst = instrumentById.get(String(t.instrumentId));
+      if (inst) return getCanonicalTickerFromInstrument(inst);
+    }
+    if (t.instrumentTicker) return mapCanonical(t.instrumentTicker);
+    return null;
+  };
   if (scope === 'all') {
-    const all = Array.from(new Set(tx.map(t => t.instrumentTicker).filter(Boolean))) as string[];
+    const all = Array.from(new Set(tx.map(t => resolveTxTicker(t)).filter(Boolean))) as string[];
     return Array.from(new Set(all.map(mapCanonical)));
   }
 
   const qtyMap = new Map<string, number>();
   tx.forEach(t => {
-    if (!t.instrumentTicker) return;
-    const cur = qtyMap.get(t.instrumentTicker) || 0;
-    if (t.type === TransactionType.Buy) qtyMap.set(t.instrumentTicker, cur + (t.quantity || 0));
-    if (t.type === TransactionType.Sell) qtyMap.set(t.instrumentTicker, cur - (t.quantity || 0));
+    const key = resolveTxTicker(t);
+    if (!key) return;
+    const cur = qtyMap.get(key) || 0;
+    if (t.type === TransactionType.Buy) qtyMap.set(key, cur + (t.quantity || 0));
+    if (t.type === TransactionType.Sell) qtyMap.set(key, cur - (t.quantity || 0));
   });
   const current = Array.from(qtyMap.entries())
     .filter(([, qty]) => qty > 1e-8)
     .map(([ticker]) => ticker);
   if (current.length === 0) {
-    const all = Array.from(new Set(tx.map(t => t.instrumentTicker).filter(Boolean))) as string[];
+    const all = Array.from(new Set(tx.map(t => resolveTxTicker(t)).filter(Boolean))) as string[];
     return Array.from(new Set(all.map(mapCanonical)));
   }
   return Array.from(new Set(current.map(mapCanonical)));
@@ -614,6 +920,9 @@ export const getPriceCoverage = async (portfolioId: string, tickers: string[], m
   const ranges: Record<string, { firstDate?: string; lastDate?: string }> = {};
   let earliestCoveredDate: string | undefined;
   let latestCoveredDate: string | undefined;
+  const txSorted = await db.transactions.where('portfolioId').equals(portfolioId).sortBy('date');
+  const firstTransactionDate = txSorted[0]?.date ? format(txSorted[0].date, 'yyyy-MM-dd') : undefined;
+  const startTargetDate = resolveCoverageStartDate(minHistoryDate, firstTransactionDate);
 
   for (const t of tickers) {
     if (!t) {
@@ -635,9 +944,41 @@ export const getPriceCoverage = async (portfolioId: string, tickers: string[], m
   }
 
   const today = format(new Date(), 'yyyy-MM-dd');
-  const perTicker = buildCoverageRows(tickers, ranges, instruments, minHistoryDate, today);
+  const perTicker = buildCoverageRows(tickers, ranges, instruments, startTargetDate, today);
   const okCount = perTicker.filter(p => p.status === 'OK').length;
   return { earliestCoveredDate, latestCoveredDate, perTicker, okCount };
+};
+
+const getBudgetKey = (dateStr: string) => `eodhd_budget_${dateStr}`;
+
+const readDailyBudget = (dateStr: string): { used: number } => {
+  if (typeof localStorage === 'undefined') return { used: 0 };
+  const raw = localStorage.getItem(getBudgetKey(dateStr));
+  if (!raw) return { used: 0 };
+  try {
+    const parsed = JSON.parse(raw) as { used?: number };
+    return { used: Number(parsed.used || 0) };
+  } catch {
+    return { used: 0 };
+  }
+};
+
+const writeDailyBudget = (dateStr: string, used: number) => {
+  if (typeof localStorage === 'undefined') return;
+  localStorage.setItem(getBudgetKey(dateStr), JSON.stringify({ used }));
+};
+
+const bumpDailyBudget = (dateStr: string, delta = 1): number => {
+  const current = readDailyBudget(dateStr);
+  const next = Math.max(0, current.used + delta);
+  writeDailyBudget(dateStr, next);
+  return next;
+};
+
+export const getEodhdDailyBudgetStatus = (dateStr?: string) => {
+  const day = dateStr || format(new Date(), 'yyyy-MM-dd');
+  const { used } = readDailyBudget(day);
+  return { key: getBudgetKey(day), used };
 };
 
 export const backfillPricesForPortfolio = async (
@@ -645,37 +986,160 @@ export const backfillPricesForPortfolio = async (
   tickers: string[],
   minHistoryDate: string,
   onProgress?: (info: { ticker: string; index: number; total: number; phase: 'backfill' | 'forward' | 'done'; error?: string }) => void,
-  apiKeyOverride?: string
-) => {
-  const settings = await db.settings.where('portfolioId').equals(portfolioId).first();
+  apiKeyOverride?: string,
+  options?: BackfillOptions
+): Promise<BackfillSummary> => {
+  const summary: BackfillSummary = { status: 'ok', updatedTickers: [], skipped: 0, stoppedByBudget: false, mode: options?.mode || 'MANUAL_FULL' };
+  let settings = await db.settings.where('portfolioId').equals(portfolioId).first();
   if (!settings) {
     const msg = 'Impostazioni mancanti';
     if (onProgress) onProgress({ ticker: '', index: 0, total: tickers.length, phase: 'done', error: msg });
-    throw new Error(msg);
+    return { status: 'error', message: msg };
   }
 
+  const mode: BackfillMode = options?.mode || 'MANUAL_FULL';
+  const maxApiCallsPerRun = options?.maxApiCallsPerRun ?? (mode === 'AUTO_GAPS' ? 10 : 20);
+  const maxLookbackDays = options?.maxLookbackDays ?? (mode === 'AUTO_GAPS' ? 30 : 365);
+  const staleThresholdDays = options?.staleThresholdDays ?? 7;
+  const sleepMs = options?.sleepMs ?? 400;
+  const maxDailyCalls = options?.maxDailyCalls;
+
   const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey;
+  if (!eodhdKey?.trim()) {
+    return { status: 'error', message: 'Missing EODHD key', updatedTickers: [], skipped: tickers.length, stoppedByBudget: false, mode };
+  }
   const eodhd = new EodhdPriceProvider(eodhdKey);
   const today = format(new Date(), 'yyyy-MM-dd');
+  const minAllowedFrom = format(subDays(new Date(), maxLookbackDays), 'yyyy-MM-dd');
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
-    const priceCurrencyByTicker = new Map<string, Currency>();
-    instruments.forEach(inst => {
-      const ticker = getCanonicalTickerFromInstrument(inst);
-      if (!ticker) return;
-      priceCurrencyByTicker.set(ticker, inst.preferredListing?.currency || inst.currency);
-    });
-    const filtered = tickers.filter(t => {
-      const cfg = resolvePriceSyncConfig(t, settings);
-      return cfg.provider === 'EODHD' && Boolean(getResolvedSymbol(t, settings, cfg.provider, instruments.find(i => i.ticker === t || i.preferredListing?.symbol === t)?.type));
+  const priceCurrencyByTicker = new Map<string, Currency>();
+  const instrumentIdByTicker = new Map<string, string>();
+  const instrumentTypeByTicker = new Map<string, AssetType>();
+  instruments.forEach(inst => {
+    const ticker = getCanonicalTickerFromInstrument(inst);
+    if (!ticker) return;
+    priceCurrencyByTicker.set(ticker, inst.preferredListing?.currency || inst.currency);
+    instrumentTypeByTicker.set(ticker, inst.type);
+    if (inst.id) instrumentIdByTicker.set(ticker, String(inst.id));
+  });
+  const filtered = tickers.filter(t => {
+    const cfg = resolvePriceSyncConfig(t, settings);
+    return !cfg.excluded && cfg.provider !== 'MANUAL';
+  });
+  let usedThisRun = 0;
+  let dailyUsed = readDailyBudget(today).used;
+
+  if (mode === 'AUTO_GAPS') {
+    const candidates: { ticker: string; lastDate?: string }[] = [];
+    for (const ticker of filtered) {
+      const lastRow = await db.prices
+        .where('[ticker+date]')
+        .between([ticker, Dexie.minKey], [ticker, Dexie.maxKey])
+        .and(p => p.portfolioId === portfolioId)
+        .last();
+      const lastDate = lastRow?.date;
+      if (isAutoGapCandidate(lastDate, today, staleThresholdDays)) {
+        candidates.push({ ticker, lastDate });
+      } else {
+        summary.skipped = (summary.skipped || 0) + 1;
+      }
+    }
+
+    candidates.sort((a, b) => {
+      if (!a.lastDate && !b.lastDate) return 0;
+      if (!a.lastDate) return -1;
+      if (!b.lastDate) return 1;
+      return a.lastDate.localeCompare(b.lastDate);
     });
 
-    for (let i = 0; i < filtered.length; i++) {
-      const ticker = filtered[i];
+    const budgetLimit = limitTickersByBudget(candidates.map(c => c.ticker), maxApiCallsPerRun, maxDailyCalls, dailyUsed);
+    const limitedSet = new Set(budgetLimit.tickers);
+    summary.stoppedByBudget = budgetLimit.stoppedByBudget;
+
+    const limitedCandidates = candidates.filter(c => limitedSet.has(c.ticker));
+    for (let i = 0; i < limitedCandidates.length; i++) {
+      const { ticker, lastDate } = limitedCandidates[i];
       const cfg = resolvePriceSyncConfig(ticker, settings);
-      const resolvedSymbol = getResolvedSymbol(ticker, settings, cfg.provider, instruments.find(i => i.ticker === ticker || i.preferredListing?.symbol === ticker)?.type);
+      const assetType = instrumentTypeByTicker.get(ticker);
+      const symbol = resolveBackfillSymbol(ticker, cfg, assetType);
       const priceCurrency = priceCurrencyByTicker.get(ticker);
+      const instrumentId = instrumentIdByTicker.get(ticker);
+      if (!isValidEodhdSymbol(symbol, assetType)) {
+        const message = 'Symbol EODHD non valido';
+        if (onProgress) onProgress({ ticker, index: i + 1, total: limitedCandidates.length, phase: 'backfill', error: message });
+        summary.status = 'error';
+        summary.message = message;
+        continue;
+      }
+
+      if (onProgress) onProgress({ ticker, index: i + 1, total: limitedCandidates.length, phase: 'backfill' });
+      const range = computeAutoGapRange(lastDate, today, maxLookbackDays);
+      if (range.from > range.to) {
+        summary.skipped = (summary.skipped || 0) + 1;
+        continue;
+      }
+      if (maxApiCallsPerRun !== undefined && usedThisRun >= maxApiCallsPerRun) {
+        summary.stoppedByBudget = true;
+        break;
+      }
+      if (maxDailyCalls !== undefined && dailyUsed >= maxDailyCalls) {
+        summary.stoppedByBudget = true;
+        break;
+      }
+      usedThisRun += 1;
+      dailyUsed = bumpDailyBudget(today, 1);
       try {
-        if (onProgress) onProgress({ ticker, index: i + 1, total: filtered.length, phase: 'backfill' });
+        const pts = await eodhd.getHistory(symbol, range.from, range.to);
+        if (pts.length > 0) {
+          const toSave = buildPointsForSave(pts, {
+            ticker,
+            instrumentId,
+            currency: priceCurrency,
+            portfolioId
+          });
+          await db.prices.bulkPut(toSave);
+          summary.updatedTickers?.push(ticker);
+        } else {
+          summary.skipped = (summary.skipped || 0) + 1;
+        }
+      } catch (e: any) {
+        if (e?.message === 'EODHD_LIMIT_REACHED') {
+          summary.status = 'error';
+          summary.message = 'Limite EODHD sessione raggiunto (20 richieste).';
+          break;
+        }
+        if (isEodhdError(e) && e.httpStatus === 402) {
+          summary.status = 'quota_exhausted';
+          summary.message = 'Quota EODHD esaurita (402). Backfill interrotto.';
+          summary.quota = {
+            ticker,
+            httpStatus: e.httpStatus,
+            contentType: e.contentType,
+            rawPreview: e.rawPreview
+          };
+          break;
+        }
+        const message = e?.message || String(e);
+        if (onProgress) onProgress({ ticker, index: i + 1, total: limitedCandidates.length, phase: 'backfill', error: message });
+        summary.status = 'error';
+        summary.message = message;
+      }
+      await new Promise(res => setTimeout(res, sleepMs));
+    }
+
+    if (onProgress) onProgress({ ticker: '', index: limitedCandidates.length, total: limitedCandidates.length, phase: 'done' });
+    return summary;
+  }
+
+  for (let i = 0; i < filtered.length; i++) {
+    const ticker = filtered[i];
+    const cfg = resolvePriceSyncConfig(ticker, settings);
+    const assetType = instrumentTypeByTicker.get(ticker);
+    const resolvedSymbol = resolveBackfillSymbol(ticker, cfg, assetType);
+    const priceCurrency = priceCurrencyByTicker.get(ticker);
+    const instrumentId = instrumentIdByTicker.get(ticker);
+    try {
+      if (onProgress) onProgress({ ticker, index: i + 1, total: filtered.length, phase: 'backfill' });
       const existing = await db.prices
         .where('[ticker+date]')
         .between([ticker, Dexie.minKey], [ticker, Dexie.maxKey])
@@ -687,35 +1151,89 @@ export const backfillPricesForPortfolio = async (
 
       const ranges: { from: string; to: string }[] = [];
       if (!minInDb || minInDb > minHistoryDate) {
-        ranges.push({ from: minHistoryDate, to: minInDb ? format(subDays(new Date(minInDb), 1), 'yyyy-MM-dd') : today });
+        const from = minHistoryDate < minAllowedFrom ? minAllowedFrom : minHistoryDate;
+        ranges.push({ from, to: minInDb ? subDaysYmd(minInDb, 1) : today });
       }
       if (!maxInDb || maxInDb < today) {
-        ranges.push({ from: maxInDb ? format(addDays(new Date(maxInDb), 1), 'yyyy-MM-dd') : minHistoryDate, to: today });
+        const fromCandidate = maxInDb ? addDaysYmd(maxInDb, 1) : minHistoryDate;
+        const from = fromCandidate < minAllowedFrom ? minAllowedFrom : fromCandidate;
+        ranges.push({ from, to: today });
       }
 
-        for (const r of ranges) {
-          if (onProgress) onProgress({ ticker, index: i + 1, total: filtered.length, phase: 'forward' });
-          if (!resolvedSymbol) throw new Error('Symbol EODHD non valido');
-          const pts = await eodhd.getHistory(resolvedSymbol, r.from, r.to);
-          if (pts.length > 0) {
-            const toSave = pts.map(p => ({ ...p, ticker, currency: priceCurrency || p.currency || Currency.USD, portfolioId }));
-            await db.prices.bulkPut(toSave);
-          }
-        await new Promise(res => setTimeout(res, 400)); // rate-limit soft
+      const limitedRanges = ranges.filter(r => r.from <= r.to);
+
+      let stopForBudget = false;
+      for (const r of limitedRanges) {
+        if (maxApiCallsPerRun !== undefined && usedThisRun >= maxApiCallsPerRun) {
+          summary.stoppedByBudget = true;
+          stopForBudget = true;
+          break;
+        }
+        if (maxDailyCalls !== undefined && dailyUsed >= maxDailyCalls) {
+          summary.stoppedByBudget = true;
+          stopForBudget = true;
+          break;
+        }
+        if (onProgress) onProgress({ ticker, index: i + 1, total: filtered.length, phase: 'forward' });
+        if (!isValidEodhdSymbol(resolvedSymbol, assetType)) throw new Error('Symbol EODHD non valido');
+        usedThisRun += 1;
+        dailyUsed = bumpDailyBudget(today, 1);
+        const pts = await eodhd.getHistory(resolvedSymbol, r.from, r.to);
+        if (pts.length > 0) {
+          const toSave = buildPointsForSave(pts, {
+            ticker,
+            instrumentId,
+            currency: priceCurrency,
+            portfolioId
+          });
+          await db.prices.bulkPut(toSave);
+          if (!summary.updatedTickers?.includes(ticker)) summary.updatedTickers?.push(ticker);
+        }
+        await new Promise(res => setTimeout(res, sleepMs));
       }
+      if (stopForBudget) break;
     } catch (e: any) {
+      if (e?.message === 'EODHD_LIMIT_REACHED') {
+        summary.status = 'error';
+        summary.message = 'Limite EODHD sessione raggiunto (20 richieste).';
+        break;
+      }
+      if (isEodhdError(e) && e.httpStatus === 402) {
+        summary.status = 'quota_exhausted';
+        summary.message = 'Quota EODHD esaurita (402). Backfill interrotto.';
+        summary.quota = {
+          ticker,
+          httpStatus: e.httpStatus,
+          contentType: e.contentType,
+          rawPreview: e.rawPreview
+        };
+        break;
+      }
       const message = e?.message || String(e);
       if (onProgress) onProgress({ ticker, index: i + 1, total: filtered.length, phase: 'backfill', error: message });
       if (message === PROXY_ERROR_MESSAGE) throw e;
+      summary.status = 'error';
+      summary.message = message;
     }
   }
   if (onProgress) onProgress({ ticker: '', index: filtered.length, total: filtered.length, phase: 'done' });
+  return summary;
 };
 
 export type SheetTestResult = {
   status: 'ok' | 'not_found' | 'disabled' | 'error';
   reason?: string;
   price?: Partial<PricePoint>;
+};
+
+export type BackfillSummary = {
+  status: 'ok' | 'error' | 'quota_exhausted';
+  message?: string;
+  quota?: { ticker: string; httpStatus: number; contentType?: string; rawPreview?: string };
+  updatedTickers?: string[];
+  skipped?: number;
+  stoppedByBudget?: boolean;
+  mode?: BackfillMode;
 };
 
 export const testSheetLatestPrice = async (sheetUrl: string, ticker: string): Promise<SheetTestResult> => {
@@ -769,32 +1287,41 @@ export const getMarketCloseAroundDate = async (
     .where('portfolioId')
     .equals(portfolioId)
     .toArray()
-    .then(list => list.find(i => i.ticker === ticker || i.preferredListing?.symbol === ticker || i.listings?.some(l => l.symbol === ticker)));
+    .then(list => list.find(i => i.symbol === ticker || i.ticker === ticker || i.preferredListing?.symbol === ticker || i.listings?.some(l => l.symbol === ticker)));
 
   const cfg = resolvePriceSyncConfig(ticker, settings);
-  if (cfg.needsMapping || cfg.provider !== 'EODHD') return { status: 'not_found', message: 'needs-mapping' };
-
-  const symbol = getResolvedSymbol(ticker, settings, cfg.provider, instrument?.type);
-  if (!symbol) return { status: 'not_found', message: 'missing-symbol' };
 
   const target = format(dateObj, 'yyyy-MM-dd');
-  const from = format(subDays(dateObj, Math.max(1, lookbackDays)), 'yyyy-MM-dd');
+  const clampedLookback = Math.min(lookbackDays, EODHD_BACKFILL_MAX_DAYS);
+  const from = format(subDays(dateObj, Math.max(1, clampedLookback)), 'yyyy-MM-dd');
 
   if (!options?.forceEodhd) {
-    const exact = await db.prices
-      .where('[ticker+date]')
-      .equals([ticker, target])
-      .and(p => p.portfolioId === portfolioId)
-      .first();
+    const exact = instrument?.id
+      ? await db.prices
+        .where('[instrumentId+date]')
+        .equals([String(instrument.id), target])
+        .and(p => p.portfolioId === portfolioId)
+        .first()
+      : await db.prices
+        .where('[ticker+date]')
+        .equals([ticker, target])
+        .and(p => p.portfolioId === portfolioId)
+        .first();
     if (exact && Number.isFinite(exact.close)) {
       return { status: 'exact', dateUsed: exact.date, close: exact.close, currency: exact.currency, source: 'cache' };
     }
 
-    const cachedRange = await db.prices
-      .where('[ticker+date]')
-      .between([ticker, from], [ticker, target], true, true)
-      .and(p => p.portfolioId === portfolioId)
-      .toArray();
+    const cachedRange = instrument?.id
+      ? await db.prices
+        .where('[instrumentId+date]')
+        .between([String(instrument.id), from], [String(instrument.id), target], true, true)
+        .and(p => p.portfolioId === portfolioId)
+        .toArray()
+      : await db.prices
+        .where('[ticker+date]')
+        .between([ticker, from], [ticker, target], true, true)
+        .and(p => p.portfolioId === portfolioId)
+        .toArray();
     if (cachedRange.length > 0) {
       const best = cachedRange.reduce((acc, row) => (!acc || row.date > acc.date) ? row : acc, null as PricePoint | null);
       if (best && Number.isFinite(best.close)) {
@@ -803,10 +1330,25 @@ export const getMarketCloseAroundDate = async (
     }
   }
 
+  if (cfg.needsMapping) return { status: 'not_found', message: 'needs-mapping' };
+  const allowEodhd = cfg.provider === 'EODHD' || options?.forceEodhd;
+  if (!allowEodhd) return { status: 'not_found', message: 'provider_not_eodhd' };
+
+  const symbol = getResolvedSymbol(ticker, settings, 'EODHD', instrument?.type);
+  if (!symbol) return { status: 'not_found', message: 'missing-symbol' };
+
   try {
-    const url = buildEodhdProxyUrl(`/api/eod/${encodeURIComponent(symbol)}`, { from, to: target, fmt: 'json' });
-    const headers = buildEodhdHeaders(settings.eodhdApiKey);
-    const diag = await fetchJsonWithDiagnostics(url, headers ? { headers, signal: options?.signal } : { signal: options?.signal });
+    const result = await fetchEodhdJson(
+      `/api/eod/${encodeURIComponent(symbol)}`,
+      { from, to: target, fmt: 'json' },
+      settings.eodhdApiKey,
+      { signal: options?.signal }
+    );
+    const diag = result.diag;
+    const url = result.url;
+    if (!diag.ok && result.proxyMissing) {
+      return { status: 'error', message: PROXY_ERROR_MESSAGE };
+    }
     if (diag.httpStatus === 404) return { status: 'not_found', rawCount: 0 };
     if (!diag.ok) {
       let message = `status_${diag.httpStatus}`;
@@ -854,9 +1396,10 @@ export const getMarketCloseAroundDate = async (
         if (!rowDate || close === null) return null;
         return {
           ticker,
+          instrumentId: instrument?.id ? String(instrument.id) : undefined,
           date: rowDate,
           close,
-          currency: currency || Currency.USD,
+          currency: currency || (undefined as any),
           portfolioId
         } as PricePoint;
       })
@@ -869,6 +1412,9 @@ export const getMarketCloseAroundDate = async (
   } catch (err: any) {
     if (err && err.name === 'AbortError') {
       return { status: 'aborted', message: 'aborted' };
+    }
+    if (err?.message === 'EODHD_LIMIT_REACHED') {
+      return { status: 'error', message: 'Limite EODHD sessione raggiunto (20 richieste).' };
     }
     return { status: 'error', message: PROXY_ERROR_MESSAGE };
   }
@@ -890,16 +1436,22 @@ export const getMarketCloseForDate = async (
     .where('portfolioId')
     .equals(portfolioId)
     .toArray()
-    .then(list => list.find(i => i.ticker === ticker || i.preferredListing?.symbol === ticker || i.listings?.some(l => l.symbol === ticker)));
+    .then(list => list.find(i => i.symbol === ticker || i.ticker === ticker || i.preferredListing?.symbol === ticker || i.listings?.some(l => l.symbol === ticker)));
 
   const cfg = resolvePriceSyncConfig(ticker, settings);
   if (cfg.needsMapping || cfg.provider !== 'EODHD') return null;
 
-  const cached = await db.prices
-    .where('[ticker+date]')
-    .equals([ticker, dateYYYYMMDD])
-    .and(p => p.portfolioId === portfolioId)
-    .first();
+  const cached = instrument?.id
+    ? await db.prices
+      .where('[instrumentId+date]')
+      .equals([String(instrument.id), dateYYYYMMDD])
+      .and(p => p.portfolioId === portfolioId)
+      .first()
+    : await db.prices
+      .where('[ticker+date]')
+      .equals([ticker, dateYYYYMMDD])
+      .and(p => p.portfolioId === portfolioId)
+      .first();
   if (cached && Number.isFinite(cached.close)) {
     return { close: cached.close, date: cached.date, currency: cached.currency, source: 'cache' };
   }
@@ -910,12 +1462,15 @@ export const getMarketCloseForDate = async (
   const from = format(subDays(dateObj, 7), 'yyyy-MM-dd');
   const to = format(addDays(dateObj, 1), 'yyyy-MM-dd');
   try {
-    const url = buildEodhdProxyUrl(`/api/eod/${encodeURIComponent(symbol)}`, { from, to, fmt: 'json' });
-    const headers = buildEodhdHeaders(settings.eodhdApiKey);
-    const res = await fetch(url, headers ? { headers } : undefined);
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (!Array.isArray(data)) return null;
+    const result = await fetchEodhdJson(
+      `/api/eod/${encodeURIComponent(symbol)}`,
+      { from, to, fmt: 'json' },
+      settings.eodhdApiKey
+    );
+    const diag = result.diag;
+    if (!diag.ok) return null;
+    if (!Array.isArray(diag.json)) return null;
+    const data = diag.json;
 
       let best: { date: string; close: number } | null = null;
       let next: { date: string; close: number } | null = null;
@@ -939,3 +1494,6 @@ export const getMarketCloseForDate = async (
     return null;
   }
 };
+
+
+

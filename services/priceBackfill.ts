@@ -1,5 +1,6 @@
-import { differenceInCalendarDays } from 'date-fns';
 import { Currency, PricePoint } from '../types';
+import { diffDaysYmd } from './dateUtils';
+import { PRICE_GAP_DAYS } from './constants';
 
 export type FilledPricePoint = PricePoint & {
   synthetic: boolean;
@@ -38,7 +39,7 @@ const buildWarnings = (ticker: string, rows: PricePoint[], gapWarningDays: numbe
     const prev = sorted[i - 1];
     const curr = sorted[i];
     if (!prev.date || !curr.date) continue;
-    const gap = differenceInCalendarDays(new Date(curr.date), new Date(prev.date));
+    const gap = diffDaysYmd(curr.date, prev.date);
     if (gap > gapWarningDays) {
       warnings.push({
         ticker,
@@ -56,7 +57,7 @@ export const fillMissingPrices = (
   dateIndex: string[],
   options?: { tickers?: string[]; gapWarningDays?: number }
 ): FillMissingPricesResult => {
-  const gapWarningDays = options?.gapWarningDays ?? 7;
+  const gapWarningDays = options?.gapWarningDays ?? PRICE_GAP_DAYS;
   const tickers = (options?.tickers && options.tickers.length > 0)
     ? options.tickers
     : Array.from(new Set(prices.map(p => p.ticker).filter(Boolean)));
