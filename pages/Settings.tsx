@@ -1476,8 +1476,10 @@ export const Settings: React.FC = () => {
                     <span className="text-xs text-slate-400">Verifica...</span>
                   ) : proxyHealth?.ok ? (
                     <span className="text-xs font-bold text-green-600">OK</span>
+                  ) : proxyHealth ? (
+                    <span className="text-xs font-bold text-red-600">Non raggiungibile</span>
                   ) : (
-                    <span className="text-xs font-bold text-red-600">Errore</span>
+                    <span className="text-xs font-bold text-slate-500">Non testato</span>
                   )}
                   {config.eodhdApiKey?.trim() && (
                     <span className="text-[10px] font-bold uppercase text-emerald-700 bg-emerald-100 px-2 py-1 rounded-full">
@@ -1490,7 +1492,7 @@ export const Settings: React.FC = () => {
                   className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
                   onClick={() => loadProxyHealth(config.eodhdApiKey)}
                 >
-                  Riprova
+                  Test connessione
                 </button>
               </div>
               <div className="mt-2 flex flex-wrap gap-3 text-xs">
@@ -1500,12 +1502,25 @@ export const Settings: React.FC = () => {
                 </div>
                 {proxyHealth?.ok && !proxyHealth?.hasEodhdKey && (
                   <div className="text-amber-700">
-                    Missing EODHD_API_KEY in .env.local or Vercel env. Restart dev server.
+                    Chiave EODHD non trovata nell’ambiente locale. Aggiungila in `.env.local` e riavvia il dev server.
                   </div>
                 )}
-                {!proxyHealth?.ok && (
+                {proxyHealth === null && (
                   <div className="text-slate-500">
-                    Avvia `vercel dev` oppure verifica il deploy su Vercel.
+                    Stato non testato: premi “Test connessione” per verificare.
+                  </div>
+                )}
+                {proxyHealth && !proxyHealth.ok && (
+                  <div className="space-y-1 text-slate-600">
+                    <div><span className="font-semibold">Cosa significa:</span> il proxy `/api` non risponde e alcune funzioni (prezzi/FX) possono fallire.</div>
+                    <div><span className="font-semibold">Cosa fare:</span> avvia `npm run dev:vercel` in locale oppure verifica la configurazione del proxy.</div>
+                    <div>
+                      <a href="#/data?tab=checks" className="text-[#0052a3] font-bold hover:underline">
+                        Apri Data Inspector
+                      </a>
+                      <span className="mx-2 text-slate-400">·</span>
+                      <span className="text-slate-500">Documentazione locale: usa `dev:vercel`</span>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1623,6 +1638,15 @@ export const Settings: React.FC = () => {
                 <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
                   HTTP {appsScriptTests.fx.diag.httpStatus} â€¢ {appsScriptTests.fx.diag.contentType || 'n/a'}
                   {appsScriptTests.fx.diag.rawPreview ? ` â€¢ ${appsScriptTests.fx.diag.rawPreview}` : ''}
+                </div>
+              )}
+              {appsScriptTests.fx && appsScriptTests.fx.status === 'err' && (
+                <div className="text-xs text-amber-700">
+                  <div><span className="font-semibold">Cosa significa:</span> Apps Script ha risposto con errore e i tassi FX non sono stati importati.</div>
+                  <div><span className="font-semibold">Cosa fare:</span> verifica URL/API key in Settings e riprova.</div>
+                  <div>
+                    <a href="#/data?tab=fx" className="text-[#0052a3] font-bold hover:underline">Apri Data Inspector (FX)</a>
+                  </div>
                 </div>
               )}
             </div>
