@@ -18,7 +18,7 @@ describe('buildCoverageRows', () => {
   it('maps coverage rows to instruments and fills defaults', () => {
     const instruments: Instrument[] = [
       {
-        id: 'inst-1',
+        id: 1,
         ticker: 'SWDA.SW',
         symbol: 'SWDA.SW',
         name: 'iShares Core MSCI World',
@@ -28,7 +28,7 @@ describe('buildCoverageRows', () => {
         preferredListing: { exchangeCode: 'SW', symbol: 'SWDA.SW', currency: Currency.CHF }
       },
       {
-        id: 'inst-2',
+        id: 2,
         ticker: 'AAPL.US',
         symbol: 'AAPL.US',
         name: 'Apple Inc.',
@@ -53,7 +53,7 @@ describe('buildCoverageRows', () => {
 
     expect(rows[0].ticker).toBe('SWDA.SW');
     expect(rows[0].isin).toBe('IE00B4L5Y983');
-    expect(rows[0].instrumentId).toBe('inst-1');
+    expect(rows[0].instrumentId).toBe('1');
     expect(rows[0].status).toBe('OK');
 
     expect(rows[1].ticker).toBe('AAPL.US');
