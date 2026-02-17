@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { calculateHistoricalPerformance, calculateAnalytics } from './financeUtils';
+import { calculateHistoricalPerformance, calculateAnalytics, computeTWRRFromNav } from './financeUtils';
 import { fillMissingPrices } from './priceBackfill';
 import { AssetType, Currency, Instrument, PricePoint, Transaction, TransactionType } from '../types';
 import case1 from '../__fixtures__/case1_single_asset.json';
 import case3 from '../__fixtures__/case3_missing_price.json';
 
-const instr: Instrument = { ticker: 'TEST', name: 'Test', type: AssetType.Stock, currency: Currency.USD };
+const instr: Instrument = { id: 'inst-test', ticker: 'TEST', symbol: 'TEST', name: 'Test', type: AssetType.Stock, currency: Currency.USD };
 
 describe('financeUtils daily series', () => {
   it('forward-fills missing prices between trading days', () => {
@@ -82,6 +82,17 @@ describe('financeUtils daily series', () => {
     ];
     const analytics = calculateAnalytics(history as any, 'daily');
     expect(analytics.annualizedReturn).toBeCloseTo(50, 0);
+  });
+
+  it('TWRR accounts for external cashflows only', () => {
+    const history = [
+      { date: '2024-01-01', value: 100, invested: 100, monthlyReturnPct: 0, cumulativeReturnPct: 0 },
+      { date: '2024-01-02', value: 120, invested: 110, monthlyReturnPct: 0, cumulativeReturnPct: 0 }
+    ];
+    const withFlow = computeTWRRFromNav(history as any, [{ date: '2024-01-02', amount: 10 }]);
+    const withoutFlow = computeTWRRFromNav(history as any, []);
+    expect(withFlow[1].monthlyReturnPct).toBeCloseTo(10, 5);
+    expect(withoutFlow[1].monthlyReturnPct).toBeCloseTo(20, 5);
   });
 
   it('backfills from next available price when series starts after transactions', () => {

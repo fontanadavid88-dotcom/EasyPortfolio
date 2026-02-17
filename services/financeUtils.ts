@@ -1,11 +1,12 @@
 import { Transaction, TransactionType, Instrument, PricePoint, PortfolioState, PortfolioPosition, PerformancePoint, AssetType, Currency, AssetClass, RegionKey } from '../types';
-import { format, startOfMonth, endOfMonth, eachMonthOfInterval, isValid, getYear, eachDayOfInterval, differenceInCalendarDays } from 'date-fns';
+import { format, startOfMonth, endOfMonth, eachMonthOfInterval, isValid, getYear, eachDayOfInterval } from 'date-fns';
 import { fillMissingPrices, PriceFillMeta } from './priceBackfill';
+import { diffDaysYmd, isYmd, parseYmdLocal } from './dateUtils';
 
 // Helper sicuro per gestire date che potrebbero essere stringhe o oggetti Date
 const toDateSafe = (dateInput: string | Date | number): Date => {
   if (dateInput instanceof Date) return dateInput;
-  if (typeof dateInput === 'string') return new Date(dateInput);
+  if (typeof dateInput === 'string') return isYmd(dateInput) ? parseYmdLocal(dateInput) : new Date(dateInput);
   return new Date(dateInput);
 };
 
@@ -36,7 +37,10 @@ const ASSET_CLASS_LABELS: Record<AssetClass, string> = {
 
 export const getAssetClassLabel = (ac: AssetClass): string => ASSET_CLASS_LABELS[ac] || ac;
 export const getCanonicalTicker = (instrument: Instrument): string => {
-  return instrument.preferredListing?.symbol || instrument.ticker;
+  return instrument.preferredListing?.symbol || instrument.symbol || instrument.ticker;
+};
+const getInstrumentKey = (instrument: Instrument): string => {
+  return instrument.symbol || instrument.ticker;
 };
 const REGION_LABELS: Record<RegionKey, string> = {
   CH: 'Svizzera',
@@ -57,7 +61,7 @@ const containsAny = (source: string, keywords: string[]) =>
 export const inferAssetClass = (instrument: Instrument): AssetClass => {
   if (instrument.assetClass) return instrument.assetClass;
   const name = instrument.name?.toLowerCase() || '';
-  const ticker = instrument.ticker?.toUpperCase() || '';
+  const ticker = (instrument.symbol || instrument.ticker || '').toUpperCase();
   const type = instrument.type;
 
   // Crypto
@@ -111,7 +115,7 @@ export const getValuationDateForHoldings = (
   let minLastDate: string | undefined;
   let fallbackLastDate: string | undefined;
   const canonicalByTicker = instruments
-    ? new Map(instruments.map(inst => [inst.ticker, getCanonicalTicker(inst)]))
+    ? new Map(instruments.map(inst => [getInstrumentKey(inst), getCanonicalTicker(inst)]))
     : null;
   prices.forEach(p => {
     if (!fallbackLastDate || p.date > fallbackLastDate) fallbackLastDate = p.date;
@@ -202,7 +206,7 @@ export const calculatePortfolioState = (
 ): PortfolioState => {
   // Deduplicate instruments by ticker to avoid duplicate render if DB has dupes
   const uniqueInstruments = Array.from(
-    new Map(instruments.map(inst => [inst.ticker, inst])).values()
+    new Map(instruments.map(inst => [inst.id || getInstrumentKey(inst), inst])).values()
   );
 
   // 1. Calculate Invested Capital (Net Flows)
@@ -245,14 +249,15 @@ export const calculatePortfolioState = (
   const { filledByTicker } = fillMissingPrices(prices, [todayStr], { tickers: priceTickers });
 
   uniqueInstruments.forEach(inst => {
-    const qty = holdingsMap.get(inst.ticker) || 0;
+    const instrumentKey = getInstrumentKey(inst);
+    const qty = holdingsMap.get(instrumentKey) || 0;
     // Handle floating point dust
     if (qty > 0.000001) {
       const priceTicker = getCanonicalTicker(inst);
       const filled = filledByTicker.get(priceTicker)?.get(todayStr);
       let currentPrice = filled?.close;
       if (currentPrice === undefined) {
-        const txArr = txPriceMap.get(inst.ticker);
+        const txArr = txPriceMap.get(instrumentKey);
         const latestTx = txArr?.find(tx => tx.dateStr <= todayStr);
         if (latestTx) currentPrice = latestTx.price;
       }
@@ -264,7 +269,7 @@ export const calculatePortfolioState = (
       totalValue += val;
 
       positions.push({
-        ticker: inst.ticker,
+        ticker: instrumentKey,
         name: inst.name,
         assetType: inst.type,
         assetClass: inst.assetClass,
@@ -383,15 +388,15 @@ export const buildNavSeriesDetailed = (
 
   const txPriceMap = buildTxPriceMap(transactions);
   const uniqueInstruments = Array.from(
-    new Map(instruments.map(inst => [inst.ticker, inst])).values()
+    new Map(instruments.map(inst => [inst.id || getInstrumentKey(inst), inst])).values()
   );
-  const canonicalByTicker = new Map(uniqueInstruments.map(inst => [inst.ticker, getCanonicalTicker(inst)]));
+  const canonicalByTicker = new Map(uniqueInstruments.map(inst => [getInstrumentKey(inst), getCanonicalTicker(inst)]));
   const dateIndex = granularity === 'monthly'
     ? eachMonthOfInterval({ start: startDate, end: rangeEndDate }).map(d => format(endOfMonth(d), 'yyyy-MM-dd'))
     : eachDayOfInterval({ start: startDate, end: rangeEndDate }).map(d => format(d, 'yyyy-MM-dd'));
 
   const priceTickers = Array.from(
-    new Set(uniqueInstruments.map(instr => canonicalByTicker.get(instr.ticker) || instr.ticker))
+    new Set(uniqueInstruments.map(instr => canonicalByTicker.get(getInstrumentKey(instr)) || getInstrumentKey(instr)))
   ).filter(Boolean);
   const { filledByTicker } = fillMissingPrices(prices, dateIndex, { tickers: priceTickers });
 
@@ -458,9 +463,9 @@ export const buildNavSeriesDetailed = (
     const backfilledPriceSet = new Set<string>();
 
     uniqueInstruments.forEach(instr => {
-      const ticker = instr.ticker;
-      const priceTicker = canonicalByTicker.get(ticker) || ticker;
-      const qty = runningQty.get(ticker) || 0;
+      const instrumentKey = getInstrumentKey(instr);
+      const priceTicker = canonicalByTicker.get(instrumentKey) || instrumentKey;
+      const qty = runningQty.get(instrumentKey) || 0;
       if (qty <= 0.000001) return;
 
       const filled = filledByTicker.get(priceTicker)?.get(dateStr);
@@ -468,7 +473,7 @@ export const buildNavSeriesDetailed = (
       let isBackfilled = Boolean(filled?.synthetic);
 
       if (price === undefined) {
-        const txArr = txPriceMap.get(ticker);
+        const txArr = txPriceMap.get(instrumentKey);
         const latestTx = txArr?.find(tx => tx.dateStr <= dateStr);
         if (latestTx) {
           price = latestTx.price;
@@ -612,9 +617,10 @@ export const calculateHistoricalPerformance = (
 } => {
 
   const uniqueInstruments = Array.from(
-    new Map(instruments.map(inst => [inst.ticker, inst])).values()
+    new Map(instruments.map(inst => [inst.id || getInstrumentKey(inst), inst])).values()
   );
-  const canonicalByTicker = new Map(uniqueInstruments.map(inst => [inst.ticker, getCanonicalTicker(inst)]));
+  const canonicalByTicker = new Map(uniqueInstruments.map(inst => [getInstrumentKey(inst), getCanonicalTicker(inst)]));
+  const instrumentByKey = new Map(uniqueInstruments.map(inst => [getInstrumentKey(inst), inst]));
   void monthsBack;
 
   const history: PerformancePoint[] = [];
@@ -650,9 +656,9 @@ export const calculateHistoricalPerformance = (
   if (granularity === 'monthly') {
     const months = eachMonthOfInterval({ start, end });
     const dateIndex = months.map(date => format(endOfMonth(date), 'yyyy-MM-dd'));
-    const priceTickers = Array.from(
-      new Set(uniqueInstruments.map(inst => canonicalByTicker.get(inst.ticker) || inst.ticker))
-    ).filter(Boolean);
+  const priceTickers = Array.from(
+    new Set(uniqueInstruments.map(inst => canonicalByTicker.get(getInstrumentKey(inst)) || getInstrumentKey(inst)))
+  ).filter(Boolean);
     const fillResult = fillMissingPrices(prices, dateIndex, { tickers: priceTickers });
     const filledByTicker = fillResult.filledByTicker;
     priceFillMeta = fillResult.meta;
@@ -719,7 +725,7 @@ export const calculateHistoricalPerformance = (
         const val = qty * price;
         totalValueAtDate += val;
 
-        const instr = uniqueInstruments.find(i => i.ticker === ticker);
+        const instr = instrumentByKey.get(ticker);
         if (instr) {
           assetValues[instr.type] = (assetValues[instr.type] || 0) + val;
           currencyValues[instr.currency] = (currencyValues[instr.currency] || 0) + val;
@@ -772,7 +778,7 @@ export const calculateHistoricalPerformance = (
   const dateIndex = days.map(d => format(d, 'yyyy-MM-dd'));
 
   const priceTickers = Array.from(
-    new Set(uniqueInstruments.map(instr => canonicalByTicker.get(instr.ticker) || instr.ticker))
+    new Set(uniqueInstruments.map(instr => canonicalByTicker.get(getInstrumentKey(instr)) || getInstrumentKey(instr)))
   ).filter(Boolean);
   const fillResult = fillMissingPrices(prices, dateIndex, { tickers: priceTickers });
   const filledByTicker = fillResult.filledByTicker;
@@ -837,16 +843,16 @@ export const calculateHistoricalPerformance = (
     const backfilledPriceSet = new Set<string>();
 
     uniqueInstruments.forEach(instr => {
-      const ticker = instr.ticker;
-      const priceTicker = canonicalByTicker.get(ticker) || ticker;
-      const qty = runningQty.get(ticker) || 0;
+      const instrumentKey = getInstrumentKey(instr);
+      const priceTicker = canonicalByTicker.get(instrumentKey) || instrumentKey;
+      const qty = runningQty.get(instrumentKey) || 0;
       if (qty <= 0.000001) return;
 
       const filled = filledByTicker.get(priceTicker)?.get(dateStr);
       let price = filled?.close;
       let isBackfilled = Boolean(filled?.synthetic);
       if (price === undefined) {
-        const txArr = txPriceMap.get(ticker);
+        const txArr = txPriceMap.get(instrumentKey);
         const latestTx = txArr?.find(tx => tx.dateStr <= dateStr);
         if (latestTx) {
           price = latestTx.price;
@@ -995,7 +1001,7 @@ export const calculateAnalytics = (history: PerformancePoint[], granularity: Gra
     const stdDaily = Math.sqrt(variance);
     stdDevAnnualized = stdDaily * Math.sqrt(252);
 
-    const days = differenceInCalendarDays(new Date(lastPoint.date), new Date(firstPoint.date)) || 1;
+    const days = diffDaysYmd(lastPoint.date, firstPoint.date) || 1;
     annualizedReturn = startIndex > 0
       ? Math.pow(endIndex / startIndex, 365.25 / days) - 1
       : 0;
@@ -1049,8 +1055,9 @@ export const calculateRebalancing = (
 ) => {
 
   const effectiveTotal = totalPortfolioValue + (strategy === 'Accumulate' ? cashInjection : 0);
+  const threshold = effectiveTotal * 0.01;
 
-  return positions.map(p => {
+  const baseRows = positions.map(p => {
     const targetValue = effectiveTotal * (p.targetPct / 100);
     const currentValue = p.currentValueCHF;
     const diff = targetValue - currentValue;
@@ -1058,20 +1065,34 @@ export const calculateRebalancing = (
     let action = 'NEUTRO';
     if (p.targetPct === 0 && p.quantity > 0) action = 'VENDI'; // Exit position
     else {
-      // Threshold 1% (could be dynamic)
-      const threshold = effectiveTotal * 0.01;
       if (diff > threshold) action = 'COMPRA';
       else if (diff < -threshold) action = 'VENDI';
     }
 
     if (strategy === 'Accumulate' && action === 'VENDI') action = 'NEUTRO'; // Only buys
 
+    return { p, diff, action };
+  });
+
+  let buyScale = 1;
+  if (strategy === 'Accumulate' && cashInjection > 0) {
+    const totalBuyDiff = baseRows
+      .filter(row => row.action === 'COMPRA')
+      .reduce((sum, row) => sum + Math.max(0, row.diff), 0);
+    if (totalBuyDiff > 0) {
+      buyScale = Math.min(1, cashInjection / totalBuyDiff);
+    }
+  }
+
+  return baseRows.map(({ p, diff, action }) => {
+    const scaledDiff = action === 'COMPRA' ? diff * buyScale : diff;
+    const absAmount = action === 'NEUTRO' ? 0 : Math.abs(scaledDiff);
     return {
       ticker: p.ticker,
       name: p.name,
       action,
-      amount: action === 'NEUTRO' ? 0 : Math.abs(diff),
-      quantity: action === 'NEUTRO' ? 0 : (p.currentPrice > 0 ? Math.abs(diff) / p.currentPrice : 0),
+      amount: absAmount,
+      quantity: absAmount > 0 && p.currentPrice > 0 ? absAmount / p.currentPrice : 0,
       currentPct: p.currentPct,
       targetPct: p.targetPct
     };
@@ -1109,7 +1130,7 @@ export const calculateRegionExposure = (
   instruments: Instrument[]
 ): { region: RegionKey; label: string; pct: number; value: number }[] => {
   if (!state) return [];
-  const instByTicker = new Map(instruments.map(i => [i.ticker, i]));
+  const instByTicker = new Map(instruments.map(i => [getInstrumentKey(i), i]));
   const totals = new Map<RegionKey, number>();
   let unassignedValue = 0;
 
@@ -1195,7 +1216,7 @@ export const calculateAllocationByAssetClass = (
 ): { key: AssetClass; label: string; value: number; pct: number }[] => {
   if (!state) return [];
   const map = new Map<AssetClass, number>();
-  const instByTicker = new Map(instruments.map(i => [i.ticker, i]));
+  const instByTicker = new Map(instruments.map(i => [getInstrumentKey(i), i]));
   state.positions.forEach(p => {
     const inst = instByTicker.get(p.ticker);
     const ac = inst ? (inst.assetClass || inferAssetClass(inst)) : AssetClass.OTHER;

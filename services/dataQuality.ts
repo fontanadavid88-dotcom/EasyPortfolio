@@ -1,6 +1,7 @@
-import { differenceInCalendarDays } from 'date-fns';
 import { AssetClass, AssetType, Currency, Instrument, PricePoint } from '../types';
 import { FxRateRow, resolveFxRateFromSeries } from './fxService';
+import { diffDaysYmd } from './dateUtils';
+import { FX_STALE_DAYS, PRICE_GAP_DAYS, PRICE_STALE_DAYS } from './constants';
 
 export type SeriesIssueType =
   | 'duplicate'
@@ -74,7 +75,7 @@ export const analyzePriceSeries = (
     assetType?: AssetType;
   }
 ): { stats: SeriesStats; issues: SeriesIssue[] } => {
-  const gapDays = options?.gapDays ?? 7;
+  const gapDays = options?.gapDays ?? PRICE_GAP_DAYS;
   const outlierThreshold = options?.outlierThreshold ?? 0.2;
   const thresholds = getOutlierThresholds(options?.assetClass, options?.assetType, outlierThreshold);
   const sorted = [...points].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
@@ -99,14 +100,16 @@ export const analyzePriceSeries = (
       issues.push({ type: 'duplicate', message: 'Data duplicata', date: p.date, severity: 'warning' });
     }
     dateSet.add(p.date);
-    currencySet.add(String(p.currency || ''));
+    if (p.currency) {
+      currencySet.add(String(p.currency));
+    }
 
     if (prevDate) {
       if (p.date < prevDate) {
         nonMonotone++;
         issues.push({ type: 'nonMonotone', message: 'Date non monotone', date: p.date, severity: 'warning' });
       }
-      const gap = differenceInCalendarDays(new Date(p.date), new Date(prevDate));
+      const gap = diffDaysYmd(p.date, prevDate);
       if (gap > gapDays) {
         gaps++;
         issues.push({ type: 'gap', message: `Gap di ${gap} giorni`, date: p.date, severity: 'warning' });
@@ -158,7 +161,7 @@ export type FxRatePoint = {
 
 export const analyzeFxSeries = (
   points: FxRatePoint[],
-  gapDays = 7,
+  gapDays = PRICE_GAP_DAYS,
   outlierThreshold = 0.2
 ): { stats: SeriesStats; issues: SeriesIssue[] } => {
   const mapped: PricePoint[] = points.map(p => ({
@@ -273,15 +276,22 @@ export const analyzeRebalanceQuality = (
   fxRates: FxRatePoint[],
   valuationDate: string,
   baseCurrency: Currency,
-  staleDays = 5
+  staleDays = PRICE_STALE_DAYS
 ): RebalanceQualitySummary => {
   const issues: RebalanceQualityIssue[] = [];
-  const instByTicker = new Map(instruments.map(i => [i.ticker, i]));
+  const fxStaleDays = FX_STALE_DAYS;
+  const instByTicker = new Map<string, Instrument>();
+  instruments.forEach(instr => {
+    const key = instr.symbol || instr.ticker;
+    if (key) instByTicker.set(key, instr);
+    if (instr.ticker) instByTicker.set(instr.ticker, instr);
+  });
   const fxSeries: FxRateRow[] = fxRates;
   const statusByTicker: Record<string, RebalanceAssetStatus> = {};
 
   const resolvePriceTicker = (ticker: string, instrument?: Instrument) => {
     if (instrument?.preferredListing?.symbol) return instrument.preferredListing.symbol;
+    if (instrument?.symbol) return instrument.symbol;
     if (instrument?.ticker) return instrument.ticker;
     return ticker;
   };
@@ -333,7 +343,7 @@ export const analyzeRebalanceQuality = (
         instrumentCurrency: instr.currency
       });
     }
-    const priceAge = differenceInCalendarDays(new Date(valuationDate), new Date(pricePoint.date));
+    const priceAge = diffDaysYmd(valuationDate, pricePoint.date);
     if (priceAge > staleDays) {
       hasStale = true;
       issues.push({
@@ -354,7 +364,7 @@ export const analyzeRebalanceQuality = (
         issues.push({
           ticker,
           type: 'fxMissing',
-          message: `FX mancante ${priceCurrency}->${baseCurrency}`,
+          message: `FX mancante ${priceCurrency}->${baseCurrency} al ${valuationDate}`,
           blocking: true,
           valuationDate,
           priceTicker,
@@ -362,8 +372,8 @@ export const analyzeRebalanceQuality = (
           fxQuote: baseCurrency
         });
       } else {
-        const fxAge = differenceInCalendarDays(new Date(valuationDate), new Date(fxLookup.date));
-        if (fxAge > staleDays) {
+        const fxAge = diffDaysYmd(valuationDate, fxLookup.date);
+        if (fxAge > fxStaleDays) {
           hasStale = true;
           issues.push({
             ticker,
