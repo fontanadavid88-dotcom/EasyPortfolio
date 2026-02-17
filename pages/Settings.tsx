@@ -1444,7 +1444,7 @@ export const Settings: React.FC = () => {
                     )}
                     {!quotaInfo && quotaDiag && (
                       <div className="text-xs text-slate-600 mt-1">
-                        HTTP {quotaDiag.httpStatus} â€¢ {quotaDiag.contentType || 'n/a'}
+                        HTTP {quotaDiag.httpStatus} · {quotaDiag.contentType || 'n/a'}
                       </div>
                     )}
                     {quotaError && (
@@ -1505,7 +1505,7 @@ export const Settings: React.FC = () => {
                     Chiave EODHD non trovata nell’ambiente locale. Aggiungila in `.env.local` e riavvia il dev server.
                   </div>
                 )}
-                {proxyHealth === null && (
+                {proxyHealth == null && !proxyHealthLoading && (
                   <div className="text-slate-500">
                     Stato non testato: premi “Test connessione” per verificare.
                   </div>
@@ -1598,46 +1598,46 @@ export const Settings: React.FC = () => {
               {appsScriptTests.assets && (
                 <div className="text-[11px] text-slate-600">
                   Asset Map: {appsScriptTests.assets.status.toUpperCase()}
-                  {appsScriptTests.assets.count !== undefined ? ` â€¢ count=${appsScriptTests.assets.count}` : ''}
-                  {appsScriptTests.assets.sample ? ` â€¢ ${appsScriptTests.assets.sample}` : ''}
+                  {appsScriptTests.assets.count !== undefined ? ` · count=${appsScriptTests.assets.count}` : ''}
+                  {appsScriptTests.assets.sample ? ` · ${appsScriptTests.assets.sample}` : ''}
                 </div>
               )}
               {appsScriptTests.macro && (
                 <div className="text-[11px] text-slate-600">
                   Macro: {appsScriptTests.macro.status.toUpperCase()}
-                  {appsScriptTests.macro.count !== undefined ? ` â€¢ count=${appsScriptTests.macro.count}` : ''}
-                  {appsScriptTests.macro.sample ? ` â€¢ ${appsScriptTests.macro.sample}` : ''}
+                  {appsScriptTests.macro.count !== undefined ? ` · count=${appsScriptTests.macro.count}` : ''}
+                  {appsScriptTests.macro.sample ? ` · ${appsScriptTests.macro.sample}` : ''}
                 </div>
               )}
               {appsScriptTests.fx && (
                 <div className="text-[11px] text-slate-600">
                   FX: {appsScriptTests.fx.status.toUpperCase()}
-                  {appsScriptTests.fx.count !== undefined ? ` â€¢ count=${appsScriptTests.fx.count}` : ''}
-                  {appsScriptTests.fx.sample ? ` â€¢ ${appsScriptTests.fx.sample}` : ''}
+                  {appsScriptTests.fx.count !== undefined ? ` · count=${appsScriptTests.fx.count}` : ''}
+                  {appsScriptTests.fx.sample ? ` · ${appsScriptTests.fx.sample}` : ''}
                 </div>
               )}
               {appsScriptTests.ping && (
                 <div className="text-[11px] text-slate-600">
                   Ping: {appsScriptTests.ping.status.toUpperCase()}
-                  {appsScriptTests.ping.message ? ` â€¢ ${appsScriptTests.ping.message}` : ''}
+                  {appsScriptTests.ping.message ? ` · ${appsScriptTests.ping.message}` : ''}
                 </div>
               )}
               {appsScriptTests.assets?.diag && appsScriptTests.assets.status === 'err' && (
                 <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
-                  HTTP {appsScriptTests.assets.diag.httpStatus} â€¢ {appsScriptTests.assets.diag.contentType || 'n/a'}
-                  {appsScriptTests.assets.diag.rawPreview ? ` â€¢ ${appsScriptTests.assets.diag.rawPreview}` : ''}
+                  HTTP {appsScriptTests.assets.diag.httpStatus} · {appsScriptTests.assets.diag.contentType || 'n/a'}
+                  {appsScriptTests.assets.diag.rawPreview ? ` · ${appsScriptTests.assets.diag.rawPreview}` : ''}
                 </div>
               )}
               {appsScriptTests.macro?.diag && appsScriptTests.macro.status === 'err' && (
                 <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
-                  HTTP {appsScriptTests.macro.diag.httpStatus} â€¢ {appsScriptTests.macro.diag.contentType || 'n/a'}
-                  {appsScriptTests.macro.diag.rawPreview ? ` â€¢ ${appsScriptTests.macro.diag.rawPreview}` : ''}
+                  HTTP {appsScriptTests.macro.diag.httpStatus} · {appsScriptTests.macro.diag.contentType || 'n/a'}
+                  {appsScriptTests.macro.diag.rawPreview ? ` · ${appsScriptTests.macro.diag.rawPreview}` : ''}
                 </div>
               )}
               {appsScriptTests.fx?.diag && appsScriptTests.fx.status === 'err' && (
                 <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
-                  HTTP {appsScriptTests.fx.diag.httpStatus} â€¢ {appsScriptTests.fx.diag.contentType || 'n/a'}
-                  {appsScriptTests.fx.diag.rawPreview ? ` â€¢ ${appsScriptTests.fx.diag.rawPreview}` : ''}
+                  HTTP {appsScriptTests.fx.diag.httpStatus} · {appsScriptTests.fx.diag.contentType || 'n/a'}
+                  {appsScriptTests.fx.diag.rawPreview ? ` · ${appsScriptTests.fx.diag.rawPreview}` : ''}
                 </div>
               )}
               {appsScriptTests.fx && appsScriptTests.fx.status === 'err' && (
@@ -2033,10 +2033,10 @@ export const Settings: React.FC = () => {
                               {eodhdTests[row.ticker] && (
                                 <div className="text-[10px] text-slate-500 mt-1">
                                   {eodhdTests[row.ticker]?.httpStatus ? `HTTP ${eodhdTests[row.ticker]?.httpStatus}` : ''}
-                                  {eodhdTests[row.ticker]?.contentType ? ` â€¢ ${eodhdTests[row.ticker]?.contentType}` : ''}
-                                  {eodhdTests[row.ticker]?.message ? ` â€¢ ${eodhdTests[row.ticker]?.message}` : ''}
-                                  {eodhdTests[row.ticker]?.sample ? ` â€¢ ${eodhdTests[row.ticker]?.sample}` : ''}
-                                  {eodhdTests[row.ticker]?.parseError ? ` â€¢ parseError: ${eodhdTests[row.ticker]?.parseError}` : ''}
+                                  {eodhdTests[row.ticker]?.contentType ? ` · ${eodhdTests[row.ticker]?.contentType}` : ''}
+                                  {eodhdTests[row.ticker]?.message ? ` · ${eodhdTests[row.ticker]?.message}` : ''}
+                                  {eodhdTests[row.ticker]?.sample ? ` · ${eodhdTests[row.ticker]?.sample}` : ''}
+                                  {eodhdTests[row.ticker]?.parseError ? ` · parseError: ${eodhdTests[row.ticker]?.parseError}` : ''}
                                 </div>
                               )}
                               {eodhdTests[row.ticker]?.rawPreview && eodhdTests[row.ticker]?.status !== 'OK' && (
@@ -2530,7 +2530,7 @@ export const Settings: React.FC = () => {
                         >
                           <option value="">Seleziona...</option>
                           {instruments.map(inst => {
-                            const label = `${inst.symbol || inst.ticker}${inst.name ? ` - ${inst.name}` : ''}${inst.isin ? ` â€¢ ${inst.isin}` : ''}`;
+                            const label = `${inst.symbol || inst.ticker}${inst.name ? ` - ${inst.name}` : ''}${inst.isin ? ` · ${inst.isin}` : ''}`;
                             return (
                               <option key={String(inst.id)} value={String(inst.id)}>{label}</option>
                             );
