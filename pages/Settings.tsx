@@ -1632,11 +1632,15 @@ export const Settings: React.FC = () => {
               <div className="text-xs text-slate-600">
                 Copertura: {coverageSummary.okCount}/{coverageSummary.total} tickers - {coverageSummary.earliest || coverage.earliestCoveredDate || 'N/D'} - {coverageSummary.latest || coverage.latestCoveredDate || 'N/D'}
               </div>
+              <div className="text-xs text-slate-600 space-y-1">
+                <div><span className="font-semibold text-slate-700">Aggiorna prezzi:</span> aggiorna i valori di oggi (Sheets/EODHD) e rinfresca l’app.</div>
+                <div><span className="font-semibold text-slate-700">Scarica storico:</span> usa quando mancano periodi o hai appena importato nuovi strumenti.</div>
+              </div>
               <div className="flex flex-wrap gap-3">
                 <button
                   onClick={handleSync}
                   disabled={loading}
-                  className="bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-blue-600 transition shadow-sm flex items-center gap-2"
+                  className="bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-blue-600 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
                 >
                   {loading ? (
                     <>
@@ -1653,7 +1657,7 @@ export const Settings: React.FC = () => {
                 <button
                   onClick={handleBackfill}
                   disabled={bfLoading}
-                  className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50 transition shadow-sm flex items-center gap-2"
+                  className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
                 >
                   {bfLoading ? (
                     <>
@@ -1692,6 +1696,11 @@ export const Settings: React.FC = () => {
                 </button>
               </div>
               {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
+              {bfStatus && (bfStatus.toLowerCase().includes('errore') || bfStatus.toLowerCase().includes('quota') || bfStatus.toLowerCase().includes('interrotto')) && (
+                <div className="text-xs text-amber-700">
+                  Suggerimento: verifica la chiave EODHD e riprova. Se il problema persiste, usa il Data Inspector per vedere quali ticker mancano.
+                </div>
+              )}
               {syncSummary && (
                 <div className="text-xs text-slate-600 space-y-1">
                   <div>
@@ -1712,13 +1721,18 @@ export const Settings: React.FC = () => {
                     {syncSummary.sheet.enabled ? null : (
                       <div className="text-slate-500">Sheets disabilitato: {syncSummary.sheet.reason}</div>
                     )}
-                    {syncSummary.status === 'quota_exhausted' && (
-                      <div className="text-red-700">
-                        Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili. Riprova dopo il reset o valuta upgrade.
-                      </div>
-                    )}
-                  </div>
-                )}
+                  {syncSummary.status === 'quota_exhausted' && (
+                    <div className="text-red-700">
+                      Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili. Riprova dopo il reset o valuta upgrade.
+                    </div>
+                  )}
+                </div>
+              )}
+              {syncSummary && syncSummary.status !== 'ok' && (
+                <div className="text-xs text-amber-700">
+                  Cosa fare ora: controlla impostazioni Sheet/EODHD/Apps Script, poi riprova. In alternativa apri il Data Inspector per i dettagli.
+                </div>
+              )}
 
               <div className="border-t border-borderSoft pt-3 mt-2 space-y-2 text-xs text-slate-600">
                 <div className="flex flex-wrap gap-4 items-center">

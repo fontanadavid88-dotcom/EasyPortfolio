@@ -213,6 +213,9 @@ export const Dashboard: React.FC = () => {
     []
   );
 
+  const hasTransactions = (transactions?.length || 0) > 0;
+  const hasAnyPrices = (prices?.length || 0) > 0;
+
   // --- Filter State (Global) ---
   const [timeRange, setTimeRange] = useState<'3M' | '6M' | '1Y' | '5Y' | '10Y' | 'YTD' | 'MAX'>('MAX');
   const [metric, setMetric] = useState<'PERF' | 'TWRR' | 'MWRR'>('PERF');
@@ -351,6 +354,7 @@ export const Dashboard: React.FC = () => {
   }, [rangeHistory]);
 
   const hasPerfBase = perfBaseNav > 0;
+  const hasIncompleteData = hasTransactions && (!hasAnyPrices || !baseHistory.length || !hasPerfBase);
   const twrrBaseIndex = useMemo(() => {
     const base = rangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
     return base?.cumulativeTWRRIndex || 1;
@@ -532,6 +536,52 @@ export const Dashboard: React.FC = () => {
           Report PDF
         </a>
       </div>
+
+      {!hasTransactions && (
+        <div className="bg-white border border-borderSoft rounded-2xl p-5 shadow-sm">
+          <div className="text-sm font-bold text-slate-900">Start here</div>
+          <div className="text-xs text-slate-600 mt-1">
+            Nessuna transazione trovata. Aggiungi un primo strumento per iniziare il tracking.
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <a
+              href="#/transactions"
+              className="inline-flex items-center gap-2 bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-sm hover:bg-blue-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              Vai a Transactions
+            </a>
+            <a
+              href="#/settings"
+              className="inline-flex items-center gap-2 bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-slate-50 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              Apri Settings
+            </a>
+          </div>
+        </div>
+      )}
+
+      {hasTransactions && hasIncompleteData && (
+        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5 text-xs text-amber-900">
+          <div className="font-bold">Dati incompleti per prezzi/FX</div>
+          <div className="text-amber-800 mt-1">
+            Alcuni prezzi o tassi FX mancano/sono datati. Aggiorna i dati per sbloccare KPI e grafici.
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <a
+              href="#/settings"
+              className="inline-flex items-center gap-2 bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-sm hover:bg-blue-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              Aggiorna prezzi
+            </a>
+            <a
+              href="#/data?tab=checks"
+              className="inline-flex items-center gap-2 bg-white border border-amber-200 text-amber-800 px-4 py-2 rounded-lg text-xs font-bold hover:bg-amber-100 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              Apri Data Inspector
+            </a>
+          </div>
+        </div>
+      )}
 
       {/* KPI ROW */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-3 md:gap-4">
