@@ -1,11 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import Dexie from 'dexie';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { useLocation } from 'react-router-dom';
 import { db, getCurrentPortfolioId } from '../db';
-import { Currency, Instrument, PricePoint } from '../types';
+import { AssetType, Currency, Instrument, PricePoint } from '../types';
 import { analyzeFxSeries, analyzePriceSeries, FxRatePoint, analyzeRebalanceQuality } from '../services/dataQuality';
+import { PRICE_GAP_DAYS } from '../services/constants';
 import { fillMissingPrices } from '../services/priceBackfill';
 import { buildNavSeriesDetailed, calculateHoldings, getCanonicalTicker, getValuationDateForHoldings } from '../services/financeUtils';
+import { queryFxForPairsRange, queryLatestFxForPairs, queryLatestPricesForTickers, queryPriceBoundsForTickers, queryPricesForTickersRange } from '../services/dbQueries';
+import { downsampleSeries } from '../services/chartUtils';
+import { addDaysYmd, subDaysYmd, diffDaysYmd } from '../services/dateUtils';
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 import clsx from 'clsx';
 import { InfoPopover } from '../components/InfoPopover';
@@ -51,6 +56,7 @@ export const Data: React.FC = () => {
   const [priceRange, setPriceRange] = useState<{ from: string; to: string }>({ from: '', to: '' });
   const [selectedFxPair, setSelectedFxPair] = useState<string>('');
   const [fxRange, setFxRange] = useState<{ from: string; to: string }>({ from: '', to: '' });
+  const [showAllFxRows, setShowAllFxRows] = useState(false);
   const [importPreview, setImportPreview] = useState<PricePoint[]>([]);
   const [importErrors, setImportErrors] = useState<string[]>([]);
   const [fxImportPreview, setFxImportPreview] = useState<FxRatePoint[]>([]);
@@ -58,11 +64,6 @@ export const Data: React.FC = () => {
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const fxImportInputRef = useRef<HTMLInputElement | null>(null);
 
-  const prices = useLiveQuery(
-    () => db.prices.where('portfolioId').equals(currentPortfolioId).toArray(),
-    [currentPortfolioId],
-    []
-  );
   const instruments = useLiveQuery(
     () => db.instruments.where('portfolioId').equals(currentPortfolioId).toArray(),
     [currentPortfolioId],
@@ -73,7 +74,207 @@ export const Data: React.FC = () => {
     [currentPortfolioId],
     []
   );
-  const fxRates = useLiveQuery(() => db.fxRates.toArray(), [], []);
+
+  const portfolioTickers = useMemo(() => {
+    const set = new Set<string>();
+    (instruments || []).forEach(instr => {
+      const ticker = getCanonicalTicker(instr);
+      if (ticker) set.add(ticker);
+      if (instr.ticker) set.add(instr.ticker);
+    });
+    (transactions || []).forEach(t => {
+      if (t.instrumentTicker) set.add(t.instrumentTicker);
+    });
+    return Array.from(set.values()).sort();
+  }, [instruments, transactions]);
+
+  const portfolioTickersKey = useMemo(() => portfolioTickers.join('|'), [portfolioTickers]);
+
+  const todayYmd = useMemo(() => format(new Date(), 'yyyy-MM-dd'), []);
+  const checkWindowStart = useMemo(() => subDaysYmd(todayYmd, 365), [todayYmd]);
+  const checkWindowEnd = todayYmd;
+
+  const selectedTickerBounds = useLiveQuery(
+    async () => {
+      if (!selectedTicker) return { firstPriceDate: undefined, lastPriceDate: undefined };
+      const t0 = performance.now();
+      const bounds = await queryPriceBoundsForTickers({
+        portfolioId: currentPortfolioId,
+        tickers: [selectedTicker],
+        firstTransactionDate: '0000-01-01'
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] price bounds', Math.round(performance.now() - t0), 'ms', bounds);
+      }
+      return bounds;
+    },
+    [currentPortfolioId, selectedTicker],
+    { firstPriceDate: undefined, lastPriceDate: undefined }
+  );
+
+  const priceQueryStart = priceRange.from || selectedTickerBounds?.firstPriceDate || '';
+  const priceQueryEnd = priceRange.to || selectedTickerBounds?.lastPriceDate || '';
+
+  const selectedPrices = useLiveQuery(
+    async () => {
+      if (tab !== 'prices' || !selectedTicker || !priceQueryStart || !priceQueryEnd) return [];
+      const t0 = performance.now();
+      const rows = await queryPricesForTickersRange({
+        portfolioId: currentPortfolioId,
+        tickers: [selectedTicker],
+        startDate: priceQueryStart,
+        endDate: priceQueryEnd
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] prices query', Math.round(performance.now() - t0), 'ms', {
+          ticker: selectedTicker,
+          count: rows.length,
+          range: `${priceQueryStart}..${priceQueryEnd}`
+        });
+      }
+      return rows;
+    },
+    [tab, currentPortfolioId, selectedTicker, priceQueryStart, priceQueryEnd],
+    []
+  );
+
+  const checkPrices = useLiveQuery(
+    async () => {
+      if (!portfolioTickers.length) return [];
+      const t0 = performance.now();
+      const rows = await queryPricesForTickersRange({
+        portfolioId: currentPortfolioId,
+        tickers: portfolioTickers,
+        startDate: checkWindowStart,
+        endDate: checkWindowEnd
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] check prices query', Math.round(performance.now() - t0), 'ms', {
+          tickers: portfolioTickers.length,
+          count: rows.length,
+          range: `${checkWindowStart}..${checkWindowEnd}`
+        });
+      }
+      return rows;
+    },
+    [currentPortfolioId, portfolioTickersKey, checkWindowStart, checkWindowEnd],
+    []
+  );
+
+  const latestPrices = useLiveQuery(
+    async () => {
+      if (!portfolioTickers.length) return [];
+      const t0 = performance.now();
+      const rows = await queryLatestPricesForTickers({
+        portfolioId: currentPortfolioId,
+        tickers: portfolioTickers
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] latest prices query', Math.round(performance.now() - t0), 'ms', {
+          tickers: portfolioTickers.length,
+          count: rows.length
+        });
+      }
+      return rows;
+    },
+    [currentPortfolioId, portfolioTickersKey],
+    []
+  );
+
+  const portfolioCurrencies = useMemo(() => {
+    const set = new Set<Currency>();
+    (instruments || []).forEach(instr => {
+      if (instr.currency) set.add(instr.currency);
+    });
+    (transactions || []).forEach(t => {
+      if (t.currency) set.add(t.currency as Currency);
+    });
+    return Array.from(set.values());
+  }, [instruments, transactions]);
+
+  const fxPairs = useMemo(() => {
+    const base = Currency.CHF;
+    return Array.from(new Set(
+      portfolioCurrencies
+        .filter(c => c && c !== base)
+        .map(c => `${c}/${base}`)
+    )).sort();
+  }, [portfolioCurrencies]);
+
+  const fxPairsKey = useMemo(() => fxPairs.join('|'), [fxPairs]);
+
+  const fxQueryStart = fxRange.from || subDaysYmd(todayYmd, 365);
+  const fxQueryEnd = fxRange.to || todayYmd;
+
+  const selectedFxRates = useLiveQuery(
+    async () => {
+      if (tab !== 'fx' || !selectedFxPair) return [];
+      const t0 = performance.now();
+      const rows = await queryFxForPairsRange({
+        pairs: [selectedFxPair],
+        startDate: fxQueryStart,
+        endDate: fxQueryEnd
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] fx query', Math.round(performance.now() - t0), 'ms', {
+          pair: selectedFxPair,
+          count: rows.length,
+          range: `${fxQueryStart}..${fxQueryEnd}`
+        });
+      }
+      return rows;
+    },
+    [tab, selectedFxPair, fxQueryStart, fxQueryEnd],
+    []
+  );
+
+  const checkFxRates = useLiveQuery(
+    async () => {
+      if (!fxPairs.length) return [];
+      const t0 = performance.now();
+      const rows = await queryFxForPairsRange({
+        pairs: fxPairs,
+        startDate: checkWindowStart,
+        endDate: checkWindowEnd
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] check fx query', Math.round(performance.now() - t0), 'ms', {
+          pairs: fxPairs.length,
+          count: rows.length,
+          range: `${checkWindowStart}..${checkWindowEnd}`
+        });
+      }
+      return rows;
+    },
+    [fxPairsKey, checkWindowStart, checkWindowEnd],
+    []
+  );
+
+  const valuationDate = useMemo(() => {
+    if (!transactions || !instruments || !latestPrices.length) return '';
+    return getValuationDateForHoldings(transactions, latestPrices, instruments) || '';
+  }, [transactions, instruments, latestPrices]);
+
+  const latestFxRates = useLiveQuery(
+    async () => {
+      if (!fxPairs.length || !valuationDate) return [];
+      const t0 = performance.now();
+      const rows = await queryLatestFxForPairs({
+        pairs: fxPairs,
+        upToDate: valuationDate
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] latest fx query', Math.round(performance.now() - t0), 'ms', {
+          pairs: fxPairs.length,
+          count: rows.length,
+          upToDate: valuationDate
+        });
+      }
+      return rows;
+    },
+    [fxPairsKey, valuationDate],
+    []
+  );
 
   useEffect(() => {
     const key = `hiddenTickers:${currentPortfolioId}`;
@@ -101,29 +302,24 @@ export const Data: React.FC = () => {
   };
 
   const tickers = useMemo(() => {
-    const set = new Set((prices || []).map(p => p.ticker).filter(Boolean));
-    return Array.from(set.values()).sort();
-  }, [prices]);
+    return portfolioTickers;
+  }, [portfolioTickers]);
+
+  const checkTickers = useMemo(() => {
+    const maxTickers = 40;
+    return tickers.length > maxTickers ? tickers.slice(0, maxTickers) : tickers;
+  }, [tickers]);
 
   const usedTickers = useMemo(() => {
-    const used = new Set<string>();
-    (prices || []).forEach(p => {
-      if (p.ticker) used.add(p.ticker);
-    });
-    (transactions || []).forEach(t => {
-      if (t.instrumentTicker) used.add(t.instrumentTicker);
-    });
-    (instruments || []).forEach(instr => {
-      const canonical = getCanonicalTicker(instr);
-      if (canonical) used.add(canonical);
-    });
+    const used = new Set<string>(portfolioTickers);
+    if (selectedTicker) used.add(selectedTicker);
     return used;
-  }, [prices, transactions, instruments]);
+  }, [portfolioTickers, selectedTicker]);
 
   const tickerOptions = useMemo(() => {
     const options = new Map<string, { value: string; label: string; isPreferred: boolean; isAlternative: boolean; instrument?: Instrument }>();
     const instrumentsList = instruments || [];
-    const priceTickers = new Set((prices || []).map(p => p.ticker).filter(Boolean));
+    const priceTickers = new Set(portfolioTickers);
     const txTickers = new Set(
       (transactions || [])
         .map(t => t.instrumentTicker)
@@ -153,7 +349,7 @@ export const Data: React.FC = () => {
     });
 
     return filtered.sort((a, b) => a.label.localeCompare(b.label));
-  }, [prices, instruments, transactions, hiddenTickers, showUnusedTickers, usedTickers]);
+  }, [portfolioTickers, instruments, transactions, hiddenTickers, showUnusedTickers, usedTickers]);
 
   const selectedInstrument = useMemo(() => {
     if (!selectedTicker || !instruments) return undefined;
@@ -163,9 +359,9 @@ export const Data: React.FC = () => {
   const selectedCanonicalTicker = selectedInstrument ? getCanonicalTicker(selectedInstrument) : '';
   const isSelectedPreferred = !!selectedTicker && !!selectedCanonicalTicker && selectedTicker === selectedCanonicalTicker;
   const hasPriceData = useMemo(() => {
-    if (!selectedTicker || !prices) return false;
-    return prices.some(p => p.ticker === selectedTicker);
-  }, [prices, selectedTicker]);
+    if (!selectedTicker) return false;
+    return (selectedPrices || []).some(p => p.ticker === selectedTicker);
+  }, [selectedPrices, selectedTicker]);
 
   const firstTransactionDateByTicker = useMemo(() => {
     const map = new Map<string, string>();
@@ -191,10 +387,10 @@ export const Data: React.FC = () => {
   const hiddenTickersSet = useMemo(() => new Set(hiddenTickers), [hiddenTickers]);
 
   const cleanupCandidates = useMemo(() => {
-    if (!prices || !instruments || !transactions) return [];
+    if (!instruments || !transactions) return [];
     const canonicalSet = new Set(instruments.map(instr => getCanonicalTicker(instr)));
     const txSet = new Set(transactions.map(t => t.instrumentTicker).filter(Boolean) as string[]);
-    const priceSet = new Set(prices.map(p => p.ticker).filter(Boolean));
+    const priceSet = new Set(portfolioTickers);
     const allTickers = new Set<string>();
     instruments.forEach(instr => {
       const canonical = getCanonicalTicker(instr);
@@ -217,24 +413,38 @@ export const Data: React.FC = () => {
       candidates.push({ ticker, reason: 'Listing non canonico senza transazioni' });
     });
     return candidates.sort((a, b) => a.ticker.localeCompare(b.ticker));
-  }, [prices, instruments, transactions, hiddenTickersSet, showUnusedTickers]);
+  }, [portfolioTickers, instruments, transactions, hiddenTickersSet, showUnusedTickers]);
+
+  const priceCounts = useLiveQuery(
+    async () => {
+      if (tab !== 'prices' || !portfolioTickers.length) return new Map<string, number>();
+      const t0 = performance.now();
+      const entries = await Promise.all(portfolioTickers.map(async ticker => {
+        const count = await db.prices
+          .where('[ticker+date]')
+          .between([ticker, Dexie.minKey], [ticker, Dexie.maxKey])
+          .and(p => p.portfolioId === currentPortfolioId)
+          .count();
+        return [ticker, count] as const;
+      }));
+      const map = new Map<string, number>(entries);
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Data] price counts', Math.round(performance.now() - t0), 'ms', {
+          tickers: portfolioTickers.length
+        });
+      }
+      return map;
+    },
+    [tab, currentPortfolioId, portfolioTickersKey],
+    new Map<string, number>()
+  );
 
   const cleanupMeta = useMemo(() => {
-    if (!prices || !transactions || !instruments) return null;
+    if (!transactions || !instruments) return null;
     const canonicalSet = new Set(instruments.map(instr => getCanonicalTicker(instr)));
     const txSet = new Set(transactions.map(t => t.instrumentTicker).filter(Boolean) as string[]);
-    const priceCount = new Map<string, number>();
-    prices.forEach(p => {
-      if (!p.ticker) return;
-      priceCount.set(p.ticker, (priceCount.get(p.ticker) || 0) + 1);
-    });
-    return { canonicalSet, txSet, priceCount };
-  }, [prices, transactions, instruments]);
-
-  const fxPairs = useMemo(() => {
-    const set = new Set((fxRates || []).map(r => `${r.baseCurrency}/${r.quoteCurrency}`));
-    return Array.from(set.values()).sort();
-  }, [fxRates]);
+    return { canonicalSet, txSet, priceCount: priceCounts };
+  }, [transactions, instruments, priceCounts]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -270,15 +480,13 @@ export const Data: React.FC = () => {
     }
   }, [location.search]);
 
+  useEffect(() => {
+    setShowAllFxRows(false);
+  }, [selectedFxPair]);
+
   const filteredPrices = useMemo(() => {
-    const rows = (prices || []).filter(p => p.ticker === selectedTicker);
-    if (!priceRange.from && !priceRange.to) return rows;
-    return rows.filter(p => {
-      if (priceRange.from && p.date < priceRange.from) return false;
-      if (priceRange.to && p.date > priceRange.to) return false;
-      return true;
-    });
-  }, [prices, selectedTicker, priceRange]);
+    return selectedPrices || [];
+  }, [selectedPrices]);
 
   const warningsFromDate = useMemo(() => {
     if (showPreTransactions) return '';
@@ -307,18 +515,39 @@ export const Data: React.FC = () => {
   }, [filteredPrices, selectedInstrument, warningsFromDate]);
 
   const fxFiltered = useMemo(() => {
-    if (!selectedFxPair) return [];
-    const [base, quote] = selectedFxPair.split('/');
-    const rows = (fxRates || []).filter(r => r.baseCurrency === base && r.quoteCurrency === quote);
-    if (!fxRange.from && !fxRange.to) return rows;
-    return rows.filter(r => {
-      if (fxRange.from && r.date < fxRange.from) return false;
-      if (fxRange.to && r.date > fxRange.to) return false;
-      return true;
-    });
-  }, [fxRates, selectedFxPair, fxRange]);
+    return selectedFxRates || [];
+  }, [selectedFxRates]);
 
   const fxAnalysis = useMemo(() => analyzeFxSeries(fxFiltered), [fxFiltered]);
+  const fxTableRows = useMemo(() => {
+    return fxFiltered
+      .slice()
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }, [fxFiltered]);
+  const fxTableMaxRows = 200;
+  const fxTableVisible = useMemo(
+    () => (showAllFxRows ? fxTableRows : fxTableRows.slice(0, fxTableMaxRows)),
+    [fxTableRows, showAllFxRows]
+  );
+  const fxGapDetails = useMemo(() => {
+    const sorted = fxFiltered.slice().sort((a, b) => a.date.localeCompare(b.date));
+    const gaps: { from: string; to: string; days: number }[] = [];
+    let prevDate: string | null = null;
+    sorted.forEach(row => {
+      if (prevDate) {
+        const gap = diffDaysYmd(row.date, prevDate);
+        if (gap > PRICE_GAP_DAYS) {
+          gaps.push({
+            from: addDaysYmd(prevDate, 1),
+            to: subDaysYmd(row.date, 1),
+            days: gap - 1
+          });
+        }
+      }
+      prevDate = row.date;
+    });
+    return gaps.sort((a, b) => b.days - a.days);
+  }, [fxFiltered]);
 
   const priceChartData = useMemo(() => {
     return filteredPrices
@@ -333,6 +562,9 @@ export const Data: React.FC = () => {
       .sort((a, b) => a.date.localeCompare(b.date))
       .map(p => ({ date: p.date, close: p.rate }));
   }, [fxFiltered]);
+
+  const priceChartSeries = useMemo(() => downsampleSeries(priceChartData, 900), [priceChartData]);
+  const fxChartSeries = useMemo(() => downsampleSeries(fxChartData, 900), [fxChartData]);
 
   const handlePriceExport = () => {
     if (!selectedTicker) return;
@@ -490,9 +722,10 @@ export const Data: React.FC = () => {
   };
 
   const removeDuplicatePrices = async () => {
-    if (!prices || prices.length === 0) return;
+    const rows = await db.prices.where('portfolioId').equals(currentPortfolioId).toArray();
+    if (!rows || rows.length === 0) return;
     const byKey = new Map<string, PricePoint[]>();
-    prices.forEach(row => {
+    rows.forEach(row => {
       const key = `${row.ticker}|${row.date}`;
       const arr = byKey.get(key) || [];
       arr.push(row);
@@ -512,9 +745,10 @@ export const Data: React.FC = () => {
   };
 
   const removeDuplicateFx = async () => {
-    if (!fxRates || fxRates.length === 0) return;
+    const rows = await db.fxRates.toArray();
+    if (!rows || rows.length === 0) return;
     const byKey = new Map<string, { id?: number }[]>();
-    fxRates.forEach(row => {
+    rows.forEach(row => {
       const key = `${row.baseCurrency}/${row.quoteCurrency}|${row.date}`;
       const arr = byKey.get(key) || [];
       arr.push(row);
@@ -535,46 +769,129 @@ export const Data: React.FC = () => {
 
   const navChecks = useMemo(() => {
     if (checkRunId === 0) return null;
-    if (!transactions || !instruments || !prices) return null;
-    const detailed = buildNavSeriesDetailed(transactions, instruments, prices, 'daily');
+    if (!transactions || !instruments || !checkPrices) return null;
+    const detailed = buildNavSeriesDetailed(transactions, instruments, checkPrices, 'daily', checkWindowStart, checkWindowEnd);
     const missingPriceDays = detailed.filter(p => p.missingPriceTickers.length > 0);
     const backfilledDays = detailed.filter(p => p.backfilledPriceTickers.length > 0);
     const dateIndex = detailed.map(point => point.date);
     const priceTickers = Array.from(new Set(instruments.map(instr => getCanonicalTicker(instr)).filter(Boolean)));
-    const priceFillMeta = fillMissingPrices(prices, dateIndex, { tickers: priceTickers }).meta;
-    const backfillRows = Object.entries(priceFillMeta.countsByTicker)
-      .map(([ticker, count]) => ({
-        ticker,
-        count,
-        range: priceFillMeta.filledRangesByTicker[ticker]
-      }))
-      .sort((a, b) => b.count - a.count);
+    const fillResult = fillMissingPrices(checkPrices, dateIndex, { tickers: priceTickers });
+    const priceFillMeta = fillResult.meta;
+    const warningsByTicker = new Map<string, { startDate: string; endDate: string; gapDays: number }[]>();
+    priceFillMeta.warnings.forEach(w => {
+      const arr = warningsByTicker.get(w.ticker) || [];
+      arr.push(w);
+      warningsByTicker.set(w.ticker, arr);
+    });
+    const tickerMeta = new Map<string, { isCrypto: boolean; group: string }>();
+    priceTickers.forEach(ticker => {
+      const instr = resolveInstrumentForTicker(instruments || [], ticker);
+      const isCrypto = instr?.type === AssetType.Crypto;
+      const parts = ticker.split('.');
+      const group = isCrypto ? 'CRYPTO' : (parts.length > 1 ? (parts[parts.length - 1] || 'NO_SUFFIX').toUpperCase() : 'NO_SUFFIX');
+      tickerMeta.set(ticker, { isCrypto, group });
+    });
+    const datesPresentByTicker = new Map<string, Set<string>>();
+    const unionTradingDatesByGroup = new Map<string, Set<string>>();
+    checkPrices.forEach(row => {
+      if (!row?.ticker || !row?.date) return;
+      const set = datesPresentByTicker.get(row.ticker) || new Set<string>();
+      set.add(row.date);
+      datesPresentByTicker.set(row.ticker, set);
+      const meta = tickerMeta.get(row.ticker);
+      if (!meta || meta.isCrypto) return;
+      const groupSet = unionTradingDatesByGroup.get(meta.group) || new Set<string>();
+      groupSet.add(row.date);
+      unionTradingDatesByGroup.set(meta.group, groupSet);
+    });
+
+    let weekendTotal = 0;
+    let closedTotal = 0;
+    let realMissingTotal = 0;
+
+    const backfillRows = priceTickers
+      .map(ticker => {
+        const meta = tickerMeta.get(ticker) || {
+          isCrypto: false,
+          group: (ticker.split('.').length > 1 ? ticker.split('.').pop() || 'NO_SUFFIX' : 'NO_SUFFIX')
+        };
+        const present = datesPresentByTicker.get(ticker) || new Set<string>();
+        let weekendCount = 0;
+        let closedCount = 0;
+        let realMissing = 0;
+        if (meta.isCrypto) {
+          dateIndex.forEach(date => {
+            if (!present.has(date)) realMissing += 1;
+          });
+        } else {
+          const tradingDates = unionTradingDatesByGroup.get(meta.group) || new Set<string>();
+          dateIndex.forEach(date => {
+            if (present.has(date)) return;
+            const day = new Date(`${date}T00:00:00Z`).getUTCDay();
+            if (day === 0 || day === 6) {
+              weekendCount += 1;
+              return;
+            }
+            if (!tradingDates.has(date)) {
+              closedCount += 1;
+              return;
+            }
+            realMissing += 1;
+          });
+        }
+        weekendTotal += weekendCount;
+        closedTotal += closedCount;
+        realMissingTotal += realMissing;
+        let range: { start: string; end: string; gapDays?: number } | undefined;
+        if (realMissing > 0) {
+          const warn = warningsByTicker.get(ticker)?.[0];
+          if (warn) {
+            range = { start: warn.startDate, end: warn.endDate, gapDays: warn.gapDays };
+          }
+        }
+        return {
+          ticker,
+          realMissingDays: realMissing,
+          weekendDays: weekendCount,
+          closedDays: closedCount,
+          isCrypto: meta.isCrypto,
+          range
+        };
+      })
+      .sort((a, b) => b.realMissingDays - a.realMissingDays);
+
+    const filteredWarnings = priceFillMeta.warnings.filter(w => {
+      const row = backfillRows.find(r => r.ticker === w.ticker);
+      return row ? row.realMissingDays > 0 : false;
+    });
     return {
       missingPriceDays: missingPriceDays.length,
       examples: missingPriceDays.slice(0, 5),
       backfilledPriceDays: backfilledDays.length,
       backfillTotal: priceFillMeta.totalFilled,
+      weekendTotal,
+      closedTotal,
+      realMissingTotal,
       backfillRows,
-      backfillWarnings: priceFillMeta.warnings
+      backfillWarnings: filteredWarnings
     };
-  }, [transactions, instruments, prices, checkRunId]);
+  }, [transactions, instruments, checkPrices, checkRunId, checkWindowStart, checkWindowEnd]);
 
   const rebalanceQuality = useMemo(() => {
     if (checkRunId === 0) return null;
-    if (!transactions || !instruments || !prices || !fxRates) return null;
-    const valuationDate = getValuationDateForHoldings(transactions, prices, instruments);
+    if (!transactions || !instruments || !latestPrices || !latestFxRates) return null;
     if (!valuationDate) return null;
     const holdings = calculateHoldings(transactions);
     return {
       valuationDate,
-      summary: analyzeRebalanceQuality(holdings, instruments, prices, fxRates, valuationDate, Currency.CHF)
+      summary: analyzeRebalanceQuality(holdings, instruments, latestPrices, latestFxRates, valuationDate, Currency.CHF)
     };
-  }, [transactions, instruments, prices, fxRates, checkRunId]);
+  }, [transactions, instruments, latestPrices, latestFxRates, valuationDate, checkRunId]);
 
   const navSummary = useMemo(() => {
     if (checkRunId === 0) return null;
-    if (!transactions || !instruments || !prices) return null;
-    const detailed = buildNavSeriesDetailed(transactions, instruments, prices, 'daily');
+    if (!transactions || !instruments || !checkPrices) return null;
+    const detailed = buildNavSeriesDetailed(transactions, instruments, checkPrices, 'daily', checkWindowStart, checkWindowEnd);
     if (!detailed.length) return null;
     const start = detailed[0];
     const end = detailed[detailed.length - 1];
@@ -590,12 +907,12 @@ export const Data: React.FC = () => {
       pnl,
       totalReturnPct
     };
-  }, [transactions, instruments, prices, checkRunId]);
+  }, [transactions, instruments, checkPrices, checkRunId, checkWindowStart, checkWindowEnd]);
 
   const priceChecksSummary = useMemo(() => {
-    if (!prices || tickers.length === 0) return [];
-    return tickers.map(ticker => {
-      const rows = prices.filter(p => p.ticker === ticker);
+    if (!checkPrices || checkTickers.length === 0) return [];
+    return checkTickers.map(ticker => {
+      const rows = checkPrices.filter(p => p.ticker === ticker);
       const instr = resolveInstrumentForTicker(instruments || [], ticker);
       const { stats, issues } = analyzePriceSeries(rows, {
         assetClass: instr?.assetClass,
@@ -603,17 +920,17 @@ export const Data: React.FC = () => {
       });
       return { ticker, stats, issueCount: issues.length };
     });
-  }, [prices, tickers, instruments]);
+  }, [checkPrices, checkTickers, instruments]);
 
   const fxChecksSummary = useMemo(() => {
-    if (!fxRates || fxPairs.length === 0) return [];
+    if (!checkFxRates || fxPairs.length === 0) return [];
     return fxPairs.map(pair => {
       const [base, quote] = pair.split('/');
-      const rows = (fxRates as FxRatePoint[]).filter(r => r.baseCurrency === base && r.quoteCurrency === quote);
+      const rows = (checkFxRates as FxRatePoint[]).filter(r => r.baseCurrency === base && r.quoteCurrency === quote);
       const { stats, issues } = analyzeFxSeries(rows);
       return { pair, stats, issueCount: issues.length };
     });
-  }, [fxRates, fxPairs]);
+  }, [checkFxRates, fxPairs]);
 
   const topIssues = useMemo(() => {
     const items: {
@@ -761,6 +1078,28 @@ export const Data: React.FC = () => {
     return { label: 'PARZIALE', className: 'bg-slate-100 text-slate-700', title: 'Parziale: anomalie non bloccanti' };
   };
 
+  const openTab = (next: TabKey) => {
+    setTab(next);
+    if (typeof window !== 'undefined') {
+      window.location.hash = `/data?tab=${next}`;
+    }
+  };
+
+  const openTabFromHref = (href: string) => {
+    if (!href.includes('?')) {
+      if (typeof window !== 'undefined') window.location.hash = href.replace(/^#/, '');
+      return;
+    }
+    const query = href.split('?')[1] || '';
+    const params = new URLSearchParams(query);
+    const tabParam = params.get('tab');
+    if (tabParam === 'prices' || tabParam === 'fx' || tabParam === 'checks') {
+      openTab(tabParam);
+      return;
+    }
+    if (typeof window !== 'undefined') window.location.hash = href.replace(/^#/, '');
+  };
+
   return (
     <div className="space-y-6 pb-20 animate-fade-in text-textPrimary">
       <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-lg">
@@ -797,19 +1136,39 @@ export const Data: React.FC = () => {
                     <div><span className="font-semibold">Azione:</span> {issue.action}</div>
                   </div>
                   <div className="mt-2 flex flex-wrap gap-2">
-                    <a
-                      href={issue.primary.href}
-                      className="inline-flex items-center gap-2 bg-[#0052a3] text-white px-3 py-1.5 rounded-lg text-[11px] font-bold shadow-sm hover:bg-blue-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                    >
-                      {issue.primary.label}
-                    </a>
-                    {issue.secondary && (
-                      <a
-                        href={issue.secondary.href}
-                        className="inline-flex items-center gap-2 bg-white border border-amber-200 text-amber-800 px-3 py-1.5 rounded-lg text-[11px] font-bold hover:bg-amber-100 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                    {issue.primary.href.startsWith('#/data?tab=') ? (
+                      <button
+                        type="button"
+                        onClick={() => openTabFromHref(issue.primary.href)}
+                        className="inline-flex items-center gap-2 bg-[#0052a3] text-white px-3 py-1.5 rounded-lg text-[11px] font-bold shadow-sm hover:bg-blue-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
                       >
-                        {issue.secondary.label}
+                        {issue.primary.label}
+                      </button>
+                    ) : (
+                      <a
+                        href={issue.primary.href}
+                        className="inline-flex items-center gap-2 bg-[#0052a3] text-white px-3 py-1.5 rounded-lg text-[11px] font-bold shadow-sm hover:bg-blue-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                      >
+                        {issue.primary.label}
                       </a>
+                    )}
+                    {issue.secondary && (
+                      issue.secondary.href.startsWith('#/data?tab=') ? (
+                        <button
+                          type="button"
+                          onClick={() => openTabFromHref(issue.secondary!.href)}
+                          className="inline-flex items-center gap-2 bg-white border border-amber-200 text-amber-800 px-3 py-1.5 rounded-lg text-[11px] font-bold hover:bg-amber-100 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                        >
+                          {issue.secondary.label}
+                        </button>
+                      ) : (
+                        <a
+                          href={issue.secondary.href}
+                          className="inline-flex items-center gap-2 bg-white border border-amber-200 text-amber-800 px-3 py-1.5 rounded-lg text-[11px] font-bold hover:bg-amber-100 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                        >
+                          {issue.secondary.label}
+                        </a>
+                      )
                     )}
                   </div>
                 </div>
@@ -953,21 +1312,21 @@ export const Data: React.FC = () => {
 
           {selectedTicker && (
             <>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-600">
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
-                  <div className="text-[10px] uppercase font-bold text-slate-400">Start</div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-700">
+                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">Start</div>
                   <div className="font-semibold">{priceAnalysis.stats.startDate || 'N/D'}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
-                  <div className="text-[10px] uppercase font-bold text-slate-400">End</div>
+                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">End</div>
                   <div className="font-semibold">{priceAnalysis.stats.endDate || 'N/D'}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
-                  <div className="text-[10px] uppercase font-bold text-slate-400">Count</div>
+                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">Count</div>
                   <div className="font-semibold">{priceAnalysis.stats.count}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
-                  <div className="text-[10px] uppercase font-bold text-slate-400">Currency</div>
+                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">Currency</div>
                   <select
                     value={String(priceAnalysis.stats.currency || '')}
                     onChange={handlePriceCurrencyChange}
@@ -989,7 +1348,7 @@ export const Data: React.FC = () => {
 
               <div className="h-56 border border-borderSoft rounded-xl bg-slate-50">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={priceChartData}>
+                  <LineChart data={priceChartSeries}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                     <XAxis dataKey="date" tick={{ fontSize: 10 }} />
                     <YAxis tick={{ fontSize: 10 }} />
@@ -1000,7 +1359,7 @@ export const Data: React.FC = () => {
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <div className="bg-slate-50 border border-borderSoft rounded-xl p-3">
+                <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-slate-800">
                   <div className="flex items-center justify-between mb-2">
                     <div className="text-xs font-bold text-slate-500 uppercase">Warnings</div>
                     <label className="inline-flex items-center gap-2 text-[11px] text-slate-500">
@@ -1035,10 +1394,10 @@ export const Data: React.FC = () => {
                     </ul>
                   )}
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 overflow-auto max-h-56">
+                <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 overflow-auto max-h-56 text-slate-800">
                   <div className="text-xs font-bold text-slate-500 uppercase mb-2">Prezzi</div>
-                  <table className="w-full text-xs">
-                    <thead className="text-slate-400 uppercase">
+                  <table className="w-full text-xs text-slate-800">
+                    <thead className="text-[10px] uppercase text-slate-600 sticky top-0 bg-slate-50">
                       <tr>
                         <th className="text-left py-1">Date</th>
                         <th className="text-right py-1">Close</th>
@@ -1048,7 +1407,7 @@ export const Data: React.FC = () => {
                       {priceChartData.slice(-40).map((row, idx) => (
                         <tr key={`${row.date}-${idx}`}>
                           <td className="py-1">{row.date}</td>
-                          <td className="py-1 text-right">{row.close}</td>
+                          <td className="py-1 text-right font-mono text-slate-800">{row.close}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1117,8 +1476,9 @@ export const Data: React.FC = () => {
                           if (!cleanupMeta) return;
                           const isCanonical = cleanupMeta.canonicalSet.has(candidate.ticker);
                           const hasTx = cleanupMeta.txSet.has(candidate.ticker);
-                          const priceCount = cleanupMeta.priceCount.get(candidate.ticker) || 0;
-                          if (isCanonical || hasTx || priceCount > 0) return;
+                          const priceCount = cleanupMeta.priceCount.get(candidate.ticker);
+                          const hasPriceCount = cleanupMeta.priceCount.has(candidate.ticker);
+                          if (!hasPriceCount || isCanonical || hasTx || (priceCount ?? 0) > 0) return;
                           const ok = window.confirm(`Eliminare definitivamente il listing ${candidate.ticker}? Questa azione e irreversibile.`);
                           if (!ok) return;
                           await db.prices
@@ -1131,19 +1491,21 @@ export const Data: React.FC = () => {
                         }}
                         className={clsx(
                           'px-2 py-1 rounded text-[11px] font-bold border',
-                          cleanupMeta
-                            && !cleanupMeta.canonicalSet.has(candidate.ticker)
-                            && !cleanupMeta.txSet.has(candidate.ticker)
-                            && (cleanupMeta.priceCount.get(candidate.ticker) || 0) === 0
-                            ? 'bg-red-50 text-red-700 border-red-200'
-                            : 'bg-slate-100 text-slate-400 border-borderSoft cursor-not-allowed'
-                        )}
-                        disabled={
-                          !cleanupMeta
-                          || cleanupMeta.canonicalSet.has(candidate.ticker)
-                          || cleanupMeta.txSet.has(candidate.ticker)
-                          || (cleanupMeta.priceCount.get(candidate.ticker) || 0) > 0
-                        }
+                            cleanupMeta
+                              && cleanupMeta.priceCount.has(candidate.ticker)
+                              && !cleanupMeta.canonicalSet.has(candidate.ticker)
+                              && !cleanupMeta.txSet.has(candidate.ticker)
+                              && (cleanupMeta.priceCount.get(candidate.ticker) || 0) === 0
+                              ? 'bg-red-50 text-red-700 border-red-200'
+                              : 'bg-slate-100 text-slate-400 border-borderSoft cursor-not-allowed'
+                          )}
+                          disabled={
+                            !cleanupMeta
+                            || !cleanupMeta.priceCount.has(candidate.ticker)
+                            || cleanupMeta.canonicalSet.has(candidate.ticker)
+                            || cleanupMeta.txSet.has(candidate.ticker)
+                            || (cleanupMeta.priceCount.get(candidate.ticker) || 0) > 0
+                          }
                       >
                         Elimina
                       </button>
@@ -1233,7 +1595,7 @@ export const Data: React.FC = () => {
 
               <div className="h-56 border border-borderSoft rounded-xl bg-slate-50">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={fxChartData}>
+                  <LineChart data={fxChartSeries}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                     <XAxis dataKey="date" tick={{ fontSize: 10 }} />
                     <YAxis tick={{ fontSize: 10 }} />
@@ -1243,16 +1605,82 @@ export const Data: React.FC = () => {
                 </ResponsiveContainer>
               </div>
 
+              <div className="bg-white border border-borderSoft rounded-xl overflow-hidden">
+                <div className="flex items-center justify-between px-3 py-2 border-b border-borderSoft bg-slate-50 text-xs text-slate-600">
+                  <span className="font-bold uppercase text-slate-500">Righe FX</span>
+                  <div className="flex items-center gap-3">
+                    <span>
+                      {fxTableRows.length > fxTableMaxRows
+                        ? `Mostrati ${showAllFxRows ? 'tutti' : `ultimi ${fxTableMaxRows}`} / ${fxTableRows.length}`
+                        : `Totale: ${fxTableRows.length}`}
+                    </span>
+                    {fxTableRows.length > fxTableMaxRows && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllFxRows(prev => !prev)}
+                        className="text-[11px] font-bold text-[#0052a3] hover:text-blue-600"
+                      >
+                        {showAllFxRows ? 'Limita a 200' : 'Mostra tutte'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="max-h-64 overflow-auto">
+                  <table className="w-full text-xs">
+                    <thead className="sticky top-0 bg-white border-b border-borderSoft text-slate-500">
+                      <tr>
+                        <th className="text-left px-3 py-2 font-semibold">Data</th>
+                        <th className="text-right px-3 py-2 font-semibold">Rate</th>
+                        <th className="text-left px-3 py-2 font-semibold">Base</th>
+                        <th className="text-left px-3 py-2 font-semibold">Quote</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {fxTableVisible.map((row, idx) => (
+                        <tr key={`${row.date}-${idx}`} className="border-b border-borderSoft last:border-0">
+                          <td className="px-3 py-2 text-slate-700">{row.date}</td>
+                          <td className="px-3 py-2 text-right text-slate-700">{Number.isFinite(row.rate) ? row.rate : 'N/D'}</td>
+                          <td className="px-3 py-2 text-slate-500">{row.baseCurrency}</td>
+                          <td className="px-3 py-2 text-slate-500">{row.quoteCurrency}</td>
+                        </tr>
+                      ))}
+                      {fxTableVisible.length === 0 && (
+                        <tr>
+                          <td className="px-3 py-3 text-slate-500" colSpan={4}>Nessuna riga FX disponibile.</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
               <div className="bg-slate-50 border border-borderSoft rounded-xl p-3">
                 <div className="text-xs font-bold text-slate-500 uppercase mb-2">Warnings</div>
                 {fxAnalysis.issues.length === 0 ? (
                   <div className="text-xs text-slate-500">Nessun problema rilevato.</div>
                 ) : (
-                  <ul className="text-xs text-slate-600 space-y-1 max-h-48 overflow-auto">
-                    {fxAnalysis.issues.slice(0, 30).map((issue, idx) => (
-                      <li key={`${issue.type}-${idx}`}>{issue.message}{issue.date ? ` (${issue.date})` : ''}</li>
-                    ))}
-                  </ul>
+                  <div className="text-xs text-slate-600 space-y-2 max-h-56 overflow-auto">
+                    {fxGapDetails.length > 0 && (
+                      <div className="bg-white border border-borderSoft rounded-lg p-2">
+                        <div className="font-semibold text-slate-700 mb-1">Gap rilevati</div>
+                        <ul className="space-y-1">
+                          {fxGapDetails.slice(0, 5).map((gap, idx) => (
+                            <li key={`${gap.from}-${idx}`}>
+                              Gap di {gap.days} giorni: {gap.from} → {gap.to}
+                            </li>
+                          ))}
+                        </ul>
+                        {fxGapDetails.length > 5 && (
+                          <div className="text-[11px] text-slate-500 mt-1">Mostrati i 5 gap più grandi.</div>
+                        )}
+                      </div>
+                    )}
+                    <ul className="space-y-1">
+                      {fxAnalysis.issues.slice(0, 30).map((issue, idx) => (
+                        <li key={`${issue.type}-${idx}`}>{issue.message}{issue.date ? ` (${issue.date})` : ''}</li>
+                      ))}
+                    </ul>
+                  </div>
                 )}
               </div>
 
@@ -1279,6 +1707,21 @@ export const Data: React.FC = () => {
       {tab === 'checks' && (
         <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-lg space-y-4">
           <div className="text-sm text-slate-600">Report sintetico su dati prezzi/FX e impatto sul NAV.</div>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-slate-100 text-slate-600 border border-borderSoft">
+              Mostrati: primi 40 ticker
+            </span>
+            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+              Finestra analisi: ultimi 365 giorni
+            </span>
+            <details className="text-xs text-slate-500">
+              <summary className="cursor-pointer hover:text-slate-700 font-semibold">Perché?</summary>
+              <div className="mt-1 text-[11px] text-slate-500 max-w-[520px]">
+                Per mantenere la pagina fluida con dataset grandi, i check sono sintetici e focalizzati sull’ultimo anno.
+                I dati completi restano disponibili nelle tab Prezzi/FX.
+              </div>
+            </details>
+          </div>
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
@@ -1356,14 +1799,29 @@ export const Data: React.FC = () => {
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-900">
               <div className="font-bold text-amber-800 uppercase mb-2">Backfill prezzi</div>
               <div className="text-amber-800">
-                Punti sintetici: <span className="font-semibold">{navChecks.backfillTotal}</span> · Giorni con backfill: <span className="font-semibold">{navChecks.backfilledPriceDays}</span>
+                Weekend/festivi (normali): <span className="font-semibold">{navChecks.weekendTotal}</span>
+              </div>
+              <div className="text-amber-800">
+                Giorni borsa chiusa (inferiti): <span className="font-semibold">{navChecks.closedTotal}</span>
+              </div>
+              <div className="text-amber-800">
+                Buchi REALI su giorni di trading: <span className="font-semibold">{navChecks.realMissingTotal}</span>
+              </div>
+              <div className="text-amber-700 mt-1">
+                Significato: mancano prezzi in alcuni giorni nel periodo NAV. Se ti serve continuita/backtest, usa Settings -&gt; "Scarica storico prezzi".
+              </div>
+              <div className="text-amber-700 mt-1">
+                Nota: per ETF/azioni e normale non avere prezzi nei weekend; l'app usa l'ultimo close disponibile per continuita NAV.
               </div>
               {navChecks.backfillRows.length > 0 && (
                 <div className="mt-2 space-y-1">
                   {navChecks.backfillRows.slice(0, 8).map(row => (
                     <div key={`backfill-${row.ticker}`} className="flex items-center justify-between">
                       <span className="font-semibold">{row.ticker}</span>
-                      <span>{row.count} {row.range ? `(${row.range.start} → ${row.range.end})` : ''}</span>
+                      <span>
+                        Buchi reali{row.isCrypto ? ' (crypto)' : ''}: {row.realMissingDays}
+                        {row.realMissingDays > 0 && row.range ? ` (${row.range.start} -> ${row.range.end}${row.range.gapDays ? ", " + row.range.gapDays + "g" : ""})` : ""}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -1374,7 +1832,7 @@ export const Data: React.FC = () => {
                   <ul className="space-y-1">
                     {navChecks.backfillWarnings.slice(0, 5).map((warning, idx) => (
                       <li key={`gap-${warning.ticker}-${idx}`}>
-                        {warning.ticker}: {warning.startDate} → {warning.endDate} ({warning.gapDays}g)
+                        {warning.ticker}: {warning.startDate} -&gt; {warning.endDate} ({warning.gapDays}g)
                       </li>
                     ))}
                   </ul>
@@ -1404,11 +1862,11 @@ export const Data: React.FC = () => {
           )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs">
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs text-slate-800">
               <div className="font-bold text-slate-500 uppercase mb-2">Price checks</div>
               <div className="max-h-64 overflow-auto">
-                <table className="w-full">
-                  <thead className="text-[10px] uppercase text-slate-400 sticky top-0 bg-slate-50">
+                <table className="w-full text-slate-800">
+                  <thead className="text-[10px] uppercase text-slate-600 sticky top-0 bg-slate-50">
                     <tr>
                       <th className="text-left py-1">Ticker</th>
                       <th className="text-right py-1">Issues</th>
@@ -1441,11 +1899,11 @@ export const Data: React.FC = () => {
                 </table>
               </div>
             </div>
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs">
+            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs text-slate-800">
               <div className="font-bold text-slate-500 uppercase mb-2">FX checks</div>
               <div className="max-h-64 overflow-auto">
-                <table className="w-full">
-                  <thead className="text-[10px] uppercase text-slate-400 sticky top-0 bg-slate-50">
+                <table className="w-full text-slate-800">
+                  <thead className="text-[10px] uppercase text-slate-600 sticky top-0 bg-slate-50">
                     <tr>
                       <th className="text-left py-1">Pair</th>
                       <th className="text-right py-1">Issues</th>

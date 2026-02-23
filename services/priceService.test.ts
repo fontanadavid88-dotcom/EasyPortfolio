@@ -9,10 +9,12 @@ import {
   computeAutoGapRange,
   isAutoGapCandidate,
   limitTickersByBudget,
-  resolveBackfillSymbol
+  resolveBackfillSymbol,
+  resolveProxyFailure
 } from './priceService';
 import * as priceService from './priceService';
 import { AppSettings, AssetType, Currency, Instrument } from '../types';
+import type { ProxyHealth } from './apiHealthService';
 
 describe('buildCoverageRows', () => {
   it('maps coverage rows to instruments and fills defaults', () => {
@@ -132,6 +134,22 @@ describe('resolveBackfillSymbol', () => {
   it('uses eodhdSymbol even when provider is SHEETS', () => {
     const symbol = resolveBackfillSymbol('AAA', { provider: 'SHEETS', eodhdSymbol: 'BBB.US' }, AssetType.Stock);
     expect(symbol).toBe('BBB.US');
+  });
+});
+
+describe('resolveProxyFailure', () => {
+  it('maps proxy unreachable to status', () => {
+    const health: ProxyHealth = {
+      ok: false,
+      tested: true,
+      hasEodhdKey: false,
+      usingLocalKey: false,
+      mode: 'no-key',
+      message: 'Proxy /api non raggiungibile',
+      diag: { httpStatus: 404, ok: false, rawPreview: '<html>' }
+    };
+    const result = resolveProxyFailure(health);
+    expect(result?.status).toBe('proxy_unreachable');
   });
 });
 

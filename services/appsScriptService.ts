@@ -8,6 +8,8 @@ export type AppsScriptDiagnostics = {
   diag: FetchJsonDiagnostics;
 };
 
+export const APPS_SCRIPT_DISABLED_MESSAGE = 'Apps Script non configurato';
+
 export type AppsScriptAssetRow = {
   ticker: string;
   sheetSymbol?: string;
@@ -165,7 +167,7 @@ export const fetchAppsScript = async (
   if (!baseUrl || !key) {
     return {
       ok: false,
-      error: 'DISABILITATO',
+      error: APPS_SCRIPT_DISABLED_MESSAGE,
       diag: { url: baseUrl || '', diag: { httpStatus: 0, ok: false, rawPreview: '' } }
     };
   }
@@ -335,6 +337,9 @@ export const applyFxRowsToDexie = async (
   }));
 
   await db.fxRates.bulkPut(toSave);
+  if (import.meta.env?.DEV) {
+    console.log('[SYNC][FX]', { saved: toSave.length, source });
+  }
   return toSave.length;
 };
 
@@ -353,12 +358,28 @@ export const syncFxRates = async (
   try {
     const result = await fetchFx(settings);
     if (!result.ok) {
-      return { ok: false, error: result.error, diag: result.diag };
+      const rawError = result.error || 'Apps Script non disponibile';
+      const error = rawError === APPS_SCRIPT_DISABLED_MESSAGE
+        ? rawError
+        : rawError.startsWith('HTTP')
+          ? 'Apps Script non disponibile'
+          : rawError;
+      if (import.meta.env?.DEV) {
+        console.log('[SYNC][FX]', { ok: false, error, httpStatus: result.diag?.diag.httpStatus });
+      }
+      return { ok: false, error, diag: result.diag };
     }
     const rows = result.data || [];
     const count = await applyFxRowsToDexie(rows, db, source);
+    if (import.meta.env?.DEV) {
+      console.log('[SYNC][FX]', { ok: true, count });
+    }
     return { ok: true, count, rows, diag: result.diag };
   } catch (e: any) {
-    return { ok: false, error: e?.message || 'Errore sync FX' };
+    const error = e?.message || 'Errore sync FX';
+    if (import.meta.env?.DEV) {
+      console.log('[SYNC][FX]', { ok: false, error });
+    }
+    return { ok: false, error };
   }
 };

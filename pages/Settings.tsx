@@ -5,8 +5,10 @@ import { AutoGapScope, getAutoGapFillEnabled, setAutoGapFillEnabled, getAutoGapF
 import { fetchJsonWithDiagnostics, toNum, FetchJsonDiagnostics } from '../services/diagnostics';
 import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
-import { importFxCsv, FxRateRow } from '../services/fxService';
-import { fetchAppsScriptPing, fetchAssetsMap, fetchMacro, applyAssetsMapToSettings, applyMacroRowsToDexie, syncFxRates, AppsScriptFxRow } from '../services/appsScriptService';
+import { importFxCsv, FxRateRow, backfillFxRatesForPortfolio, getFxPairsForPortfolio, FxBackfillSummary } from '../services/fxService';
+import { fetchAppsScriptPing, fetchAssetsMap, fetchMacro, applyAssetsMapToSettings, applyMacroRowsToDexie, syncFxRates, AppsScriptFxRow, APPS_SCRIPT_DISABLED_MESSAGE } from '../services/appsScriptService';
+import { checkProxyHealth } from '../services/apiHealthService';
+import type { ProxyHealth } from '../services/apiHealthService';
 import { isIsin, normalizeTicker, resolveEodhdSymbol, hasExchangeSuffix } from '../services/symbolUtils';
 import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType, Transaction } from '../types';
 import { createUuid } from '../services/idUtils';
@@ -16,6 +18,7 @@ import { format, subDays } from 'date-fns';
 import { useLocation } from 'react-router-dom';
 import { resetSymbolMigrationFlag, runSymbolMigrationOnce } from '../services/symbolMigration';
 import clsx from 'clsx';
+import Dexie from 'dexie';
 
 type InstrumentListingRow = {
   id?: number;
@@ -56,7 +59,14 @@ export const Settings: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [syncSummary, setSyncSummary] = useState<SyncPricesSummary | null>(null);
   const [saveNotice, setSaveNotice] = useState('');
+  const [fxBackfillLoading, setFxBackfillLoading] = useState(false);
+  const [fxBackfillStatus, setFxBackfillStatus] = useState('');
+  const [fxBackfillSummary, setFxBackfillSummary] = useState<FxBackfillSummary | null>(null);
+  const [fxLastDateInfo, setFxLastDateInfo] = useState<{ global?: string; details?: string; pairs: string[] } | null>(null);
+  const [fxLastDateLoading, setFxLastDateLoading] = useState(false);
   const [eodhdTests, setEodhdTests] = useState<Record<string, { status: string; symbol?: string; message?: string; httpStatus?: number; sample?: string; contentType?: string; rawPreview?: string; parseError?: string; url?: string }>>({});
+  const [rawModal, setRawModal] = useState<{ open: boolean; title: string; content: string }>({ open: false, title: '', content: '' });
+  const [rawModalLoading, setRawModalLoading] = useState(false);
   const [eodhdSymbolErrors, setEodhdSymbolErrors] = useState<Record<string, string>>({});
   const [isTestingAll, setIsTestingAll] = useState(false);
   const [testAllProgress, setTestAllProgress] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
@@ -86,7 +96,7 @@ export const Settings: React.FC = () => {
   const [fxQuote, setFxQuote] = useState<Currency>(Currency.USD);
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
   const [regionAllocation, setRegionAllocation] = useState<Partial<Record<RegionKey, number>>>({});
-  const [proxyHealth, setProxyHealth] = useState<{ ok: boolean; hasEodhdKey: boolean; error?: string } | null>(null);
+  const [proxyHealth, setProxyHealth] = useState<ProxyHealth | null>(null);
   const [proxyHealthLoading, setProxyHealthLoading] = useState(false);
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [quotaInfo, setQuotaInfo] = useState<EodhdQuotaInfo | null>(null);
@@ -186,22 +196,20 @@ export const Settings: React.FC = () => {
     focusHandledRef.current = focusKey;
   }, [location.search, instruments]);
 
-  const loadProxyHealth = async (apiKey?: string) => {
+  const loadProxyHealth = async (apiKey?: string, force = false) => {
     setProxyHealthLoading(true);
     try {
-      const headers = apiKey?.trim() ? { 'x-eodhd-key': apiKey.trim() } : undefined;
-      const res = await fetch('/api/health', headers ? { headers } : undefined);
-      if (!res.ok) {
-        setProxyHealth({ ok: false, hasEodhdKey: false, error: 'Proxy non raggiungibile' });
-        return;
-      }
-      const data = await res.json();
+      const health = await checkProxyHealth({ eodhdApiKey: apiKey, force });
+      setProxyHealth(health);
+    } catch (e: any) {
       setProxyHealth({
-        ok: Boolean(data?.ok),
-        hasEodhdKey: Boolean(data?.hasEodhdKey)
+        ok: false,
+        tested: true,
+        hasEodhdKey: false,
+        usingLocalKey: Boolean(apiKey?.trim()),
+        mode: apiKey?.trim() ? 'direct-local-key' : 'no-key',
+        message: e?.message || 'Proxy /api non raggiungibile.'
       });
-    } catch (e) {
-      setProxyHealth({ ok: false, hasEodhdKey: false, error: 'Proxy non raggiungibile' });
     } finally {
       setProxyHealthLoading(false);
     }
@@ -214,6 +222,47 @@ export const Settings: React.FC = () => {
     }, 300);
     return () => clearTimeout(timeoutId);
   }, [config.eodhdApiKey]);
+
+  const loadFxLastDates = async () => {
+    setFxLastDateLoading(true);
+    try {
+      const baseCurrency = config.baseCurrency || Currency.CHF;
+      const pairs = await getFxPairsForPortfolio(currentPortfolioId, baseCurrency);
+      if (!pairs.length) {
+        setFxLastDateInfo({ global: undefined, details: '', pairs: [] });
+        return;
+      }
+      const details: string[] = [];
+      const dates: string[] = [];
+      for (const pair of pairs) {
+        const [base, quote] = pair.split('/') as [Currency, Currency];
+        if (!base || !quote) continue;
+        const last = await db.fxRates
+          .where('[baseCurrency+quoteCurrency+date]')
+          .between([base, quote, Dexie.minKey], [base, quote, Dexie.maxKey])
+          .last();
+        const lastDate = last?.date;
+        if (lastDate) {
+          details.push(`${pair} ${lastDate}`);
+          dates.push(lastDate);
+        } else {
+          details.push(`${pair} n/d`);
+        }
+      }
+      const global = dates.length
+        ? dates.reduce((min, d) => (d < min ? d : min), dates[0])
+        : 'N/D';
+      setFxLastDateInfo({ global, details: details.join(' · '), pairs });
+    } catch {
+      setFxLastDateInfo({ global: undefined, details: '', pairs: [] });
+    } finally {
+      setFxLastDateLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadFxLastDates();
+  }, [currentPortfolioId, config.baseCurrency]);
 
   const handleQuotaCheck = async () => {
     if (quotaLoading) return;
@@ -247,7 +296,7 @@ export const Settings: React.FC = () => {
     try {
       const result = await fetchAppsScriptPing(config);
       if (!result.ok) {
-        setAppsScriptTestResult('ping', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
+        setAppsScriptTestResult('ping', { status: result.error === APPS_SCRIPT_DISABLED_MESSAGE ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
         return;
       }
       setAppsScriptTestResult('ping', { status: 'ok', message: 'OK', diag: result.diag.diag });
@@ -261,7 +310,7 @@ export const Settings: React.FC = () => {
     try {
       const result = await fetchAssetsMap(config);
       if (!result.ok) {
-        setAppsScriptTestResult('assets', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
+        setAppsScriptTestResult('assets', { status: result.error === APPS_SCRIPT_DISABLED_MESSAGE ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
         return;
       }
       const sample = result.data.slice(0, 2).map(row => `${row.ticker} -> ${row.sheetSymbol || ''} ${row.currency || ''}`).join(' | ');
@@ -281,7 +330,7 @@ export const Settings: React.FC = () => {
     try {
       const result = await fetchMacro(config);
       if (!result.ok) {
-        setAppsScriptTestResult('macro', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
+        setAppsScriptTestResult('macro', { status: result.error === APPS_SCRIPT_DISABLED_MESSAGE ? 'disabled' : 'err', message: result.error, diag: result.diag.diag });
         return;
       }
       const count = await applyMacroRowsToDexie(result.data, currentPortfolioId, db);
@@ -297,7 +346,7 @@ export const Settings: React.FC = () => {
     try {
       const result = await syncFxRates(config, 'apps_script');
       if (!result.ok) {
-        setAppsScriptTestResult('fx', { status: result.error === 'DISABILITATO' ? 'disabled' : 'err', message: result.error, diag: result.diag?.diag });
+        setAppsScriptTestResult('fx', { status: result.error === APPS_SCRIPT_DISABLED_MESSAGE ? 'disabled' : 'err', message: result.error, diag: result.diag?.diag });
         return;
       }
       const sample = (result.rows || []).slice(0, 3).map((row: AppsScriptFxRow) => `${row.baseCurrency}/${row.quoteCurrency} ${row.date} ${row.rate}`).join(' | ');
@@ -372,6 +421,14 @@ export const Settings: React.FC = () => {
       const symbol = getResolvedSymbol(ticker, config, 'EODHD', instrument?.type);
       if (!symbol) {
         setEodhdTests(prev => ({ ...prev, [ticker]: { status: 'MAP', symbol: cfg.eodhdSymbol, message: 'Symbol non valido' } }));
+        return;
+      }
+      const health = await checkProxyHealth({ eodhdApiKey: config.eodhdApiKey });
+      if (!health.ok || (!health.hasEodhdKey && !health.usingLocalKey)) {
+        setEodhdTests(prev => ({
+          ...prev,
+          [ticker]: { status: 'ERR', symbol, message: health.message || 'Proxy /api non raggiungibile' }
+        }));
         return;
       }
       const from = format(subDays(new Date(), 10), 'yyyy-MM-dd');
@@ -482,6 +539,26 @@ export const Settings: React.FC = () => {
       setIsTestingAll(false);
     }
   };
+
+  const handleOpenRawResponse = async (url: string, title: string) => {
+    if (!url) return;
+    setRawModalLoading(true);
+    try {
+      const headers = config.eodhdApiKey?.trim() ? { 'x-eodhd-key': config.eodhdApiKey.trim() } : undefined;
+      const diag = await fetchJsonWithDiagnostics(url, headers ? { headers } : undefined);
+      const content = diag.json
+        ? JSON.stringify(diag.json, null, 2)
+        : (diag.rawPreview || `HTTP ${diag.httpStatus}`);
+      setRawModal({ open: true, title, content });
+    } catch (e: any) {
+      setRawModal({ open: true, title, content: e?.message || String(e) });
+    } finally {
+      setRawModalLoading(false);
+    }
+  };
+
+  const closeRawModal = () => setRawModal({ open: false, title: '', content: '' });
+
   const handleSetEodhdSymbol = async (ticker: string, symbol: string) => {
     await updateTickerConfig(ticker, { eodhdSymbol: symbol, provider: 'EODHD', needsMapping: false });
   };
@@ -540,7 +617,7 @@ export const Settings: React.FC = () => {
         try {
           const fxResult = await syncFxRates(config, 'apps_script');
           if (!fxResult.ok) {
-            fxNotice = { status: fxResult.error === 'DISABILITATO' ? 'warn' : 'err', message: `FX non aggiornato: ${fxResult.error}.` };
+            fxNotice = { status: fxResult.error === APPS_SCRIPT_DISABLED_MESSAGE ? 'warn' : 'err', message: `FX non aggiornato: ${fxResult.error}.` };
           } else {
             fxNotice = { status: 'ok', message: `FX aggiornati: ${fxResult.count ?? 0} righe.` };
           }
@@ -549,6 +626,7 @@ export const Settings: React.FC = () => {
         }
       }
       setFxSyncNotice(fxNotice);
+      await loadFxLastDates();
       const fxSuffix = fxNotice && fxNotice.status !== 'ok' ? `\n${fxNotice.message}` : '';
       if (result.status === 'ok') {
         alert(`Prezzi aggiornati con successo!${fxSuffix}`);
@@ -556,8 +634,11 @@ export const Settings: React.FC = () => {
         alert(`Aggiornamento parziale: alcuni ticker non sono stati aggiornati.${fxSuffix}`);
       } else if (result.status === 'quota_exhausted') {
         alert(`Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili.${fxSuffix}`);
+      } else if (result.status === 'proxy_unreachable') {
+        alert(`${result.message || 'Proxy /api non raggiungibile.'}${fxSuffix}`);
       } else {
-        alert(`Aggiornamento fallito: nessun ticker aggiornato.${fxSuffix}`);
+        const reason = result.message ? ` ${result.message}` : '';
+        alert(`Aggiornamento fallito: nessun ticker aggiornato.${reason}${fxSuffix}`);
       }
     } catch (e: any) {
       alert(e?.message || 'Errore aggiornamento prezzi.');
@@ -591,7 +672,11 @@ export const Settings: React.FC = () => {
       if (result.status === 'quota_exhausted') {
         setBfStatus('Quota EODHD esaurita (402). Backfill interrotto.');
         alert('Quota EODHD esaurita (402). Backfill interrotto.');
+      } else if (result.status === 'proxy_unreachable') {
+        setBfStatus(result.message || 'Proxy /api non raggiungibile.');
+        alert(result.message || 'Proxy /api non raggiungibile.');
       } else if (result.status === 'ok') {
+        if (result.message) setBfStatus(result.message);
         alert('Storico aggiornato');
       } else {
         alert(result.message || 'Backfill non completato');
@@ -600,6 +685,50 @@ export const Settings: React.FC = () => {
       alert(e?.message || e);
     } finally {
       setBfLoading(false);
+    }
+  };
+
+  const handleFxBackfill = async () => {
+    if (fxBackfillLoading) return;
+    setFxBackfillLoading(true);
+    setFxBackfillStatus('Avvio backfill FX...');
+    setFxBackfillSummary(null);
+    try {
+      const pairs = await getFxPairsForPortfolio(currentPortfolioId, config.baseCurrency || Currency.CHF);
+      if (!pairs.length) {
+        setFxBackfillStatus('Nessuna coppia FX da aggiornare.');
+        return;
+      }
+      const result = await backfillFxRatesForPortfolio(
+        currentPortfolioId,
+        pairs,
+        (p) => {
+          if (p.phase === 'done') {
+            setFxBackfillStatus('Completato');
+          } else {
+            setFxBackfillStatus(`Backfill FX ${p.index}/${p.total} ${p.pair}${p.error ? ' - ' + p.error : ''}`);
+          }
+        },
+        config.eodhdApiKey,
+        { mode: 'AUTO_GAPS', maxApiCallsPerRun: 5, maxLookbackDays: 90, staleThresholdDays: 7, sleepMs: 400 }
+      );
+      setFxBackfillSummary(result);
+      await loadFxLastDates();
+      if (result.status === 'quota_exhausted') {
+        setFxBackfillStatus('Quota EODHD esaurita (402). Backfill FX interrotto.');
+      } else if (result.status === 'proxy_unreachable') {
+        setFxBackfillStatus(result.message || 'Proxy /api non raggiungibile.');
+      } else if (result.status === 'error') {
+        setFxBackfillStatus(result.message || 'Backfill FX non completato');
+      } else if (result.status === 'ok' && result.message) {
+        setFxBackfillStatus(result.message);
+      } else if (result.updatedPairs.length > 0) {
+        setFxBackfillStatus(`FX aggiornati: ${result.updatedPairs.length} coppie.`);
+      }
+    } catch (e: any) {
+      setFxBackfillStatus(e?.message || 'Errore backfill FX');
+    } finally {
+      setFxBackfillLoading(false);
     }
   };
 
@@ -653,8 +782,12 @@ export const Settings: React.FC = () => {
       });
       if (result.status === 'quota_exhausted') {
         setAutoGapStatus('Quota EODHD esaurita (402). Gap-fill interrotto.');
+      } else if (result.status === 'proxy_unreachable') {
+        setAutoGapStatus(result.message || 'Proxy /api non raggiungibile.');
       } else if (result.status === 'error') {
         setAutoGapStatus(result.message || 'Gap-fill non completato');
+      } else if (result.status === 'ok' && result.message) {
+        setAutoGapStatus(result.message);
       }
     } catch (e: any) {
       setAutoGapStatus(e?.message || 'Errore gap-fill');
@@ -936,6 +1069,7 @@ export const Settings: React.FC = () => {
     try {
       const imported = await importFxCsv(file, fxBase, fxQuote);
       alert(`Importati ${imported} tassi FX`);
+      await loadFxLastDates();
     } catch (err: any) {
       alert(err?.message || String(err));
     } finally {
@@ -1074,7 +1208,9 @@ export const Settings: React.FC = () => {
         ? 'Parziale'
         : syncSummary.status === 'quota_exhausted'
           ? 'Quota'
-          : 'Errore'
+          : syncSummary.status === 'proxy_unreachable'
+            ? 'Proxy'
+            : 'Errore'
     : '';
   const syncStatusClass = syncSummary
     ? syncSummary.status === 'ok'
@@ -1083,7 +1219,9 @@ export const Settings: React.FC = () => {
         ? 'bg-amber-100 text-amber-700'
         : syncSummary.status === 'quota_exhausted'
           ? 'bg-red-100 text-red-700'
-          : 'bg-red-100 text-red-700'
+          : syncSummary.status === 'proxy_unreachable'
+            ? 'bg-amber-100 text-amber-700'
+            : 'bg-red-100 text-red-700'
     : '';
 
   const autoSyncLabel = autoSyncMeta?.lastRun
@@ -1123,7 +1261,12 @@ export const Settings: React.FC = () => {
     const sheetsConfigured = Boolean(config.googleSheetUrl?.trim());
     const sheetsHasErrors = sheetsConfigured && Object.values(sheetTests).some(result => result.status === 'error' || result.status === 'disabled');
     const sheetsStatus: 'disabled' | 'ok' | 'err' = !sheetsConfigured ? 'disabled' : sheetsHasErrors ? 'err' : 'ok';
-    const eodhdStatus: 'ok' | 'err' = proxyHealth?.ok && proxyHealth?.hasEodhdKey ? 'ok' : 'err';
+    const eodhdOk = proxyHealth
+      ? (proxyHealth.ok
+        ? (proxyHealth.hasEodhdKey || proxyHealth.usingLocalKey)
+        : proxyHealth.mode === 'direct-local-key')
+      : false;
+    const eodhdStatus: 'ok' | 'err' = eodhdOk ? 'ok' : 'err';
     const appsScriptEnabled = Boolean(config.appsScriptUrl?.trim() && config.appsScriptApiKey?.trim());
     const appsScriptHasErrors = Object.values(appsScriptTests).some(result => result?.status === 'err');
     const appsScriptStatus: 'disabled' | 'ok' | 'err' = !appsScriptEnabled ? 'disabled' : appsScriptHasErrors ? 'err' : 'ok';
@@ -1422,10 +1565,11 @@ export const Settings: React.FC = () => {
                       {quotaDiag && (
                         <button
                           type="button"
-                          onClick={() => window.open('/api/eodhd-proxy?path=%2Fapi%2Fuser&fmt=json', '_blank')}
+                          onClick={() => handleOpenRawResponse('/api/eodhd-proxy?path=%2Fapi%2Fuser&fmt=json', 'EODHD quota (raw)')}
                           className="font-bold text-slate-600 underline"
+                          disabled={rawModalLoading}
                         >
-                          Apri risposta raw
+                          {rawModalLoading ? 'Carico raw...' : 'Apri risposta raw'}
                         </button>
                       )}
                       {quotaUpdatedAt && (
@@ -1455,7 +1599,20 @@ export const Settings: React.FC = () => {
                     )}
                     <div className="text-xs text-slate-600">Valuta base: {config.baseCurrency}</div>
                     <div className="text-xs text-slate-600">Exchange preferiti: {(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(', ')}</div>
-                  <div className="text-xs text-slate-600">Backfill: dal {config.minHistoryDate || '2020-01-01'} ({(config.priceBackfillScope || 'current') === 'all' ? 'Completo' : 'Solo correnti'})</div>
+                    <div className="text-xs text-slate-600">Backfill: dal {config.minHistoryDate || '2020-01-01'} ({(config.priceBackfillScope || 'current') === 'all' ? 'Completo' : 'Solo correnti'})</div>
+                    <div className="text-xs text-slate-600">
+                      <span className="text-slate-500">FX last date:</span>{' '}
+                      {fxLastDateLoading
+                        ? '...'
+                        : fxLastDateInfo?.pairs?.length
+                          ? (
+                            <>
+                              <span className="font-semibold">{fxLastDateInfo.global}</span>
+                              {fxLastDateInfo.details ? <span className="text-slate-500"> ({fxLastDateInfo.details})</span> : null}
+                            </>
+                          )
+                          : 'N/D'}
+                    </div>
                   {saveNotice && <div className="text-xs text-green-700 mt-2">{saveNotice}</div>}
                 </div>
                 <button
@@ -1474,8 +1631,14 @@ export const Settings: React.FC = () => {
                   <span className="text-xs font-bold uppercase text-slate-500">Proxy &amp; API</span>
                   {proxyHealthLoading ? (
                     <span className="text-xs text-slate-400">Verifica...</span>
-                  ) : proxyHealth?.ok ? (
+                  ) : !proxyHealth?.tested ? (
+                    <span className="text-xs font-bold text-slate-500">Non testato</span>
+                  ) : proxyHealth.ok && (proxyHealth.hasEodhdKey || proxyHealth.usingLocalKey) ? (
                     <span className="text-xs font-bold text-green-600">OK</span>
+                  ) : proxyHealth.ok ? (
+                    <span className="text-xs font-bold text-amber-700">Key mancante</span>
+                  ) : proxyHealth.mode === 'direct-local-key' ? (
+                    <span className="text-xs font-bold text-amber-700">Proxy KO (key locale)</span>
                   ) : proxyHealth ? (
                     <span className="text-xs font-bold text-red-600">Non raggiungibile</span>
                   ) : (
@@ -1490,30 +1653,37 @@ export const Settings: React.FC = () => {
                 <button
                   type="button"
                   className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
-                  onClick={() => loadProxyHealth(config.eodhdApiKey)}
+                  onClick={() => loadProxyHealth(config.eodhdApiKey, true)}
                 >
                   Test connessione
                 </button>
               </div>
               <div className="mt-2 flex flex-wrap gap-3 text-xs">
                 <div>
-                  <span className="text-slate-500">EODHD key:</span>{' '}
-                  {proxyHealthLoading ? '...' : proxyHealth?.hasEodhdKey ? 'OK' : 'Mancante'}
+                  <span className="text-slate-500">EODHD key server:</span>{' '}
+                  {proxyHealthLoading ? '...' : proxyHealth?.tested ? (proxyHealth.hasEodhdKey ? 'OK' : 'Mancante') : 'N/D'}
                 </div>
-                {proxyHealth?.ok && !proxyHealth?.hasEodhdKey && (
+                <div>
+                  <span className="text-slate-500">Key locale:</span>{' '}
+                  {config.eodhdApiKey?.trim() ? 'OK' : 'Non impostata'}
+                </div>
+                {proxyHealth?.tested && proxyHealth.ok && !proxyHealth.hasEodhdKey && !proxyHealth.usingLocalKey && (
                   <div className="text-amber-700">
-                    Chiave EODHD non trovata nell’ambiente locale. Aggiungila in `.env.local` e riavvia il dev server.
+                    Chiave EODHD non trovata. Aggiungila in Settings o in `.env.local` e riavvia il dev server.
                   </div>
                 )}
-                {proxyHealth == null && !proxyHealthLoading && (
+                {(!proxyHealth?.tested) && !proxyHealthLoading && (
                   <div className="text-slate-500">
                     Stato non testato: premi “Test connessione” per verificare.
                   </div>
                 )}
-                {proxyHealth && !proxyHealth.ok && (
+                {proxyHealth?.tested && !proxyHealth.ok && (
                   <div className="space-y-1 text-slate-600">
                     <div><span className="font-semibold">Cosa significa:</span> il proxy `/api` non risponde e alcune funzioni (prezzi/FX) possono fallire.</div>
                     <div><span className="font-semibold">Cosa fare:</span> avvia `npm run dev:vercel` in locale oppure verifica la configurazione del proxy.</div>
+                    {proxyHealth.usingLocalKey && (
+                      <div className="text-amber-700">Usa la key locale in direct mode (le chiamate proxy restano non disponibili).</div>
+                    )}
                     <div>
                       <a href="#/data?tab=checks" className="text-[#0052a3] font-bold hover:underline">
                         Apri Data Inspector
@@ -1521,6 +1691,12 @@ export const Settings: React.FC = () => {
                       <span className="mx-2 text-slate-400">·</span>
                       <span className="text-slate-500">Documentazione locale: usa `dev:vercel`</span>
                     </div>
+                  </div>
+                )}
+                {proxyHealth?.tested && proxyHealth.ok && proxyHealth.mode === 'no-key' && (
+                  <div className="space-y-1 text-slate-600">
+                    <div><span className="font-semibold">Cosa significa:</span> manca una EODHD key valida per usare i prezzi.</div>
+                    <div><span className="font-semibold">Cosa fare:</span> aggiungi una key in Settings oppure in `.env.local` e riprova.</div>
                   </div>
                 )}
               </div>
@@ -1696,6 +1872,23 @@ export const Settings: React.FC = () => {
                   )}
                 </button>
                 <button
+                  onClick={handleFxBackfill}
+                  disabled={fxBackfillLoading}
+                  className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+                >
+                  {fxBackfillLoading ? (
+                    <>
+                      <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
+                      Backfill FX...
+                    </>
+                  ) : (
+                    <>
+                      <span className="material-symbols-outlined text-sm">currency_exchange</span>
+                      Backfill FX
+                    </>
+                  )}
+                </button>
+                <button
                   type="button"
                   onClick={handleTestEodhdAll}
                   disabled={!config.eodhdApiKey?.trim() || isTestingAll}
@@ -1720,9 +1913,15 @@ export const Settings: React.FC = () => {
                 </button>
               </div>
               {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
+              {fxBackfillStatus && <div className="text-xs text-slate-600 font-medium">{fxBackfillStatus}</div>}
               {bfStatus && (bfStatus.toLowerCase().includes('errore') || bfStatus.toLowerCase().includes('quota') || bfStatus.toLowerCase().includes('interrotto')) && (
                 <div className="text-xs text-amber-700">
                   Suggerimento: verifica la chiave EODHD e riprova. Se il problema persiste, usa il Data Inspector per vedere quali ticker mancano.
+                </div>
+              )}
+              {fxBackfillSummary && fxBackfillSummary.status !== 'ok' && (
+                <div className="text-xs text-amber-700">
+                  FX backfill: {fxBackfillSummary.message || 'operazione non completata'}. Apri Data Inspector (FX) per verificare i gap.
                 </div>
               )}
               {syncSummary && (
@@ -1748,6 +1947,11 @@ export const Settings: React.FC = () => {
                   {syncSummary.status === 'quota_exhausted' && (
                     <div className="text-red-700">
                       Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili. Riprova dopo il reset o valuta upgrade.
+                    </div>
+                  )}
+                  {syncSummary.status === 'proxy_unreachable' && (
+                    <div className="text-amber-700">
+                      Proxy /api non raggiungibile. Avvia `npm run dev:vercel` oppure verifica il deploy del proxy.
                     </div>
                   )}
                 </div>
@@ -2002,10 +2206,11 @@ export const Settings: React.FC = () => {
                                 {eodhdTests[row.ticker]?.url && (
                                   <button
                                     type="button"
-                                    onClick={() => window.open(eodhdTests[row.ticker]?.url, '_blank')}
+                                    onClick={() => handleOpenRawResponse(eodhdTests[row.ticker]?.url as string, `EODHD raw ${row.ticker}`)}
                                     className="text-[10px] font-bold text-slate-600 underline"
+                                    disabled={rawModalLoading}
                                   >
-                                    Apri risposta raw
+                                    {rawModalLoading ? 'Carico raw...' : 'Apri risposta raw'}
                                   </button>
                                 )}
                                 {eodhdBadge && (
@@ -2576,6 +2781,28 @@ export const Settings: React.FC = () => {
           Resetta Database e Ricarica
         </button>
       </div>
+
+      {rawModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="bg-white rounded-xl shadow-xl max-w-3xl w-full border border-borderSoft">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-borderSoft">
+              <div className="font-bold text-slate-900 text-sm">{rawModal.title || 'Risposta raw'}</div>
+              <button
+                type="button"
+                onClick={closeRawModal}
+                className="text-xs font-bold text-slate-600 hover:text-slate-800"
+              >
+                Chiudi
+              </button>
+            </div>
+            <div className="p-4">
+              <pre className="text-xs text-slate-700 whitespace-pre-wrap break-words bg-slate-50 border border-borderSoft rounded-lg p-3 max-h-96 overflow-auto">
+                {rawModal.content || 'N/D'}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

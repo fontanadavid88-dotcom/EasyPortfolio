@@ -5,6 +5,7 @@ import { calculateHoldings, calculateRebalancing, getCanonicalTicker, getLatestP
 import { RebalanceStrategy, AssetType, AssetClass, Instrument, Currency, RegionKey, PortfolioPosition } from '../types';
 import { convertAmountFromSeries } from '../services/fxService';
 import { analyzeRebalanceQuality, getIssueHelp } from '../services/dataQuality';
+import { queryLatestFxForPairs, queryLatestPricesForTickers } from '../services/dbQueries';
 import { InfoPopover } from '../components/InfoPopover';
 
 import clsx from 'clsx';
@@ -86,18 +87,107 @@ export const Rebalance: React.FC = () => {
     const [editAssetInitialRegion, setEditAssetInitialRegion] = useState<RegionKey | ''>('');
 
     const transactions = useLiveQuery(() => db.transactions.where('portfolioId').equals(currentPortfolioId).toArray(), [currentPortfolioId], []);
-    const prices = useLiveQuery(() => db.prices.where('portfolioId').equals(currentPortfolioId).toArray(), [currentPortfolioId], []);
     const instruments = useLiveQuery(() => db.instruments.where('portfolioId').equals(currentPortfolioId).toArray(), [currentPortfolioId], []);
-    const fxRates = useLiveQuery(() => db.fxRates.toArray(), [], []);
+
+    const priceTickers = useMemo(() => {
+        const set = new Set<string>();
+        (instruments || []).forEach(instr => {
+            const ticker = getCanonicalTicker(instr);
+            if (ticker) set.add(ticker);
+            if (instr.ticker) set.add(instr.ticker);
+        });
+        (transactions || []).forEach(t => {
+            if (t.instrumentTicker) set.add(t.instrumentTicker);
+        });
+        return Array.from(set.values());
+    }, [instruments, transactions]);
+
+    const priceTickersKey = useMemo(() => priceTickers.slice().sort().join('|'), [priceTickers]);
+
+    const latestPricesAll = useLiveQuery(
+        async () => {
+            if (!priceTickers.length) return [];
+            const t0 = performance.now();
+            const rows = await queryLatestPricesForTickers({
+                portfolioId: currentPortfolioId,
+                tickers: priceTickers
+            });
+            if (import.meta.env.DEV) {
+                console.log('[PERF][Rebalance] latest prices', Math.round(performance.now() - t0), 'ms', {
+                    tickers: priceTickers.length,
+                    count: rows.length
+                });
+            }
+            return rows;
+        },
+        [currentPortfolioId, priceTickersKey],
+        []
+    );
+
+    const fxPairs = useMemo(() => {
+        const base = Currency.CHF;
+        const set = new Set<string>();
+        (instruments || []).forEach(instr => {
+            if (instr.currency && instr.currency !== base) {
+                set.add(`${instr.currency}/${base}`);
+            }
+        });
+        return Array.from(set.values());
+    }, [instruments]);
+
+    const fxPairsKey = useMemo(() => fxPairs.slice().sort().join('|'), [fxPairs]);
 
     const holdings = useMemo(() => {
         return calculateHoldings(transactions || []);
     }, [transactions]);
 
     const valuationDate = useMemo(() => {
-        if (!transactions || !prices) return '';
-        return getValuationDateForHoldings(transactions, prices, instruments || []) || '';
-    }, [transactions, prices, instruments]);
+        if (!transactions || !latestPricesAll) return '';
+        return getValuationDateForHoldings(transactions, latestPricesAll, instruments || []) || '';
+    }, [transactions, latestPricesAll, instruments]);
+
+    const prices = useLiveQuery(
+        async () => {
+            if (!priceTickers.length || !valuationDate) return [];
+            const t0 = performance.now();
+            const rows = await queryLatestPricesForTickers({
+                portfolioId: currentPortfolioId,
+                tickers: priceTickers,
+                upToDate: valuationDate
+            });
+            if (import.meta.env.DEV) {
+                console.log('[PERF][Rebalance] prices at valuation', Math.round(performance.now() - t0), 'ms', {
+                    tickers: priceTickers.length,
+                    count: rows.length,
+                    valuationDate
+                });
+            }
+            return rows;
+        },
+        [currentPortfolioId, priceTickersKey, valuationDate],
+        []
+    );
+
+    const fxRates = useLiveQuery(
+        async () => {
+            if (!fxPairs.length || !valuationDate) return [];
+            const t0 = performance.now();
+            const rows = await queryLatestFxForPairs({
+                pairs: fxPairs,
+                upToDate: valuationDate
+            });
+            if (import.meta.env.DEV) {
+                console.log('[PERF][Rebalance] latest fx', Math.round(performance.now() - t0), 'ms', {
+                    pairs: fxPairs.length,
+                    count: rows.length,
+                    upToDate: valuationDate
+                });
+            }
+            return rows;
+        },
+        [fxPairsKey, valuationDate],
+        []
+    );
 
     const rebalanceQuality = useMemo(() => {
         if (!transactions || !prices || !instruments || !fxRates || !valuationDate) return null;

@@ -1,5 +1,6 @@
 import { db, getCurrentPortfolioId } from '../db';
 import { syncPrices, SyncPricesSummary, backfillPricesForPortfolio, getTickersForBackfill, BackfillOptions } from './priceService';
+import { backfillFxRatesForPortfolio, getFxPairsForPortfolio } from './fxService';
 import { syncFxRates } from './appsScriptService';
 
 export type AutoGapScope = 'current' | 'allPortfolios';
@@ -8,6 +9,7 @@ export type AutoSyncResult = {
   prices?: SyncPricesSummary;
   fx?: { ok: boolean; count?: number; error?: string };
   gaps?: { ok: boolean; updatedTickers: string[]; skipped: number; stoppedByBudget?: boolean; error?: string };
+  fxGaps?: { ok: boolean; updatedPairs: string[]; skipped: number; stoppedByBudget?: boolean; error?: string };
 };
 
 type AutoSyncMeta = {
@@ -120,12 +122,13 @@ export async function autoSyncOnAppOpen(opts?: {
         fxRes = { ok: false, error: e?.message || 'FX non disponibili' };
       }
     } else {
-      fxRes = { ok: false, error: 'Apps Script disabilitato' };
+      fxRes = { ok: false, error: 'Apps Script non configurato' };
     }
 
     const prices = await syncPrices(settings.eodhdApiKey, { portfolioId, mode: 'LATEST' });
 
     let gapsRes: AutoSyncResult['gaps'] | undefined;
+    let fxGapsRes: AutoSyncResult['fxGaps'] | undefined;
     if (getAutoGapFillEnabled(portfolioId)) {
       const tickers = await getTickersForBackfill(portfolioId, settings.priceBackfillScope || 'current');
       const options: BackfillOptions = {
@@ -150,6 +153,24 @@ export async function autoSyncOnAppOpen(opts?: {
         stoppedByBudget: gaps.stoppedByBudget,
         error: gaps.message
       };
+
+      const fxPairs = await getFxPairsForPortfolio(portfolioId, settings.baseCurrency);
+      if (fxPairs.length) {
+        const fxGaps = await backfillFxRatesForPortfolio(
+          portfolioId,
+          fxPairs,
+          undefined,
+          settings.eodhdApiKey,
+          { mode: 'AUTO_GAPS', maxApiCallsPerRun: 5, maxLookbackDays: 30, staleThresholdDays: 7, sleepMs: 400 }
+        );
+        fxGapsRes = {
+          ok: fxGaps.status === 'ok',
+          updatedPairs: fxGaps.updatedPairs || [],
+          skipped: fxGaps.skipped || 0,
+          stoppedByBudget: fxGaps.stoppedByBudget,
+          error: fxGaps.message
+        };
+      }
     }
 
     setAutoSyncMeta(portfolioId, {
@@ -163,13 +184,14 @@ export async function autoSyncOnAppOpen(opts?: {
     });
 
     if (import.meta.env?.DEV) {
-      console.log('[auto-sync]', { portfolioId, prices, fx: fxRes, gaps: gapsRes });
+      console.log('[auto-sync]', { portfolioId, prices, fx: fxRes, gaps: gapsRes, fxGaps: fxGapsRes });
     }
 
     if (portfolioId === getCurrentPortfolioId()) {
       result.prices = prices;
       result.fx = fxRes;
       result.gaps = gapsRes;
+      result.fxGaps = fxGapsRes;
     }
   }
 

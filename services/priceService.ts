@@ -7,10 +7,13 @@ import { fetchJsonWithDiagnostics, FetchJsonDiagnostics, toNum } from './diagnos
 import { applyAssetsMapToSettings, buildAssetsMapIndex, fetchAssetsMap, getPriceFromAssetsMap, AppsScriptAssetRow } from './appsScriptService';
 import { addDaysYmd, diffDaysYmd, subDaysYmd } from './dateUtils';
 import { COVERAGE_TOLERANCE_DAYS } from './constants';
+import { checkProxyHealth, ProxyHealth } from './apiHealthService';
 
 const EODHD_PROXY_ENDPOINT = '/api/eodhd-proxy';
 const EODHD_DIRECT_BASE = 'https://eodhd.com';
 const PROXY_ERROR_MESSAGE = 'Impossibile raggiungere proxy API';
+const PROXY_HELP_MESSAGE = 'Proxy /api non raggiungibile. Avvia `npm run dev:vercel` oppure verifica il deploy del proxy /api.';
+const EODHD_MISSING_KEY_MESSAGE = 'Chiave EODHD mancante. Inseriscila in Settings o in `.env.local`.';
 const DEFAULT_PROVIDER: PriceProviderType = 'EODHD';
 const EODHD_SYNC_DELAY_MS = 250;
 const EODHD_BACKFILL_MAX_DAYS = 90;
@@ -27,6 +30,23 @@ const isProxyMissingResponse = (diag: FetchJsonDiagnostics): boolean => {
   if (ct.includes('text/html')) return true;
   const preview = (diag.rawPreview || '').trim().toLowerCase();
   return preview.startsWith('<!doctype html') || preview.startsWith('<html') || preview.includes('cannot get') || preview.includes('not found');
+};
+
+const applyProxyHealth = (health?: ProxyHealth | null) => {
+  if (!health) return;
+  if (health.ok) {
+    eodhdProxyAvailable = true;
+  } else if (health.mode === 'direct-local-key') {
+    eodhdProxyAvailable = false;
+  }
+};
+
+export const resolveProxyFailure = (health?: ProxyHealth | null): { status: 'proxy_unreachable'; message: string } | null => {
+  if (!health || !health.tested) return null;
+  if (!health.ok && health.mode !== 'direct-local-key') {
+    return { status: 'proxy_unreachable', message: health.message || PROXY_HELP_MESSAGE };
+  }
+  return null;
 };
 
 const enqueueEodhdRequest = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -184,7 +204,7 @@ export interface CoverageRow {
 }
 
 export type SyncPricesSummary = {
-  status: 'ok' | 'partial' | 'error' | 'quota_exhausted';
+  status: 'ok' | 'partial' | 'error' | 'quota_exhausted' | 'proxy_unreachable';
   updatedTickers: string[];
   failedTickers: { ticker: string; reason: string }[];
   sheet: { enabled: boolean; reason?: string };
@@ -698,6 +718,41 @@ export const syncPrices = async (
     : format(subDays(new Date(), 365), 'yyyy-MM-dd');
   const failedSet = new Set<string>();
 
+  const needsEodhd = !latestOnly && instruments.some(instr => {
+    if (instr.type === 'Cash') return false;
+    const ticker = getCanonicalTickerFromInstrument(instr);
+    if (!ticker) return false;
+    const cfg = resolvePriceSyncConfig(ticker, settings);
+    if (cfg.excluded || cfg.provider === 'MANUAL' || cfg.needsMapping) return false;
+    return cfg.provider === 'EODHD';
+  });
+
+  let proxyHealth: ProxyHealth | null = null;
+  if (needsEodhd) {
+    proxyHealth = await checkProxyHealth({ eodhdApiKey: eodhdKey });
+    applyProxyHealth(proxyHealth);
+    if (import.meta.env?.DEV) {
+      console.log('[SYNC][Prices]', {
+        phase: 'proxy-check',
+        ok: proxyHealth.ok,
+        mode: proxyHealth.mode,
+        usingLocalKey: proxyHealth.usingLocalKey,
+        hasEodhdKey: proxyHealth.hasEodhdKey
+      });
+    }
+    const proxyFailure = resolveProxyFailure(proxyHealth);
+    if (proxyFailure) {
+      summary.status = proxyFailure.status;
+      summary.message = proxyFailure.message;
+      return summary;
+    }
+    if (!proxyHealth.hasEodhdKey && !proxyHealth.usingLocalKey) {
+      summary.status = 'error';
+      summary.message = EODHD_MISSING_KEY_MESSAGE;
+      return summary;
+    }
+  }
+
   for (const instr of instruments) {
     if (instr.type === 'Cash') continue;
     const priceTicker = getCanonicalTickerFromInstrument(instr);
@@ -712,7 +767,12 @@ export const syncPrices = async (
       const lookupKey = tickerConfig.provider === 'SHEETS'
         ? (tickerConfig.sheetSymbol || priceTicker)
         : (resolvedSymbol || tickerConfig.eodhdSymbol || priceTicker);
-      console.log('[price-sync]', { ticker: priceTicker, provider: tickerConfig.provider, lookupKey });
+      console.log('[SYNC][Prices]', {
+        ticker: priceTicker,
+        provider: tickerConfig.provider,
+        lookupKey,
+        mode: proxyHealth?.mode || 'unknown'
+      });
     }
     if (tickerConfig.provider === 'EODHD' && !resolvedSymbol) {
       if (!failedSet.has(priceTicker)) {
@@ -773,8 +833,8 @@ export const syncPrices = async (
         }
         eodhdError = e?.message || 'Errore EODHD';
         if (eodhdError === PROXY_ERROR_MESSAGE) {
-          summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
-          summary.message = PROXY_ERROR_MESSAGE;
+          summary.status = 'proxy_unreachable';
+          summary.message = proxyHealth?.message || PROXY_HELP_MESSAGE;
           break;
         }
         if (String(eodhdError).includes('404')) {
@@ -863,7 +923,7 @@ export const syncPrices = async (
     }
   }
 
-  if (summary.status === 'quota_exhausted') return summary;
+  if (summary.status === 'quota_exhausted' || summary.status === 'proxy_unreachable') return summary;
   if (summary.failedTickers.length > 0) {
     summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
   }
@@ -1004,13 +1064,10 @@ export const backfillPricesForPortfolio = async (
   const sleepMs = options?.sleepMs ?? 400;
   const maxDailyCalls = options?.maxDailyCalls;
 
-  const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey;
-  if (!eodhdKey?.trim()) {
-    return { status: 'error', message: 'Missing EODHD key', updatedTickers: [], skipped: tickers.length, stoppedByBudget: false, mode };
-  }
+  const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey?.trim();
   const eodhd = new EodhdPriceProvider(eodhdKey);
   const today = format(new Date(), 'yyyy-MM-dd');
-  const minAllowedFrom = format(subDays(new Date(), maxLookbackDays), 'yyyy-MM-dd');
+  const minAllowedFrom = subDaysYmd(today, maxLookbackDays);
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
   const priceCurrencyByTicker = new Map<string, Currency>();
   const instrumentIdByTicker = new Map<string, string>();
@@ -1026,30 +1083,121 @@ export const backfillPricesForPortfolio = async (
     const cfg = resolvePriceSyncConfig(t, settings);
     return !cfg.excluded && cfg.provider !== 'MANUAL';
   });
+
+  let proxyHealth: ProxyHealth | null = null;
+  if (filtered.length > 0) {
+    proxyHealth = await checkProxyHealth({ eodhdApiKey: eodhdKey });
+    applyProxyHealth(proxyHealth);
+    if (import.meta.env?.DEV) {
+      console.log('[SYNC][Prices]', {
+        phase: 'proxy-check',
+        ok: proxyHealth.ok,
+        mode: proxyHealth.mode,
+        usingLocalKey: proxyHealth.usingLocalKey,
+        hasEodhdKey: proxyHealth.hasEodhdKey
+      });
+    }
+    const proxyFailure = resolveProxyFailure(proxyHealth);
+    if (proxyFailure) {
+      return {
+        status: proxyFailure.status,
+        message: proxyFailure.message,
+        updatedTickers: [],
+        skipped: tickers.length,
+        stoppedByBudget: false,
+        mode
+      };
+    }
+    if (!proxyHealth.hasEodhdKey && !proxyHealth.usingLocalKey) {
+      return {
+        status: 'error',
+        message: EODHD_MISSING_KEY_MESSAGE,
+        updatedTickers: [],
+        skipped: tickers.length,
+        stoppedByBudget: false,
+        mode
+      };
+    }
+  }
   let usedThisRun = 0;
   let dailyUsed = readDailyBudget(today).used;
 
   if (mode === 'AUTO_GAPS') {
-    const candidates: { ticker: string; lastDate?: string }[] = [];
+    type AutoGapCandidate = {
+      ticker: string;
+      lastDate?: string;
+      range: { from: string; to: string };
+      reason: 'internal-gap' | 'tail-stale';
+      sortDate?: string;
+    };
+    const candidates: AutoGapCandidate[] = [];
     for (const ticker of filtered) {
-      const lastRow = await db.prices
+      const existing = await db.prices
         .where('[ticker+date]')
-        .between([ticker, Dexie.minKey], [ticker, Dexie.maxKey])
+        .between([ticker, minAllowedFrom], [ticker, today])
         .and(p => p.portfolioId === portfolioId)
-        .last();
-      const lastDate = lastRow?.date;
+        .sortBy('date');
+      const lastDate = existing[existing.length - 1]?.date;
+
+      let chosenRange: { from: string; to: string; gapDays: number } | null = null;
+      if (existing.length > 1) {
+        for (let idx = 0; idx < existing.length - 1; idx++) {
+          const curr = existing[idx]?.date;
+          const next = existing[idx + 1]?.date;
+          if (!curr || !next) continue;
+          const gapDays = diffDaysYmd(next, curr) - 1;
+          if (gapDays < staleThresholdDays) continue;
+          const fromCandidate = addDaysYmd(curr, 1);
+          const toCandidate = subDaysYmd(next, 1);
+          const from = fromCandidate < minAllowedFrom ? minAllowedFrom : fromCandidate;
+          const to = toCandidate > today ? today : toCandidate;
+          if (from > to) continue;
+          if (!chosenRange || to > chosenRange.to) {
+            chosenRange = { from, to, gapDays };
+          }
+        }
+      }
+
+      if (chosenRange) {
+        candidates.push({
+          ticker,
+          lastDate,
+          range: { from: chosenRange.from, to: chosenRange.to },
+          reason: 'internal-gap',
+          sortDate: chosenRange.to
+        });
+        continue;
+      }
+
       if (isAutoGapCandidate(lastDate, today, staleThresholdDays)) {
-        candidates.push({ ticker, lastDate });
+        const range = computeAutoGapRange(lastDate, today, maxLookbackDays);
+        if (range.from > range.to) {
+          summary.skipped = (summary.skipped || 0) + 1;
+          if (import.meta.env?.DEV) {
+            console.log('[PRICE][Backfill]', { ticker, reason: 'skip-empty-range', from: range.from, to: range.to });
+          }
+          continue;
+        }
+        candidates.push({
+          ticker,
+          lastDate,
+          range,
+          reason: 'tail-stale',
+          sortDate: lastDate
+        });
       } else {
         summary.skipped = (summary.skipped || 0) + 1;
+        if (import.meta.env?.DEV) {
+          console.log('[PRICE][Backfill]', { ticker, reason: 'skip-up-to-date', lastDate });
+        }
       }
     }
 
     candidates.sort((a, b) => {
-      if (!a.lastDate && !b.lastDate) return 0;
-      if (!a.lastDate) return -1;
-      if (!b.lastDate) return 1;
-      return a.lastDate.localeCompare(b.lastDate);
+      if (!a.sortDate && !b.sortDate) return 0;
+      if (!a.sortDate) return -1;
+      if (!b.sortDate) return 1;
+      return a.sortDate.localeCompare(b.sortDate);
     });
 
     const budgetLimit = limitTickersByBudget(candidates.map(c => c.ticker), maxApiCallsPerRun, maxDailyCalls, dailyUsed);
@@ -1058,7 +1206,7 @@ export const backfillPricesForPortfolio = async (
 
     const limitedCandidates = candidates.filter(c => limitedSet.has(c.ticker));
     for (let i = 0; i < limitedCandidates.length; i++) {
-      const { ticker, lastDate } = limitedCandidates[i];
+      const { ticker, range, reason } = limitedCandidates[i];
       const cfg = resolvePriceSyncConfig(ticker, settings);
       const assetType = instrumentTypeByTicker.get(ticker);
       const symbol = resolveBackfillSymbol(ticker, cfg, assetType);
@@ -1073,10 +1221,8 @@ export const backfillPricesForPortfolio = async (
       }
 
       if (onProgress) onProgress({ ticker, index: i + 1, total: limitedCandidates.length, phase: 'backfill' });
-      const range = computeAutoGapRange(lastDate, today, maxLookbackDays);
-      if (range.from > range.to) {
-        summary.skipped = (summary.skipped || 0) + 1;
-        continue;
+      if (import.meta.env?.DEV) {
+        console.log('[PRICE][Backfill]', { ticker, reason, from: range.from, to: range.to });
       }
       if (maxApiCallsPerRun !== undefined && usedThisRun >= maxApiCallsPerRun) {
         summary.stoppedByBudget = true;
@@ -1091,14 +1237,26 @@ export const backfillPricesForPortfolio = async (
       try {
         const pts = await eodhd.getHistory(symbol, range.from, range.to);
         if (pts.length > 0) {
-          const toSave = buildPointsForSave(pts, {
+          const toSaveRaw = buildPointsForSave(pts, {
             ticker,
             instrumentId,
             currency: priceCurrency,
             portfolioId
           });
-          await db.prices.bulkPut(toSave);
-          summary.updatedTickers?.push(ticker);
+          const deduped = new Map<string, PricePoint>();
+          toSaveRaw.forEach(point => {
+            deduped.set(`${point.ticker}|${point.date}|${point.portfolioId}`, point);
+          });
+          const toSave = Array.from(deduped.values());
+          if (toSave.length > 0) {
+            await db.prices.bulkPut(toSave);
+            summary.updatedTickers?.push(ticker);
+            if (reason === 'internal-gap' && !summary.message) {
+              summary.message = `Backfill prezzi: riempito gap ${ticker} ${range.from} -> ${range.to}`;
+            }
+          } else {
+            summary.skipped = (summary.skipped || 0) + 1;
+          }
         } else {
           summary.skipped = (summary.skipped || 0) + 1;
         }
@@ -1121,6 +1279,11 @@ export const backfillPricesForPortfolio = async (
         }
         const message = e?.message || String(e);
         if (onProgress) onProgress({ ticker, index: i + 1, total: limitedCandidates.length, phase: 'backfill', error: message });
+        if (message === PROXY_ERROR_MESSAGE) {
+          summary.status = 'proxy_unreachable';
+          summary.message = proxyHealth?.message || PROXY_HELP_MESSAGE;
+          break;
+        }
         summary.status = 'error';
         summary.message = message;
       }
@@ -1211,7 +1374,11 @@ export const backfillPricesForPortfolio = async (
       }
       const message = e?.message || String(e);
       if (onProgress) onProgress({ ticker, index: i + 1, total: filtered.length, phase: 'backfill', error: message });
-      if (message === PROXY_ERROR_MESSAGE) throw e;
+      if (message === PROXY_ERROR_MESSAGE) {
+        summary.status = 'proxy_unreachable';
+        summary.message = proxyHealth?.message || PROXY_HELP_MESSAGE;
+        break;
+      }
       summary.status = 'error';
       summary.message = message;
     }
@@ -1227,7 +1394,7 @@ export type SheetTestResult = {
 };
 
 export type BackfillSummary = {
-  status: 'ok' | 'error' | 'quota_exhausted';
+  status: 'ok' | 'error' | 'quota_exhausted' | 'proxy_unreachable';
   message?: string;
   quota?: { ticker: string; httpStatus: number; contentType?: string; rawPreview?: string };
   updatedTickers?: string[];

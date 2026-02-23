@@ -29,6 +29,7 @@ import {
   calculateRegionExposure,
   computeMwrrSeries
 } from '../services/financeUtils';
+import { downsampleSeries } from '../services/chartUtils';
 import { MACRO_ZONES, COLORS, CARD_BG, CARD_TEXT, PRIMARY_BLUE, ACCENT_ORANGE } from '../constants';
 import '../report.css';
 import {
@@ -242,6 +243,11 @@ export const Report: React.FC = () => {
     ...d,
     displayDate: format(new Date(d.date), 'MMM yy')
   })) || [];
+
+  const trendChartData = useMemo(() => downsampleSeries(trendData, 900), [trendData]);
+  const twrrChartData = useMemo(() => downsampleSeries(twrrData, 900), [twrrData]);
+  const mwrrChartData = useMemo(() => downsampleSeries(mwrrData, 900), [mwrrData]);
+  const drawdownChartData = useMemo(() => downsampleSeries(drawdownData, 900), [drawdownData]);
 
   const currencyBars = useMemo(() => {
     if (!state) return [];
@@ -576,7 +582,7 @@ export const Report: React.FC = () => {
         return (
           <div className="chart-box">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={trendData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+              <AreaChart data={trendChartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
                 <defs>
                   <linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor={PRIMARY_BLUE} stopOpacity={0.3} />
@@ -606,7 +612,7 @@ export const Report: React.FC = () => {
         return (
           <div className="chart-box">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={twrrData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+              <AreaChart data={twrrChartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                 <XAxis dataKey="displayDate" tick={{ fontSize: 10 }} />
                 <YAxis tick={{ fontSize: 10 }} width={40} tickFormatter={(v: number) => `${v.toFixed(0)}%`} />
@@ -622,7 +628,7 @@ export const Report: React.FC = () => {
         return (
           <div className="chart-box">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={mwrrData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+              <AreaChart data={mwrrChartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                 <XAxis dataKey="displayDate" tick={{ fontSize: 10 }} />
                 <YAxis tick={{ fontSize: 10 }} width={40} tickFormatter={(v: number) => `${v.toFixed(0)}%`} />
@@ -654,7 +660,7 @@ export const Report: React.FC = () => {
         return (
           <div className="chart-box">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={drawdownData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+              <AreaChart data={drawdownChartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
                 <XAxis dataKey="displayDate" tick={{ fontSize: 10 }} />
                 <YAxis tick={{ fontSize: 10 }} width={40} tickFormatter={(v: number) => `${v.toFixed(0)}%`} />

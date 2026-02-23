@@ -1,8 +1,10 @@
 ﻿import React, { useMemo, useState } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly } from '../services/financeUtils';
+import { calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly, getCanonicalTicker } from '../services/financeUtils';
 import { DEFAULT_INDICATORS, computeMacroIndex, mapIndexToPhase, MacroIndicatorConfig } from '../services/macroService';
+import { queryPriceBoundsForTickers, queryPricesForTickersRange } from '../services/dbQueries';
+import { downsampleSeries } from '../services/chartUtils';
 import {
   PRIMARY_BLUE,
   ACCENT_ORANGE,
@@ -202,14 +204,76 @@ export const Dashboard: React.FC = () => {
     [currentPortfolioId],
     []
   );
-  const prices = useLiveQuery(
-    () => db.prices.where('portfolioId').equals(currentPortfolioId).toArray(),
-    [currentPortfolioId],
-    []
-  );
   const instruments = useLiveQuery(
     () => db.instruments.where('portfolioId').equals(currentPortfolioId).toArray(),
     [currentPortfolioId],
+    []
+  );
+
+  const priceTickers = useMemo(() => {
+    const set = new Set<string>();
+    (instruments || []).forEach(inst => {
+      const ticker = getCanonicalTicker(inst);
+      if (ticker) set.add(ticker);
+    });
+    (transactions || []).forEach(t => {
+      if (t.instrumentTicker) set.add(t.instrumentTicker);
+    });
+    return Array.from(set.values());
+  }, [transactions, instruments]);
+
+  const priceTickersKey = useMemo(() => priceTickers.slice().sort().join('|'), [priceTickers]);
+
+  const firstTransactionDate = useMemo(() => {
+    if (!transactions || transactions.length === 0) return '';
+    return transactions.reduce((min, t) => {
+      const dateStr = format(t.date, 'yyyy-MM-dd');
+      if (!min || dateStr < min) return dateStr;
+      return min;
+    }, '');
+  }, [transactions]);
+
+  const priceBounds = useLiveQuery(
+    async () => {
+      if (!priceTickers.length) return { firstPriceDate: undefined, lastPriceDate: undefined };
+      const t0 = performance.now();
+      const bounds = await queryPriceBoundsForTickers({
+        portfolioId: currentPortfolioId,
+        tickers: priceTickers,
+        firstTransactionDate: firstTransactionDate || '0000-01-01'
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Dashboard] price bounds', Math.round(performance.now() - t0), 'ms', bounds);
+      }
+      return bounds;
+    },
+    [currentPortfolioId, priceTickersKey, firstTransactionDate],
+    { firstPriceDate: undefined, lastPriceDate: undefined }
+  );
+
+  const priceQueryStart = firstTransactionDate || priceBounds?.firstPriceDate || '';
+  const priceQueryEnd = priceBounds?.lastPriceDate || format(new Date(), 'yyyy-MM-dd');
+
+  const prices = useLiveQuery(
+    async () => {
+      if (!priceTickers.length || !priceQueryStart || !priceQueryEnd) return [];
+      const t0 = performance.now();
+      const rows = await queryPricesForTickersRange({
+        portfolioId: currentPortfolioId,
+        tickers: priceTickers,
+        startDate: priceQueryStart,
+        endDate: priceQueryEnd
+      });
+      if (import.meta.env.DEV) {
+        console.log('[PERF][Dashboard] prices query', Math.round(performance.now() - t0), 'ms', {
+          tickers: priceTickers.length,
+          count: rows.length,
+          range: `${priceQueryStart}..${priceQueryEnd}`
+        });
+      }
+      return rows;
+    },
+    [currentPortfolioId, priceTickersKey, priceQueryStart, priceQueryEnd],
     []
   );
 
@@ -259,13 +323,27 @@ export const Dashboard: React.FC = () => {
 
   const dailyTrends = useMemo(() => {
     if (!transactions || !prices || !instruments) return null;
-    return calculateHistoricalPerformance(transactions, instruments, prices, 120, 'daily');
+    const t0 = import.meta.env.DEV ? performance.now() : 0;
+    const result = calculateHistoricalPerformance(transactions, instruments, prices, 120, 'daily');
+    if (import.meta.env.DEV) {
+      console.log('[PERF][Dashboard] calc history daily', Math.round(performance.now() - t0), 'ms', {
+        points: result.history.length
+      });
+    }
+    return result;
   }, [transactions, prices, instruments]);
 
   const monthlyTrends = useMemo(() => {
     if (!transactions || !prices || !instruments) return null;
     if (dailyTrends && dailyTrends.history.length > 1) return null;
-    return calculateHistoricalPerformance(transactions, instruments, prices, 120, 'monthly');
+    const t0 = import.meta.env.DEV ? performance.now() : 0;
+    const result = calculateHistoricalPerformance(transactions, instruments, prices, 120, 'monthly');
+    if (import.meta.env.DEV) {
+      console.log('[PERF][Dashboard] calc history monthly', Math.round(performance.now() - t0), 'ms', {
+        points: result.history.length
+      });
+    }
+    return result;
   }, [transactions, prices, instruments, dailyTrends]);
 
   const baseHistory = useMemo(() => {
@@ -332,6 +410,12 @@ export const Dashboard: React.FC = () => {
     return rangeHistory;
   }, [rangeHistory, chartGranularity, kpiGranularity]);
 
+  const chartHistoryDownsampled = useMemo(() => {
+    if (!chartHistory.length) return [];
+    const maxPoints = chartGranularity === 'monthly' ? 400 : 1100;
+    return downsampleSeries(chartHistory, maxPoints);
+  }, [chartHistory, chartGranularity]);
+
   const analytics = useMemo(() => {
     return calculateAnalytics(rangeHistory, kpiGranularity);
   }, [rangeHistory, kpiGranularity]);
@@ -367,12 +451,12 @@ export const Dashboard: React.FC = () => {
 
   // 1. Performance Chart Data (downsampled for rendering only)
   const chartData = useMemo(() => {
-    if (!chartHistory.length) return [];
+    if (!chartHistoryDownsampled.length) return [];
     const mwrrSorted = mwrrSeries.slice().sort((a, b) => a.date.localeCompare(b.date));
     let mwrrIdx = 0;
     let lastMwrr = 0;
 
-    return chartHistory.map(point => {
+    return chartHistoryDownsampled.map(point => {
       while (mwrrIdx < mwrrSorted.length && mwrrSorted[mwrrIdx].date <= point.date) {
         lastMwrr = mwrrSorted[mwrrIdx].mwrrPct;
         mwrrIdx += 1;
@@ -394,7 +478,7 @@ export const Dashboard: React.FC = () => {
         metricValue
       };
     });
-  }, [chartHistory, mwrrSeries, metric, valueMode, hasPerfBase, perfBaseNav, twrrBaseIndex]);
+  }, [chartHistoryDownsampled, mwrrSeries, metric, valueMode, hasPerfBase, perfBaseNav, twrrBaseIndex]);
 
   const lastChartPoint = useMemo(() => {
     if (!chartData.length) return null;
