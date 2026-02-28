@@ -7,6 +7,7 @@ import { convertAmountFromSeries } from '../services/fxService';
 import { analyzeRebalanceQuality, getIssueHelp } from '../services/dataQuality';
 import { queryLatestFxForPairs, queryLatestPricesForTickers } from '../services/dbQueries';
 import { InfoPopover } from '../components/InfoPopover';
+import { computeRebalanceUnits } from '../services/rebalanceUtils';
 
 import clsx from 'clsx';
 
@@ -524,8 +525,8 @@ export const Rebalance: React.FC = () => {
         <div className="space-y-6 pb-20 animate-fade-in text-textPrimary">
 
             {isEditAssetModalOpen && editingAsset && (
-                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-sm">
-                    <div className="bg-white w-full max-w-lg rounded-2xl shadow-2xl p-6 relative">
+                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-md">
+                    <div className="ui-panel-dense w-full max-w-lg p-6 relative">
                         <div className="flex items-start justify-between">
                             <div>
                                 <h3 className="text-lg font-bold text-slate-900">Modifica Asset</h3>
@@ -546,7 +547,7 @@ export const Rebalance: React.FC = () => {
                                 <input
                                     value={editAssetForm.name}
                                     onChange={e => setEditAssetForm({ ...editAssetForm, name: e.target.value })}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    className="ui-input w-full text-sm"
                                 />
                             </div>
 
@@ -556,7 +557,7 @@ export const Rebalance: React.FC = () => {
                                     <select
                                         value={editAssetForm.type}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, type: e.target.value as AssetType })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(AssetType).map(type => (
                                             <option key={type} value={type}>{type}</option>
@@ -568,7 +569,7 @@ export const Rebalance: React.FC = () => {
                                     <select
                                         value={editAssetForm.assetClass}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, assetClass: e.target.value as AssetClass })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(AssetClass).map(ac => (
                                             <option key={ac} value={ac}>{ac}</option>
@@ -580,7 +581,7 @@ export const Rebalance: React.FC = () => {
                                     <select
                                         value={editAssetForm.currency}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, currency: e.target.value as Currency })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(Currency).map(cur => (
                                             <option key={cur} value={cur}>{cur}</option>
@@ -592,7 +593,7 @@ export const Rebalance: React.FC = () => {
                                     <input
                                         value={editAssetForm.sector}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, sector: e.target.value })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     />
                                 </div>
                             </div>
@@ -602,7 +603,7 @@ export const Rebalance: React.FC = () => {
                                 <select
                                     value={editAssetForm.region}
                                     onChange={e => setEditAssetForm({ ...editAssetForm, region: e.target.value as RegionKey | '' })}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    className="ui-input w-full text-sm"
                                 >
                                     <option value="">Auto / multi</option>
                                     {REGION_OPTIONS.map(opt => (
@@ -615,13 +616,13 @@ export const Rebalance: React.FC = () => {
                                 <button
                                     type="button"
                                     onClick={handleCloseEditAsset}
-                                    className="flex-1 border border-borderSoft text-slate-700 py-3 rounded-xl font-bold hover:bg-slate-50 transition"
+                                    className="flex-1 ui-btn-secondary py-3 rounded-xl font-bold transition"
                                 >
                                     Annulla
                                 </button>
                                 <button
                                     type="submit"
-                                    className="flex-1 bg-primary text-slate-900 py-3 rounded-xl font-bold hover:bg-blue-600 transition"
+                                    className="flex-1 ui-btn-primary py-3 rounded-xl font-bold transition"
                                 >
                                     Salva
                                 </button>
@@ -632,7 +633,7 @@ export const Rebalance: React.FC = () => {
             )}
 
             {/* HEADER CONTROLS */}
-            <div className="bg-white p-6 rounded-2xl shadow-lg border border-borderSoft">
+            <div className="ui-panel p-6">
                 <h2 className="text-xl font-bold mb-6 flex items-center gap-2 text-slate-900">
                     <span className="material-symbols-outlined text-[#0052a3]">balance</span>
                     Pannello Ribilanciamento
@@ -719,7 +720,7 @@ export const Rebalance: React.FC = () => {
                                     type="number"
                                     value={cashInjection}
                                     onChange={e => setCashInjection(Number(e.target.value))}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none font-mono text-lg font-bold text-slate-900 text-right"
+                                    className="ui-input w-full font-mono text-lg font-bold text-right"
                                 />
                             </div>
                         </div>
@@ -728,14 +729,14 @@ export const Rebalance: React.FC = () => {
             </div>
 
             {/* HEATMAP TABLE */}
-            <div className="bg-white rounded-2xl shadow-lg border border-borderSoft overflow-hidden overflow-x-auto">
+            <div className="ui-panel-dense rounded-2xl overflow-hidden overflow-x-auto">
                 <table className="w-full text-sm text-left">
                     <thead className="bg-slate-100 text-slate-500 border-b border-borderSoft text-xs uppercase tracking-wider">
                         <tr>
                             <th className="px-4 py-4 font-bold w-[25%]">Asset Class / Strumento</th>
                             <th className="px-2 py-4 font-bold text-center w-[10%]">Target</th>
                             <th className="px-2 py-4 font-bold text-center w-[10%]">Attuale</th>
-                            <th className="px-0 py-4 font-bold text-center w-[25%] bg-black/5">
+                            <th className="px-0 py-4 font-bold text-center w-[25%] bg-slate-50">
                                 <div className="grid grid-cols-3 text-[10px] opacity-70">
                                     <span>Sottopesato</span>
                                     <span>Neutro</span>
@@ -743,6 +744,7 @@ export const Rebalance: React.FC = () => {
                                 </div>
                             </th>
                             <th className="px-4 py-4 font-bold text-right w-[15%]">Attuale / Quote</th>
+                            <th className="px-4 py-4 font-bold text-right w-[10%]">Quote</th>
                             <th className="px-4 py-4 font-bold text-right w-[15%]">Azione Consigliata</th>
                         </tr>
                     </thead>
@@ -771,6 +773,7 @@ export const Rebalance: React.FC = () => {
                                         </td>
                                         <td className="px-4 py-3 text-right"></td>
                                         <td className="px-4 py-3 text-right"></td>
+                                        <td className="px-4 py-3 text-right"></td>
                                     </tr>
 
                                     {/* ITEMS */}
@@ -782,7 +785,9 @@ export const Rebalance: React.FC = () => {
                                         const position = positionByTicker.get(p.ticker);
                                         const meta = rebalanceData?.valuationMeta.get(p.ticker);
                                         const heldQty = position?.quantity ?? 0;
-                                        const assetCurrency = meta?.priceCurrency || instr?.currency || position?.currency || 'CHF';
+                                        const priceCurrency = (meta?.priceCurrency || instr?.currency || position?.currency || Currency.CHF) as Currency;
+                                        const instrumentCurrency = (instr?.currency || position?.currency || priceCurrency) as Currency;
+                                        const assetCurrency = priceCurrency;
                                         const assetClassLabelIt = instr?.assetClass === AssetClass.ETF_BOND ? 'ETF Obbligazioni'
                                             : instr?.assetClass === AssetClass.ETF_STOCK ? 'ETF Azioni'
                                                 : instr?.assetClass === AssetClass.BOND ? 'Obbligazioni'
@@ -815,6 +820,39 @@ export const Rebalance: React.FC = () => {
                                             return value.toLocaleString('it-CH', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
                                         };
                                         const amountLocal = meta?.fxRateToChf ? (p.amount / meta.fxRateToChf) : null;
+                                        const baseCurrency = Currency.CHF;
+                                        const isNeutral = p.action === 'NEUTRO' || p.amount <= 0;
+                                        const isCashLike = instr?.type === AssetType.Cash;
+                                        const signedDelta = p.action === 'VENDI' ? -p.amount : p.amount;
+                                        const isUnvalued = unvaluedTickers.includes(p.ticker);
+                                        const unitsResult = (!isTradable || isUnvalued || isCashLike)
+                                            ? { reason: 'invalid' as const }
+                                            : computeRebalanceUnits({
+                                                deltaBase: signedDelta,
+                                                baseCurrency,
+                                                instrumentCurrency,
+                                                price: priceValue,
+                                                priceCurrency,
+                                                fxRates,
+                                                valuationDate
+                                            });
+                                        const formatUnits = (value: number) => {
+                                            if (!Number.isFinite(value)) return '—';
+                                            const decimals = instr?.type === AssetType.Crypto ? 6 : 4;
+                                            return value.toLocaleString('it-CH', { minimumFractionDigits: 0, maximumFractionDigits: decimals });
+                                        };
+                                        const unitsLabel = isNeutral
+                                            ? '0'
+                                            : (unitsResult.units !== undefined && Number.isFinite(unitsResult.units))
+                                                ? formatUnits(unitsResult.units)
+                                                : '—';
+                                        const unitsTitle = unitsLabel === '—'
+                                            ? (unitsResult.reason === 'currency_mismatch'
+                                                ? 'Valuta prezzo non coerente con la valuta dello strumento'
+                                                : unitsResult.reason === 'missing_fx'
+                                                    ? 'Manca FX per convertire il delta'
+                                                    : 'Manca prezzo o FX per calcolare le quote')
+                                            : undefined;
 
                                         return (
                                             <tr key={p.ticker} className="hover:bg-slate-50 transition-colors group">
@@ -850,7 +888,7 @@ export const Rebalance: React.FC = () => {
                                                     {isEditing ? (
                                                         <input
                                                             autoFocus
-                                                            className="w-14 border border-primary rounded bg-white text-center font-bold text-slate-900 text-xs py-1 outline-none"
+                                                            className="ui-input-sm w-14 text-center font-bold"
                                                             value={tempTargetVal}
                                                             onChange={e => setTempTargetVal(e.target.value)}
                                                             onKeyDown={e => e.key === 'Enter' && saveTarget()}
@@ -891,6 +929,16 @@ export const Rebalance: React.FC = () => {
                                                         Px: {assetCurrency} {formatPrice(priceValue)}
                                                         {meta?.priceDate && meta.priceDate !== valuationDate ? ` (${meta.priceDate})` : ''}
                                                         {hasMismatch ? ' (mismatch)' : ''}
+                                                    </div>
+                                                </td>
+
+                                                {/* Units */}
+                                                <td className="px-4 py-3 text-right">
+                                                    <div
+                                                        className={clsx('text-xs font-mono', unitsLabel === '—' ? 'text-slate-400' : 'text-slate-600')}
+                                                        title={unitsTitle}
+                                                    >
+                                                        {unitsLabel}
                                                     </div>
                                                 </td>
 
@@ -967,6 +1015,7 @@ export const Rebalance: React.FC = () => {
         </div>
     );
 };
+
 
 
 

@@ -8,6 +8,7 @@ import { applyAssetsMapToSettings, buildAssetsMapIndex, fetchAssetsMap, getPrice
 import { addDaysYmd, diffDaysYmd, subDaysYmd } from './dateUtils';
 import { COVERAGE_TOLERANCE_DAYS } from './constants';
 import { checkProxyHealth, ProxyHealth } from './apiHealthService';
+import { getHiddenTickersForPortfolio } from './portfolioVisibility';
 
 const EODHD_PROXY_ENDPOINT = '/api/eodhd-proxy';
 const EODHD_DIRECT_BASE = 'https://eodhd.com';
@@ -233,6 +234,12 @@ const resolveInstrumentForTicker = (instruments: Instrument[], ticker: string): 
 
 const getCanonicalTickerFromInstrument = (instrument: Instrument): string => {
   return instrument.preferredListing?.symbol || instrument.symbol || instrument.ticker;
+};
+
+const filterHiddenTickers = (tickers: string[], portfolioId: string): string[] => {
+  const hidden = new Set(getHiddenTickersForPortfolio(portfolioId));
+  if (hidden.size === 0) return tickers;
+  return tickers.filter(t => !hidden.has(t));
 };
 
 export const getTickerConfig = (settings: AppSettings | null | undefined, ticker: string): PriceTickerConfig => {
@@ -932,7 +939,11 @@ export const syncPrices = async (
 };
 
 // Helpers per backfill
-export const getTickersForBackfill = async (portfolioId: string, scope: 'current' | 'all'): Promise<string[]> => {
+export const getTickersForBackfill = async (
+  portfolioId: string,
+  scope: 'current' | 'all',
+  options?: { includeHidden?: boolean }
+): Promise<string[]> => {
   const tx = await db.transactions.where('portfolioId').equals(portfolioId).toArray();
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
   const canonicalByTicker = new Map<string, string>();
@@ -954,7 +965,8 @@ export const getTickersForBackfill = async (portfolioId: string, scope: 'current
   };
   if (scope === 'all') {
     const all = Array.from(new Set(tx.map(t => resolveTxTicker(t)).filter(Boolean))) as string[];
-    return Array.from(new Set(all.map(mapCanonical)));
+    const list = Array.from(new Set(all.map(mapCanonical)));
+    return options?.includeHidden ? list : filterHiddenTickers(list, portfolioId);
   }
 
   const qtyMap = new Map<string, number>();
@@ -970,9 +982,11 @@ export const getTickersForBackfill = async (portfolioId: string, scope: 'current
     .map(([ticker]) => ticker);
   if (current.length === 0) {
     const all = Array.from(new Set(tx.map(t => resolveTxTicker(t)).filter(Boolean))) as string[];
-    return Array.from(new Set(all.map(mapCanonical)));
+    const list = Array.from(new Set(all.map(mapCanonical)));
+    return options?.includeHidden ? list : filterHiddenTickers(list, portfolioId);
   }
-  return Array.from(new Set(current.map(mapCanonical)));
+  const list = Array.from(new Set(current.map(mapCanonical)));
+  return options?.includeHidden ? list : filterHiddenTickers(list, portfolioId);
 };
 
 export const getPriceCoverage = async (portfolioId: string, tickers: string[], minHistoryDate: string) => {

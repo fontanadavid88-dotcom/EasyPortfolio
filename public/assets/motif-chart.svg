@@ -1,8 +1,8 @@
 ﻿<svg width="1600" height="900" viewBox="0 0 1600 900" xmlns="http://www.w3.org/2000/svg">
-  <g stroke="#94a3b8" stroke-opacity="0.32" stroke-width="1" fill="none">
+  <g stroke="#7dd3fc" stroke-opacity="0.45" stroke-width="1.2" fill="none">
     <path d="M120 620 L260 560 L400 590 L540 520 L680 540 L820 480 L960 510 L1100 450 L1240 470 L1380 430" />
   </g>
-  <g stroke="#94a3b8" stroke-opacity="0.28" stroke-width="2">
+  <g stroke="#7dd3fc" stroke-opacity="0.4" stroke-width="2">
     <line x1="220" y1="630" x2="220" y2="560" />
     <line x1="340" y1="640" x2="340" y2="580" />
     <line x1="460" y1="620" x2="460" y2="550" />

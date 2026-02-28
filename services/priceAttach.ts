@@ -34,10 +34,10 @@ export const planAutoAttachListing = (params: {
   const normalizedTicker = normalizeSymbol(typedTicker);
   if (normalizedTicker && hasExplicitSuffix(normalizedTicker) && normalizeSymbol(selected.symbol) !== normalizedTicker) {
     const confirm = confirmOverride
-      ? confirmOverride(`Il ticker inserito (${normalizedTicker}) Ë diverso dal listing consigliato (${selected.symbol}). Vuoi usare ${selected.symbol} per i prezzi?`)
+      ? confirmOverride(`Il ticker inserito (${normalizedTicker}) √® diverso dal listing consigliato (${selected.symbol}). Vuoi usare ${selected.symbol} per i prezzi?`)
       : false;
     if (!confirm) {
-      return { warning: 'Listing non applicato: ticker gi‡ specificato.' };
+      return { warning: 'Listing non applicato: ticker gi√† specificato.' };
     }
   }
 

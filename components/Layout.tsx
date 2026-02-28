@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import clsx from 'clsx';
 import { db, getCurrentPortfolioId, setCurrentPortfolioId } from '../db';
@@ -30,6 +30,8 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
   const [currentPortfolioId, setCurrentId] = useState<string>(getCurrentPortfolioId());
   const [isPortfolioMenuOpen, setPortfolioMenuOpen] = useState(false);
   const [menuAnchor, setMenuAnchor] = useState<HTMLDivElement | null>(null);
+  const bgRef = useRef<HTMLDivElement | null>(null);
+  const mainRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     db.portfolios.toArray().then(p => {
@@ -61,23 +63,53 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [isPortfolioMenuOpen, menuAnchor]);
 
+  useEffect(() => {
+    const bg = bgRef.current;
+    const main = mainRef.current;
+    if (!bg || !main) return;
+    let rafId = 0;
+
+    const handleScroll = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        const offset = Math.round(main.scrollTop * 0.3);
+        bg.style.setProperty('--bg-parallax-y', `${offset}px`);
+        rafId = 0;
+      });
+    };
+
+    handleScroll();
+    main.addEventListener('scroll', handleScroll, { passive: true });
+    return () => {
+      main.removeEventListener('scroll', handleScroll);
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, []);
+
   const currentPortfolioName = portfolios.find(p => p.portfolioId === currentPortfolioId)?.name || 'Portafoglio';
 
   return (
     <div
-      className="app-shell flex text-textPrimary font-sans overflow-hidden"
-      style={{ background: 'transparent', ['--app-header-h' as any]: '80px' }}
+      ref={bgRef}
+      className="app-background relative min-h-screen bg-fixed bg-cover bg-center"
+      style={{ backgroundImage: "url('/Sfondo.webp')" }}
     >
+      <div className="app-overlay" />
+      <div className="app-content">
+        <div
+          className="app-shell flex text-textPrimary font-sans overflow-hidden"
+          style={{ background: 'transparent', ['--app-header-h' as any]: '80px' }}
+        >
 
       {/* Sidebar - Desktop & Mobile Drawer */}
       <aside
         className={clsx(
-          "fixed inset-y-0 left-0 z-20 bg-backgroundElevated/50 backdrop-blur-xl border-r border-borderSoft transition-all duration-300 ease-in-out flex flex-col shadow-2xl",
+          "fixed inset-y-0 left-0 z-20 bg-slate-900/55 backdrop-blur-xl border-r border-white/10 transition-all duration-300 ease-in-out flex flex-col shadow-2xl",
           isSidebarOpen ? "w-64 translate-x-0" : "w-20 -translate-x-full md:translate-x-0 md:w-20"
         )}
       >
         {/* Logo Area */}
-        <div className="h-20 flex items-center px-6 border-b border-borderSoft bg-transparent">
+        <div className="h-20 flex items-center px-6 border-b border-white/10 bg-transparent">
           <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-blue-700 text-white flex items-center justify-center mr-3 shadow-lg shadow-primary/30">
             <span className="material-symbols-outlined text-[24px]">monitoring</span>
           </div>
@@ -113,7 +145,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
         <div className="absolute bottom-[-20%] left-[-10%] w-[400px] h-[400px] bg-secondary/10 rounded-full blur-[100px] pointer-events-none" />
 
         {/* Top App Bar */}
-        <header className="h-20 bg-backgroundDark border-b border-borderSoft flex items-center justify-between px-6 sticky top-0 z-10 shadow-md">
+        <header className="h-20 bg-slate-900/70 backdrop-blur-xl border-b border-white/10 flex items-center justify-between px-6 sticky top-0 z-10 shadow-md">
           <button
             onClick={() => setSidebarOpen(!isSidebarOpen)}
             className="p-2 -ml-2 rounded-full hover:bg-white/10 text-textMuted focus:outline-none transition-colors"
@@ -125,7 +157,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
             <div className="flex flex-col text-right">
               <button
                 onClick={() => setPortfolioMenuOpen(prev => !prev)}
-                className="text-left bg-backgroundDark/60 border border-borderSoft rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-primary shadow-sm hover:bg-backgroundDark/80 transition"
+                className="text-left bg-slate-900/70 border border-white/10 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-primary shadow-sm hover:bg-slate-900/90 transition"
               >
                 <div className="text-[11px] text-textMuted uppercase tracking-wide">Portafoglio</div>
                 <div className="text-xs font-semibold text-textPrimary">{currentPortfolioName}</div>
@@ -137,14 +169,14 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
               {currentPortfolioName.slice(0, 2).toUpperCase()}
             </div>
             {isPortfolioMenuOpen && (
-              <div className="absolute right-0 top-14 w-60 bg-white text-slate-900 border border-borderSoft rounded-xl shadow-xl z-20 overflow-hidden">
+              <div className="absolute right-0 top-14 w-60 ui-panel-dense text-slate-900 rounded-xl shadow-xl z-20 overflow-hidden">
                 {portfolios.map(p => (
                   <button
                     key={p.portfolioId}
                     onClick={() => { handlePortfolioChange(p.portfolioId); setPortfolioMenuOpen(false); }}
                     className="w-full text-left px-3 py-2 hover:bg-slate-50 text-sm flex items-center justify-between"
                   >
-                    <span className="text-slate-700">{p.name}</span>
+                    <span className="text-slate-900">{p.name}</span>
                     {p.portfolioId === currentPortfolioId && <span className="material-symbols-outlined text-primary text-base">check</span>}
                   </button>
                 ))}
@@ -157,7 +189,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
         </header>
 
         {/* Page Content */}
-        <main className="app-main flex-1 overflow-y-auto p-4 md:p-8 relative z-0 hide-scrollbar">
+        <main ref={mainRef} className="app-main flex-1 overflow-y-auto p-4 md:p-8 relative z-0 hide-scrollbar">
           <div className="max-w-7xl mx-auto w-full animate-fade-in">
             {children}
           </div>
@@ -167,10 +199,13 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       {/* Mobile Overlay */}
       {isSidebarOpen && (
         <div
-          className="md:hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-10"
+          className="md:hidden fixed inset-0 bg-black/40 backdrop-blur-md z-10"
           onClick={() => setSidebarOpen(false)}
         />
       )}
+        </div>
+      </div>
     </div>
   );
 };
+

@@ -111,7 +111,7 @@ export const Macro: React.FC = () => {
       <div className="grid lg:grid-cols-4 gap-6">
 
         {/* LEFT GAUGE CARD */}
-        <div className="lg:col-span-1 bg-white p-6 rounded-2xl shadow-lg border border-borderSoft flex flex-col items-start">
+        <div className="lg:col-span-1 ui-panel p-6 flex flex-col items-start">
           <h3 className="font-bold text-slate-900 mb-6 text-xs uppercase tracking-wider flex items-center gap-2">
             <span className="w-1 h-4 rounded-full bg-[#0052a3] shadow-[0_0_10px_rgba(0,82,163,0.5)]"></span> Macro Indicator
           </h3>
@@ -121,7 +121,7 @@ export const Macro: React.FC = () => {
         </div>
 
         {/* RIGHT CONFIG CARTA */}
-        <div className="lg:col-span-3 bg-white p-6 rounded-2xl shadow-lg border border-borderSoft">
+        <div className="lg:col-span-3 ui-panel p-6">
           <div className="flex justify-between items-center mb-6">
             <div>
               <h3 className="text-lg font-semibold flex items-center gap-2">

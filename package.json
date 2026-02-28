@@ -11,7 +11,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "vercel:dev": "vercel dev --listen 3000",
-    "vercel:dev:safe": "node scripts/vercel-dev-safe.cjs"
+    "vercel:dev:safe": "node scripts/vercel-dev-safe.cjs",
+    "check:encoding": "vitest run services/encodingArtifacts.test.ts"
   },
   "dependencies": {
     "clsx": "^2.1.0",

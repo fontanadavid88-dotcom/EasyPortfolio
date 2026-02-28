@@ -28,23 +28,23 @@ import { RegionKey } from '../types';
 // --- Sub-Components ---
 
 const KPICard = ({ title, value, subValue, highlight = false, alert = false }: { title: string, value: string, subValue?: string, highlight?: boolean, alert?: boolean }) => (
-  <div className="bg-white p-5 rounded-2xl border border-borderSoft shadow-lg flex flex-col justify-between h-32 transition-transform hover:-translate-y-1 duration-300 relative overflow-hidden group">
+  <div className="ui-panel p-5 flex flex-col justify-between h-32 transition-transform hover:-translate-y-1 duration-300 relative overflow-hidden group">
     {/* Glow Effect */}
     <div className="absolute top-0 right-0 w-20 h-20 bg-[#0052a3]/5 rounded-full blur-xl -mr-10 -mt-10 transition-opacity group-hover:opacity-100 opacity-50" />
 
     <div className="flex justify-between items-start z-10">
-      <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">{title}</span>
+      <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wider">{title}</span>
       {highlight && <span className="w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(249,115,22,0.6)]" style={{ backgroundColor: ACCENT_ORANGE }}></span>}
       {alert && <span className="w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(220,38,38,0.6)]" style={{ backgroundColor: NEGATIVE_RED }}></span>}
     </div>
     <div className="mt-2 z-10">
       <div
-        className={clsx("text-2xl font-bold tracking-tight", alert ? "text-slate-900" : "text-slate-900")}
+        className={clsx("text-2xl font-bold tracking-tight text-slate-900")}
         style={{ color: highlight ? PRIMARY_BLUE : undefined, textShadow: highlight ? '0 0 20px rgba(0,82,163,0.1)' : 'none' }}
       >
         {value}
       </div>
-      {subValue && <div className="text-xs text-slate-500 font-medium mt-1">{subValue}</div>}
+      {subValue && <div className="text-xs text-slate-600 font-medium mt-1">{subValue}</div>}
     </div>
   </div>
 );
@@ -115,13 +115,13 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
   };
 
   return (
-    <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 relative overflow-hidden h-[240px]">
+    <div className="ui-panel-dense p-3 relative overflow-hidden h-[240px] text-slate-900">
       {import.meta.env.DEV && (
-        <div className="absolute top-2 left-2 flex items-center gap-2 text-[11px] text-slate-500 z-30">
-          <span className="px-2 py-0.5 rounded bg-white border border-borderSoft shadow-sm">DEV: click per coordinate</span>
+        <div className="absolute top-2 left-2 flex items-center gap-2 text-[11px] text-slate-600 z-30">
+          <span className="px-2 py-0.5 rounded bg-white/90 border border-slate-200/70 shadow-sm">DEV: click per coordinate</span>
           <button
             type="button"
-            className="px-2 py-0.5 rounded bg-white border border-borderSoft shadow-sm hover:bg-slate-100 text-[11px] font-bold"
+            className="px-2 py-0.5 rounded bg-white/90 border border-slate-200/70 shadow-sm hover:bg-slate-50 text-[11px] font-bold text-slate-700"
             onClick={() => setShowAnchors(v => !v)}
           >
             Anchors {showAnchors ? 'ON' : 'OFF'}
@@ -187,7 +187,7 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
         })}
       </svg>
       {fullData.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-500">
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-600">
           Nessuna allocazione geografica disponibile
         </div>
       )}
@@ -499,8 +499,8 @@ export const Dashboard: React.FC = () => {
       const perfIndex = typeof point.perfIndex === 'number' ? point.perfIndex : 100;
       const perfPct = typeof point.perfPct === 'number' ? point.perfPct : 0;
       return (
-        <div className="bg-white border border-borderSoft rounded-xl shadow-xl px-4 py-3 min-w-[220px]">
-          <div className="text-xs text-slate-500 mb-1">{point.displayDate || label}</div>
+        <div className="ui-panel-dense px-4 py-3 min-w-[220px]">
+          <div className="text-xs text-slate-600 mb-1">{point.displayDate || label}</div>
           <div className="flex items-center justify-between text-sm font-bold text-slate-900">
             <span>Indice 100</span>
             <span>{perfIndex.toFixed(2)}</span>
@@ -521,8 +521,8 @@ export const Dashboard: React.FC = () => {
       const profit = value - invested;
       const profitPct = invested > 0 ? (profit / invested) * 100 : null;
       return (
-        <div className="bg-white border border-borderSoft rounded-xl shadow-xl px-4 py-3 min-w-[220px]">
-          <div className="text-xs text-slate-500 mb-1">{point.displayDate || label}</div>
+        <div className="ui-panel-dense px-4 py-3 min-w-[220px]">
+          <div className="text-xs text-slate-600 mb-1">{point.displayDate || label}</div>
           <div className="flex items-center justify-between text-sm font-bold text-slate-900">
             <span>Valore</span>
             <span>{`CHF ${Math.round(value).toLocaleString()}`}</span>
@@ -543,8 +543,8 @@ export const Dashboard: React.FC = () => {
 
     const valuePct = typeof point.metricValue === 'number' ? point.metricValue : 0;
     return (
-      <div className="bg-white border border-borderSoft rounded-xl shadow-xl px-4 py-3">
-        <div className="text-xs text-slate-500 mb-1">{point.displayDate || label}</div>
+      <div className="ui-panel-dense px-4 py-3">
+        <div className="text-xs text-slate-600 mb-1">{point.displayDate || label}</div>
         <div className="flex items-center justify-between text-sm font-bold text-slate-900">
           <span>{metric}</span>
           <span>{`${valuePct.toFixed(2)}%`}</span>
@@ -612,17 +612,17 @@ export const Dashboard: React.FC = () => {
 
       <div className="flex items-center justify-between gap-3">
         <div className="flex flex-col">
-          <p className="text-xs uppercase tracking-[0.08em] text-slate-500 font-bold">Dashboard</p>
-          <p className="text-sm text-slate-500">Portafoglio {currentPortfolio?.name || 'Selezionato'}</p>
+          <p className="text-xs uppercase tracking-[0.08em] text-slate-600 font-bold">Dashboard</p>
+          <p className="text-sm text-slate-600">Portafoglio {currentPortfolio?.name || 'Selezionato'}</p>
         </div>
-        <a href="#/report" className="inline-flex items-center gap-2 bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-xl text-sm font-bold hover:bg-slate-50 transition shadow-sm no-underline">
+        <a href="#/report" className="ui-btn-secondary inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold no-underline">
           <span className="material-symbols-outlined text-base">picture_as_pdf</span>
           Report PDF
         </a>
       </div>
 
       {!hasTransactions && (
-        <div className="bg-white border border-borderSoft rounded-2xl p-5 shadow-sm">
+        <div className="ui-panel p-5">
           <div className="text-sm font-bold text-slate-900">Start here</div>
           <div className="text-xs text-slate-600 mt-1">
             Nessuna transazione trovata. Aggiungi un primo strumento per iniziare il tracking.
@@ -630,13 +630,13 @@ export const Dashboard: React.FC = () => {
           <div className="mt-3 flex flex-wrap gap-2">
             <a
               href="#/transactions"
-              className="inline-flex items-center gap-2 bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-sm hover:bg-blue-600 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+              className="ui-btn-primary inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
             >
               Vai a Transactions
             </a>
             <a
               href="#/settings"
-              className="inline-flex items-center gap-2 bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-slate-50 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+              className="ui-btn-secondary inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
             >
               Apri Settings
             </a>
@@ -704,18 +704,18 @@ export const Dashboard: React.FC = () => {
       </div>
 
       {/* GLOBAL FILTERS TOOLBAR */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 py-4 px-4 sticky top-[75px] bg-slate-100/90 backdrop-blur z-20 border border-borderSoft shadow-sm rounded-xl mb-6 mx-0.5">
-        <h2 className="text-lg font-bold text-slate-800 hidden md:block pl-2">Analisi Temporale</h2>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 py-4 px-4 sticky top-[75px] ui-panel-dense z-20 mb-6 mx-0.5">
+        <h2 className="text-lg font-bold text-slate-900 hidden md:block pl-2">Analisi Temporale</h2>
         <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
           {/* Metric Toggle (BLUE) */}
-          <div className="flex bg-white p-1 rounded-xl shadow border border-borderSoft">
+          <div className="flex ui-panel-subtle p-1">
             {(['PERF', 'TWRR', 'MWRR'] as const).map(m => (
               <button
                 key={m}
                 onClick={() => setMetric(m)}
                 className={clsx(
                   "px-4 py-1.5 rounded-lg text-xs font-bold transition-all",
-                  metric === m ? "text-white shadow-md bg-[#0052a3]" : "text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                  metric === m ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
                 )}
               >
                 {m === 'PERF' ? 'Valore' : m}
@@ -725,7 +725,7 @@ export const Dashboard: React.FC = () => {
 
           {/* Value/Performance Toggle */}
           <div className={clsx(
-            "flex bg-white p-1 rounded-xl shadow border border-borderSoft",
+            "flex ui-panel-subtle p-1",
             metric !== 'PERF' && "opacity-60 pointer-events-none"
           )}>
             {([
@@ -737,7 +737,7 @@ export const Dashboard: React.FC = () => {
                 onClick={() => setValueMode(option.key)}
                 className={clsx(
                   "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
-                  valueMode === option.key ? "text-white shadow-md bg-[#0052a3]" : "text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                  valueMode === option.key ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
                 )}
                 title={option.key === 'PERF_INDEX' ? 'Indice 100 rebased sul range' : 'NAV in valuta base'}
               >
@@ -747,14 +747,14 @@ export const Dashboard: React.FC = () => {
           </div>
 
           {/* Time Toggle (ORANGE ACCENT) */}
-          <div className="flex bg-white p-1 rounded-xl shadow border border-borderSoft overflow-x-auto no-scrollbar">
+          <div className="flex ui-panel-subtle p-1 overflow-x-auto no-scrollbar">
             {(['3M', '6M', '1Y', '5Y', 'YTD', 'MAX'] as const).map(t => (
               <button
                 key={t}
                 onClick={() => setTimeRange(t)}
                 className={clsx(
                   "px-3 py-1.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap",
-                  timeRange === t ? "text-white shadow-md bg-[#f97316]" : "text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                  timeRange === t ? "text-white shadow-md bg-[#f97316]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
                 )}
               >
                 {t}
@@ -762,19 +762,19 @@ export const Dashboard: React.FC = () => {
             ))}
           </div>
         </div>
-        <div className="text-[11px] text-slate-500 mt-2 md:mt-0 md:ml-auto">
+        <div className="text-[11px] text-slate-600 mt-2 md:mt-0 md:ml-auto">
           {`Chart: ${chartGranularityLabel} (KPI: ${kpiGranularityLabel})`}
           {kpiGranularity === 'monthly' && (
             <span className="ml-2 px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">KPI Monthly</span>
           )}
           {metric === 'PERF' && valueMode === 'PERF_INDEX' && !hasPerfBase && (
-            <span className="ml-2 text-amber-600 font-bold">Base NAV non disponibile</span>
+            <span className="ml-2 text-amber-300 font-bold">Base NAV non disponibile</span>
           )}
         </div>
       </div>
 
       {/* ROW 2: Performance Chart */}
-      <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-xl relative">
+      <div className="ui-panel p-6 relative">
         <div className="flex items-start justify-between mb-4">
           <div>
             <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider flex items-center gap-2">
@@ -796,17 +796,17 @@ export const Dashboard: React.FC = () => {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
-          <div className="bg-slate-50 border border-borderSoft rounded-xl p-3">
-            <div className="text-[11px] uppercase font-bold text-slate-500">Saldo</div>
+          <div className="ui-panel-dense p-3">
+            <div className="text-[11px] uppercase font-bold text-slate-600">Saldo</div>
             <div className="text-xl font-bold text-slate-900">
               {lastChartPoint ? `CHF ${lastChartPoint.value?.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : 'N/D'}
             </div>
           </div>
-          <div className="bg-slate-50 border border-borderSoft rounded-xl p-3">
+          <div className="ui-panel-dense p-3">
             <div className="flex items-center justify-between">
-              <div className="text-[11px] uppercase font-bold text-slate-500">Rendimento</div>
+              <div className="text-[11px] uppercase font-bold text-slate-600">Rendimento</div>
               {metric !== 'PERF' && (
-                <span className="text-[11px] text-slate-500">Ultimo</span>
+                <span className="text-[11px] text-slate-600">Ultimo</span>
               )}
             </div>
             <div className="text-xl font-bold text-slate-900 flex items-center gap-2">
@@ -885,7 +885,7 @@ export const Dashboard: React.FC = () => {
                     value: metric === 'PERF'
                       ? (valueMode === 'PERF_INDEX' ? lastChartPoint.perfIndex.toFixed(1) : '')
                       : `${lastChartPoint.metricValue.toFixed(2)}%`,
-                    fill: '#0f172a',
+                    fill: '#e2e8f0',
                     fontSize: 11,
                     fontWeight: 700
                   }}
@@ -900,7 +900,7 @@ export const Dashboard: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
         {/* Annual Returns */}
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-xl">
+        <div className="ui-panel p-6">
           <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider mb-6 flex items-center gap-2">
             <span className="w-1 h-4 rounded-full bg-gray-500"></span> Ritorni Annuali
           </h3>
@@ -934,14 +934,14 @@ export const Dashboard: React.FC = () => {
                     dataKey="returnPct"
                     formatter={(val: number) => `${val >= 0 ? '+' : ''}${val.toFixed(1)}%`}
                     position="top"
-                    className="text-[11px] font-bold fill-slate-700"
+                    className="text-[11px] font-bold fill-slate-200"
                     content={(props) => {
                       const { x, y, value } = props as any;
                       if (value === undefined || x === undefined || y === undefined) return null;
                       const val = Number(value);
                       const offset = val >= 0 ? -6 : 14;
                       return (
-                        <text x={x} y={y + offset} textAnchor="middle" fontSize={11} fontWeight={700} fill="#334155">
+                        <text x={x} y={y + offset} textAnchor="middle" fontSize={11} fontWeight={700} fill="#e2e8f0">
                           {`${val >= 0 ? '+' : ''}${val.toFixed(1)}%`}
                         </text>
                       );
@@ -954,7 +954,7 @@ export const Dashboard: React.FC = () => {
         </div>
 
         {/* Drawdowns */}
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-xl">
+        <div className="ui-panel p-6">
           <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider mb-6 flex items-center gap-2">
             <span className="w-1 h-4 rounded-full shadow-[0_0_10px_rgba(249,115,22,0.5)]" style={{ backgroundColor: ACCENT_ORANGE }}></span> Drawdowns
           </h3>
@@ -1008,13 +1008,13 @@ export const Dashboard: React.FC = () => {
 
       {/* ROW: Donut cards + Macro */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-xl lg:col-span-2 flex flex-col gap-4">
+        <div className="ui-panel p-6 lg:col-span-2 flex flex-col gap-4">
           <div className="flex items-start justify-between mb-2">
             <div>
               <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider flex items-center gap-2">
                 <span className="w-1 h-4 rounded-full bg-[#0052a3] shadow-[0_0_10px_rgba(0,82,163,0.5)]"></span> Composizione & Valute
               </h3>
-              <p className="text-xs text-slate-500 mt-1">Ripartizione per asset class e valuta.</p>
+              <p className="text-xs text-slate-600 mt-1">Ripartizione per asset class e valuta.</p>
             </div>
             <InfoPopover
               ariaLabel="Info asset class"
@@ -1033,7 +1033,7 @@ export const Dashboard: React.FC = () => {
             />
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3">
+            <div className="ui-panel-dense p-3">
               <h4 className="text-xs font-bold text-slate-600 mb-2 uppercase">Asset Class</h4>
               <div className="h-48">
                 <ResponsiveContainer width="100%" height="100%">
@@ -1073,20 +1073,20 @@ export const Dashboard: React.FC = () => {
               </div>
               <div className="mt-3 max-h-44 overflow-y-auto pr-1 custom-scrollbar space-y-1.5">
                 {assetClassAllocationData.map((d, idx) => (
-                  <div key={d.key} className="flex items-center justify-between text-xs px-2 py-1.5 rounded-lg hover:bg-white transition-colors">
+                  <div key={d.key} className="flex items-center justify-between text-xs px-2 py-1.5 rounded-lg hover:bg-slate-50 transition-colors">
                     <div className="flex items-center gap-2.5">
                       <div className="w-2 h-2 rounded-full shadow-[0_0_5px_rgba(0,0,0,0.1)]" style={{ backgroundColor: COLORS[idx % COLORS.length] }}></div>
                       <span className="font-medium text-slate-600 truncate max-w-[140px]" title={d.label}>{d.label}</span>
                     </div>
-                    <span className="font-bold text-slate-700 bg-white px-2 py-0.5 rounded border border-black/5">{d.pct.toFixed(1)}%</span>
+                    <span className="font-bold text-slate-700 bg-white px-2 py-0.5 rounded border border-slate-200/70">{d.pct.toFixed(1)}%</span>
                   </div>
                 ))}
               </div>
             </div>
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3">
+            <div className="ui-panel-dense p-3">
               <h4 className="text-xs font-bold text-slate-600 mb-2 uppercase flex items-center justify-between">
                 <span>Valute</span>
-                <span className="text-[11px] text-slate-500">Percentuale su CHF</span>
+                <span className="text-[11px] text-slate-600">Percentuale su CHF</span>
               </h4>
               <div className="h-48">
                 <ResponsiveContainer width="100%" height="100%">
@@ -1112,12 +1112,12 @@ export const Dashboard: React.FC = () => {
                         const val = props?.payload?.value ?? props?.payload?.pct ?? value;
                         return [`${(val as number).toFixed(1)}%`, name];
                       }}
-                      contentStyle={{ borderRadius: 12, border: '1px solid #e2e8f0', boxShadow: '0 10px 20px -6px rgba(0,0,0,0.15)' }}
+                      contentStyle={{ borderRadius: 12, border: '1px solid rgba(255,255,255,0.12)', backgroundColor: 'rgba(15,23,42,0.9)', color: '#e2e8f0', boxShadow: '0 10px 20px -6px rgba(0,0,0,0.4)' }}
                     />
                   </PieChart>
                 </ResponsiveContainer>
               </div>
-              <div className="mt-3 bg-white border border-borderSoft rounded-xl p-2 space-y-1">
+              <div className="mt-3 ui-panel-subtle p-2 space-y-1">
                 {currencyBars.map((c, idx) => (
                   <div key={c.name} className="flex items-center justify-between rounded-lg px-2 py-1 hover:bg-slate-50 transition-colors">
                     <div className="flex items-center gap-2">
@@ -1126,7 +1126,7 @@ export const Dashboard: React.FC = () => {
                     </div>
                     <div className="text-right text-sm leading-tight">
                       <div className="font-bold text-slate-900">{c.pct.toFixed(1)}%</div>
-                      <div className="text-[11px] text-slate-500">CHF {Math.round(c.value).toLocaleString()}</div>
+                      <div className="text-[11px] text-slate-600">CHF {Math.round(c.value).toLocaleString()}</div>
                     </div>
                   </div>
                 ))}
@@ -1134,7 +1134,7 @@ export const Dashboard: React.FC = () => {
             </div>
           </div>
         </div>
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-xl flex flex-col items-start relative overflow-visible">
+        <div className="ui-panel p-6 flex flex-col items-start relative overflow-visible">
           <div className="absolute top-0 right-0 w-32 h-32 bg-[#0052a3]/5 rounded-full blur-2xl -mr-16 -mt-16 pointer-events-none" />
           <div className="w-full flex items-center justify-between mb-4 z-10">
             <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider flex items-center gap-2">
@@ -1171,13 +1171,13 @@ export const Dashboard: React.FC = () => {
 
       {/* ROW: Regioni full width */}
       <div className="grid grid-cols-1">
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-xl flex flex-col gap-4">
+        <div className="ui-panel p-6 flex flex-col gap-4">
           <div className="flex items-start justify-between gap-3">
             <div>
               <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider flex items-center gap-2">
                 <span className="w-1 h-4 rounded-full bg-[#0052a3] shadow-[0_0_10px_rgba(0,82,163,0.5)]"></span> Distribuzione geografica
               </h3>
-              <p className="text-xs text-slate-500 mt-1">Valori in CHF. Definisci le percentuali per ogni strumento in Settings &gt; Listings &amp; FX.</p>
+              <p className="text-xs text-slate-600 mt-1">Valori in CHF. Definisci le percentuali per ogni strumento in Settings &gt; Listings &amp; FX.</p>
             </div>
             <div className="flex items-center gap-2">
               {hasIncompleteRegionData && (
@@ -1202,18 +1202,18 @@ export const Dashboard: React.FC = () => {
               <RegionBubbleMap data={regionData} />
             </div>
             <div className="lg:col-span-2">
-              <div className="bg-slate-50 border border-borderSoft rounded-xl p-2 h-full">
+              <div className="ui-panel-dense p-2 h-full">
                 {regionData.length ? (
                   <div className="space-y-1">
                     {regionData.map((r, idx) => (
-                      <div key={r.region} className="flex items-center justify-between rounded-lg px-2 py-1 hover:bg-white transition-colors">
+                      <div key={r.region} className="flex items-center justify-between rounded-lg px-2 py-1 hover:bg-slate-50 transition-colors">
                         <div className="flex items-center gap-2">
                           <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: COLORS[idx % COLORS.length] }} />
                           <span className="font-medium text-slate-700 text-sm">{r.label}</span>
                         </div>
                         <div className="text-right text-sm leading-tight">
                           <div className="font-bold text-slate-900">{r.pct.toFixed(1)}%</div>
-                          <div className="text-[11px] text-slate-500">CHF {Math.round(r.value).toLocaleString()}</div>
+                          <div className="text-[11px] text-slate-600">CHF {Math.round(r.value).toLocaleString()}</div>
                         </div>
                       </div>
                     ))}
@@ -1225,7 +1225,7 @@ export const Dashboard: React.FC = () => {
                     )}
                   </div>
                 ) : (
-                  <div className="space-y-2 text-sm text-slate-500">
+                  <div className="space-y-2 text-sm text-slate-600">
                     <div>Nessun dato geografico ancora disponibile. Imposta le allocazioni in Settings per vedere la mappa.</div>
                     {hasIncompleteRegionData && (
                       <div className="flex items-center justify-between text-xs bg-amber-50 border border-amber-100 rounded-lg px-2 py-1.5">
@@ -1238,13 +1238,13 @@ export const Dashboard: React.FC = () => {
               </div>
             </div>
           </div>
-          <div className="text-[11px] text-slate-500 flex items-center gap-3">
-            <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-100 text-slate-700 border border-borderSoft">
+          <div className="text-[11px] text-slate-600 flex items-center gap-3">
+            <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-white text-slate-700 border border-slate-200/70">
               <span className="material-symbols-outlined text-xs">public</span>
               Valori in CHF
             </span>
             {hasIncompleteRegionData && (
-              <span className="text-amber-700">Alcuni strumenti non hanno una regione assegnata.</span>
+              <span className="text-amber-300">Alcuni strumenti non hanno una regione assegnata.</span>
             )}
           </div>
         </div>
@@ -1255,6 +1255,8 @@ export const Dashboard: React.FC = () => {
     </div>
   );
 };
+
+
 
 
 

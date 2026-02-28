@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Dexie from 'dexie';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { useLocation } from 'react-router-dom';
@@ -1102,7 +1102,7 @@ export const Data: React.FC = () => {
 
   return (
     <div className="space-y-6 pb-20 animate-fade-in text-textPrimary">
-      <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-lg">
+      <div className="ui-panel p-6">
         <div className="flex items-center gap-2">
           <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
             <span className="material-symbols-outlined text-[#0052a3]">science</span>
@@ -1125,10 +1125,10 @@ export const Data: React.FC = () => {
 
         <div className="mt-4">
           {hasTopIssues ? (
-            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-3 text-xs text-amber-900">
+            <div className="ui-panel border-amber-200 bg-amber-50 p-4 space-y-3 text-xs text-amber-900">
               <div className="font-bold text-amber-900">Top 3 problemi</div>
               {topIssues.map(issue => (
-                <div key={issue.key} className="bg-white/70 border border-amber-100 rounded-lg p-3">
+                <div key={issue.key} className="ui-panel-subtle border-amber-200 p-3">
                   <div className="font-semibold text-amber-900">{issue.title}</div>
                   <div className="text-amber-800">{issue.detail}</div>
                   <div className="mt-2 text-amber-900">
@@ -1214,7 +1214,7 @@ export const Data: React.FC = () => {
       </div>
 
       {tab === 'prices' && (
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-lg space-y-4">
+        <div className="ui-panel p-6 space-y-4">
           <div className="flex flex-wrap gap-4 items-end">
             <div className="flex-1 min-w-[220px]">
               <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Ticker</label>
@@ -1359,7 +1359,7 @@ export const Data: React.FC = () => {
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-slate-800">
+                <div className="ui-panel-dense p-3 text-slate-800">
                   <div className="flex items-center justify-between mb-2">
                     <div className="text-xs font-bold text-slate-500 uppercase">Warnings</div>
                     <label className="inline-flex items-center gap-2 text-[11px] text-slate-500">
@@ -1394,7 +1394,7 @@ export const Data: React.FC = () => {
                     </ul>
                   )}
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 overflow-auto max-h-56 text-slate-800">
+                <div className="ui-panel-dense p-3 overflow-auto max-h-56 text-slate-800">
                   <div className="text-xs font-bold text-slate-500 uppercase mb-2">Prezzi</div>
                   <table className="w-full text-xs text-slate-800">
                     <thead className="text-[10px] uppercase text-slate-600 sticky top-0 bg-slate-50">
@@ -1522,7 +1522,7 @@ export const Data: React.FC = () => {
       )}
 
       {tab === 'fx' && (
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-lg space-y-4">
+        <div className="ui-panel p-6 space-y-4">
           <div className="flex flex-wrap gap-4 items-end">
             <div className="flex-1 min-w-[220px]">
               <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Coppia FX</label>
@@ -1605,7 +1605,7 @@ export const Data: React.FC = () => {
                 </ResponsiveContainer>
               </div>
 
-              <div className="bg-white border border-borderSoft rounded-xl overflow-hidden">
+              <div className="ui-panel-dense rounded-xl overflow-hidden">
                 <div className="flex items-center justify-between px-3 py-2 border-b border-borderSoft bg-slate-50 text-xs text-slate-600">
                   <span className="font-bold uppercase text-slate-500">Righe FX</span>
                   <div className="flex items-center gap-3">
@@ -1654,14 +1654,14 @@ export const Data: React.FC = () => {
                 </div>
               </div>
 
-              <div className="bg-slate-50 border border-borderSoft rounded-xl p-3">
+              <div className="ui-panel-dense p-3">
                 <div className="text-xs font-bold text-slate-500 uppercase mb-2">Warnings</div>
                 {fxAnalysis.issues.length === 0 ? (
                   <div className="text-xs text-slate-500">Nessun problema rilevato.</div>
                 ) : (
                   <div className="text-xs text-slate-600 space-y-2 max-h-56 overflow-auto">
                     {fxGapDetails.length > 0 && (
-                      <div className="bg-white border border-borderSoft rounded-lg p-2">
+                      <div className="ui-panel-subtle p-2">
                         <div className="font-semibold text-slate-700 mb-1">Gap rilevati</div>
                         <ul className="space-y-1">
                           {fxGapDetails.slice(0, 5).map((gap, idx) => (
@@ -1705,7 +1705,7 @@ export const Data: React.FC = () => {
       )}
 
       {tab === 'checks' && (
-        <div className="bg-white p-6 rounded-2xl border border-borderSoft shadow-lg space-y-4">
+        <div className="ui-panel p-6 space-y-4">
           <div className="text-sm text-slate-600">Report sintetico su dati prezzi/FX e impatto sul NAV.</div>
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
             <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-slate-100 text-slate-600 border border-borderSoft">
@@ -1766,7 +1766,7 @@ export const Data: React.FC = () => {
           </div>
 
           {navSummary && (
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs text-slate-600">
+            <div className="ui-panel-dense p-3 text-xs text-slate-600">
               <div className="font-bold text-slate-500 uppercase mb-2">NAV summary</div>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
                 <div>Start: <span className="font-semibold">{navSummary.startDate}</span></div>
@@ -1781,7 +1781,7 @@ export const Data: React.FC = () => {
           )}
 
           {navChecks?.examples?.length ? (
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs text-slate-600">
+            <div className="ui-panel-dense p-3 text-xs text-slate-600">
               <div className="font-bold text-slate-500 uppercase mb-2">Esempi missing price</div>
               <ul className="space-y-1">
                 {navChecks.examples.map((row, idx) => (
@@ -1844,7 +1844,7 @@ export const Data: React.FC = () => {
           )}
 
           {rebalanceQuality && (
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs text-slate-600">
+            <div className="ui-panel-dense p-3 text-xs text-slate-600">
               <div className="font-bold text-slate-500 uppercase mb-2">Rebalance FX/Price checks</div>
               <div className="mb-2">Valuation date: <span className="font-semibold">{rebalanceQuality.valuationDate}</span></div>
               {rebalanceQuality.summary.issues.length === 0 ? (
@@ -1862,7 +1862,7 @@ export const Data: React.FC = () => {
           )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs text-slate-800">
+            <div className="ui-panel-dense p-3 text-xs text-slate-800">
               <div className="font-bold text-slate-500 uppercase mb-2">Price checks</div>
               <div className="max-h-64 overflow-auto">
                 <table className="w-full text-slate-800">
@@ -1899,7 +1899,7 @@ export const Data: React.FC = () => {
                 </table>
               </div>
             </div>
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-3 text-xs text-slate-800">
+            <div className="ui-panel-dense p-3 text-xs text-slate-800">
               <div className="font-bold text-slate-500 uppercase mb-2">FX checks</div>
               <div className="max-h-64 overflow-auto">
                 <table className="w-full text-slate-800">
@@ -1942,3 +1942,4 @@ export const Data: React.FC = () => {
     </div>
   );
 };
+

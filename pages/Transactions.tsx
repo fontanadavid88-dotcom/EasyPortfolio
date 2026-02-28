@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+﻿import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
@@ -800,15 +800,14 @@ export const Transactions: React.FC = () => {
     return (
         <div className="space-y-6 relative animate-fade-in text-textPrimary">
             {/* Header & Add Asset Button */}
-            <div className="flex justify-between items-center bg-white p-6 rounded-2xl shadow-lg border border-borderSoft sticky top-0 z-10 transition-colors">
+            <div className="flex justify-between items-center ui-panel p-6 sticky top-0 z-10 transition-colors">
                 <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
                     <span className="material-symbols-outlined text-[#0052a3]">receipt_long</span>
                     Registro Transazioni
                 </h2>
                 <button
                     onClick={() => { setAssetAttachNotice(''); setAssetInputNotice(''); setIsinLookupStatus('idle'); setIsinLookupMessage(''); setIsinCandidates([]); setIsinResolvedSymbol(''); setAssetModalOpen(true); }}
-                    className="text-slate-900 px-5 py-2.5 rounded-xl text-sm font-bold hover:bg-blue-600 transition-all shadow-lg hover:shadow-primary/30 flex items-center gap-2"
-                    style={{ backgroundColor: '#0052a3' }}
+                    className="ui-btn-primary px-5 py-2.5 rounded-xl text-sm font-bold transition-all shadow-lg hover:shadow-primary/30 flex items-center gap-2"
                 >
                     <span className="material-symbols-outlined text-[20px]">add_circle</span>
                     Nuovo Asset
@@ -822,18 +821,18 @@ export const Transactions: React.FC = () => {
 
             {/* --- MODAL: ADD ASSET & INITIAL BUY --- */}
             {isAssetModalOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
-                    <div className="bg-backgroundElevated rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden max-h-[90vh] overflow-y-auto border border-borderSoft">
-                        <div className="p-6 border-b border-borderSoft flex justify-between items-center sticky top-0 bg-backgroundElevated z-10">
-                            <h3 className="text-lg font-bold text-textPrimary">Aggiungi Strumento</h3>
-                            <button onClick={() => setAssetModalOpen(false)} className="text-gray-400 hover:text-slate-900 transition-colors">
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-md animate-fade-in">
+                    <div className="ui-panel-dense w-full max-w-lg overflow-hidden max-h-[90vh] overflow-y-auto">
+                        <div className="p-6 border-b border-slate-200/70 flex justify-between items-center sticky top-0 bg-white/90 z-10">
+                            <h3 className="text-lg font-bold text-slate-900">Aggiungi Strumento</h3>
+                            <button onClick={() => setAssetModalOpen(false)} className="text-slate-400 hover:text-slate-700 transition-colors">
                                 <span className="material-symbols-outlined">close</span>
                             </button>
                         </div>
                         <form onSubmit={handleSaveAsset} className="p-6 space-y-5">
                             {/* Ticker Section */}
                             <div className="relative">
-                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Ticker (symbol EODHD)</label>
+                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Ticker (symbol EODHD)</label>
                                 <input
                                     ref={tickerInputRef}
                                     placeholder="Es. AAPL.US o BTC-USD.CC" required
@@ -846,7 +845,7 @@ export const Transactions: React.FC = () => {
                                             setTickerDropdownOpen(false);
                                         }
                                     }}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none uppercase font-mono text-sm text-slate-900"
+                                    className="ui-input w-full uppercase font-mono text-sm"
                                     autoComplete="off"
                                 />
                                 <div className="text-[11px] text-slate-500 mt-1">
@@ -856,14 +855,14 @@ export const Transactions: React.FC = () => {
                                 {isTickerDropdownOpen && tickerSearchResults.length > 0 && (
                                     <div
                                         ref={tickerDropdownRef}
-                                        className="absolute top-full left-0 right-0 bg-backgroundElevated border border-borderSoft rounded-xl shadow-xl mt-1 z-20 max-h-48 overflow-y-auto"
+                                        className="absolute top-full left-0 right-0 ui-panel-dense shadow-xl mt-1 z-20 max-h-48 overflow-y-auto"
                                     >
                                         <div className="p-2 text-xs text-gray-500 font-medium bg-slate-50/50">Suggerimenti Borsa</div>
                                         {tickerSearchResults.map((res) => (
                                             <div
                                                 key={res.t}
                                                 onMouseDown={() => selectTickerSuggestion(res.t)}
-                                                className="px-4 py-2 hover:bg-white/5 cursor-pointer flex justify-between items-center group transition-colors"
+                                                className="px-4 py-2 hover:bg-slate-50 cursor-pointer flex justify-between items-center group transition-colors"
                                             >
                                                 <span className="font-bold text-gray-200">{res.t}</span>
                                                 <span className="text-xs text-gray-500 group-hover:text-primary">{res.ex}</span>
@@ -886,12 +885,12 @@ export const Transactions: React.FC = () => {
                             </div>
 
                             <div>
-                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">ISIN (opzionale)</label>
+                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">ISIN (opzionale)</label>
                                 <input
                                     placeholder="Es. IE00B4L5Y983"
                                     value={assetForm.isin}
                                     onChange={e => handleIsinChange(e.target.value)}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none uppercase font-mono text-sm text-slate-900"
+                                    className="ui-input w-full uppercase font-mono text-sm"
                                     autoComplete="off"
                                 />
                                 <div className="text-[11px] text-slate-500 mt-1">
@@ -951,32 +950,32 @@ export const Transactions: React.FC = () => {
                                 )}
                             </div>
                             <div>
-                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Nome Strumento</label>
+                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Nome Strumento</label>
                                 <input
                                     placeholder="Nome completo" required
                                     value={assetForm.name}
                                     onChange={e => setAssetForm({ ...assetForm, name: e.target.value })}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    className="ui-input w-full text-sm"
                                 />
                             </div>
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Tipo</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Tipo</label>
                                     <select
                                         value={assetForm.type}
                                         onChange={e => setAssetForm({ ...assetForm, type: e.target.value as AssetType })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(AssetType).map(t => <option key={t} value={t}>{getAssetTypeLabel(t)}</option>)}
                                     </select>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Valuta</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Valuta</label>
                                     <select
                                         value={assetForm.currency}
                                         onChange={e => setAssetForm({ ...assetForm, currency: e.target.value as Currency })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(Currency).map(c => <option key={c} value={c}>{c}</option>)}
                                     </select>
@@ -984,7 +983,7 @@ export const Transactions: React.FC = () => {
                             </div>
 
                             {/* Initial Transaction Section */}
-                            <div className="border-t border-borderSoft pt-3 mt-2">
+                            <div className="border-t border-white/10 pt-3 mt-2">
                                 <p className="text-xs font-bold text-primary uppercase mb-3 flex items-center gap-1">
                                     <span className="material-symbols-outlined text-sm">shopping_cart</span>
                                     Dettagli Primo Acquisto
@@ -993,34 +992,34 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Data</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Data</label>
                                     <input
                                         ref={assetDateRef}
                                         type="date" required
                                         value={assetForm.date}
                                         onChange={e => setAssetForm({ ...assetForm, date: e.target.value })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900 dark-date-input"
+                                        className="ui-input w-full text-sm dark-date-input"
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Quantità</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Quantità</label>
                                     <input
                                         type="number" placeholder="0" step="0.0001" required
                                         value={numberValue(assetForm.quantity)}
                                         onChange={e => setAssetForm({ ...assetForm, quantity: parseNumberInput(e.target.value) })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
+                                        className="ui-input w-full text-sm font-mono"
                                     />
                                 </div>
                             </div>
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Prezzo Acquisto</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Prezzo Acquisto</label>
                                     <input
                                         type="number" placeholder="0.00" step="0.01" required
                                         value={numberValue(assetForm.price)}
                                         onChange={e => setAssetForm({ ...assetForm, price: parseNumberInput(e.target.value) })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
+                                        className="ui-input w-full text-sm font-mono"
                                     />
                                     {assetMarketHint.status === 'loading' && (
                                         <div className="text-[11px] text-slate-500 mt-1">Carico prezzo di mercato...</div>
@@ -1062,18 +1061,18 @@ export const Transactions: React.FC = () => {
                                     </label>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Commissioni</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Commissioni</label>
                                     <input
                                         type="number" placeholder="0.00" step="0.01"
                                         value={numberValue(assetForm.fees)}
                                         onChange={e => setAssetForm({ ...assetForm, fees: parseNumberInput(e.target.value) })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
+                                        className="ui-input w-full text-sm font-mono"
                                     />
                                 </div>
                             </div>
 
                             <div className="pt-4">
-                                <button type="submit" className="w-full bg-primary text-slate-900 py-3.5 rounded-xl font-bold hover:bg-blue-600 transition shadow-lg text-sm">
+                                <button type="submit" className="ui-btn-primary w-full py-3.5 rounded-xl font-bold transition shadow-lg text-sm">
                                     Salva Strumento e Transazione
                                 </button>
                             </div>
@@ -1084,35 +1083,35 @@ export const Transactions: React.FC = () => {
 
             {/* --- MODAL: ADD/EDIT TRANSACTION (Specific Asset) --- */}
             {isTxModalOpen && activeAssetForTx && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
-                    <div className="bg-backgroundElevated rounded-2xl shadow-xl w-full max-w-lg overflow-hidden border border-borderSoft">
-                        <div className="p-6 border-b border-borderSoft flex justify-between items-center bg-white/5">
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-md animate-fade-in">
+                    <div className="ui-panel-dense w-full max-w-lg overflow-hidden">
+                        <div className="p-6 border-b border-slate-200/70 flex justify-between items-center bg-white/90">
                             <div>
-                                <h3 className="text-lg font-bold text-textPrimary">
+                                <h3 className="text-lg font-bold text-slate-900">
                                     {editingTxId ? 'Modifica Operazione' : 'Nuova Operazione'}
                                 </h3>
                                 <p className="text-xs text-primary font-bold uppercase tracking-wider mt-0.5">{activeAssetForTx}</p>
                             </div>
-                            <button onClick={() => setTxModalOpen(false)} className="text-gray-400 hover:text-slate-900">
+                            <button onClick={() => setTxModalOpen(false)} className="text-slate-400 hover:text-slate-700">
                                 <span className="material-symbols-outlined">close</span>
                             </button>
                         </div>
                         <form onSubmit={handleSaveTransaction} className="p-6 space-y-4">
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Data</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Data</label>
                                     <input
                                         type="date"
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900 dark-date-input"
+                                        className="ui-input w-full text-sm dark-date-input"
                                         value={txForm.date}
                                         onChange={e => setTxForm({ ...txForm, date: e.target.value })}
                                         required
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Tipo</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Tipo</label>
                                     <select
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                         value={txForm.type}
                                         onChange={e => setTxForm({ ...txForm, type: e.target.value as TransactionType })}
                                     >
@@ -1123,10 +1122,10 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Prezzo Unitario</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Prezzo Unitario</label>
                                     <input
                                         type="number" placeholder="0.00"
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
+                                        className="ui-input w-full text-sm font-mono"
                                         step="0.01"
                                         value={numberValue(txForm.price)}
                                         onChange={e => setTxForm({ ...txForm, price: parseNumberInput(e.target.value) })}
@@ -1172,10 +1171,10 @@ export const Transactions: React.FC = () => {
                                     </label>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Quantità</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Quantità</label>
                                     <input
                                         type="number" placeholder="0"
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
+                                        className="ui-input w-full text-sm font-mono"
                                         step="0.0001"
                                         value={numberValue(txForm.qty)}
                                         onChange={e => setTxForm({ ...txForm, qty: parseNumberInput(e.target.value) })}
@@ -1186,19 +1185,19 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Commissioni</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Commissioni</label>
                                     <input
                                         type="number" placeholder="0.00"
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm font-mono text-slate-900"
+                                        className="ui-input w-full text-sm font-mono"
                                         step="0.01"
                                         value={numberValue(txForm.fees)}
                                         onChange={e => setTxForm({ ...txForm, fees: parseNumberInput(e.target.value) })}
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Valuta</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Valuta</label>
                                     <select
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                         value={txForm.currency}
                                         onChange={e => setTxForm({ ...txForm, currency: e.target.value as Currency })}
                                     >
@@ -1208,7 +1207,7 @@ export const Transactions: React.FC = () => {
                             </div>
 
                             <div className="pt-4">
-                                <button type="submit" className="w-full bg-primary text-slate-900 py-3.5 rounded-xl font-bold hover:bg-blue-600 transition shadow-lg text-sm">
+                                <button type="submit" className="ui-btn-primary w-full py-3.5 rounded-xl font-bold transition shadow-lg text-sm">
                                     {editingTxId ? 'Aggiorna Transazione' : 'Registra Movimento'}
                                 </button>
                             </div>
@@ -1218,45 +1217,45 @@ export const Transactions: React.FC = () => {
             )}
 
             {isEditAssetModalOpen && editingAsset && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
-                    <div className="bg-backgroundElevated rounded-2xl shadow-xl w-full max-w-lg overflow-hidden border border-borderSoft">
-                        <div className="p-6 border-b border-borderSoft flex justify-between items-center bg-white/5">
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-md animate-fade-in">
+                    <div className="ui-panel-dense w-full max-w-lg overflow-hidden">
+                        <div className="p-6 border-b border-slate-200/70 flex justify-between items-center bg-white/90">
                             <div>
-                                <h3 className="text-lg font-bold text-textPrimary">Modifica Asset</h3>
+                                <h3 className="text-lg font-bold text-slate-900">Modifica Asset</h3>
                                 <p className="text-xs text-primary font-bold uppercase tracking-wider mt-0.5">{editingAsset.ticker}</p>
                             </div>
-                            <button onClick={handleCloseEditAsset} className="text-gray-400 hover:text-slate-900">
+                            <button onClick={handleCloseEditAsset} className="text-slate-400 hover:text-slate-700">
                                 <span className="material-symbols-outlined">close</span>
                             </button>
                         </div>
                         <form onSubmit={handleSaveAssetMeta} className="p-6 space-y-4">
                             <div>
-                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Nome</label>
+                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Nome</label>
                                 <input
                                     value={editAssetForm.name}
                                     onChange={e => setEditAssetForm({ ...editAssetForm, name: e.target.value })}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    className="ui-input w-full text-sm"
                                     required
                                 />
                             </div>
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Tipo</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Tipo</label>
                                     <select
                                         value={editAssetForm.type}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, type: e.target.value as AssetType })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(AssetType).map(t => <option key={t} value={t}>{getAssetTypeLabel(t)}</option>)}
                                     </select>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Asset class</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Asset class</label>
                                     <select
                                         value={editAssetForm.assetClass}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, assetClass: e.target.value as AssetClass })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(AssetClass).map(ac => <option key={ac} value={ac}>{getAssetClassLabel(ac)}</option>)}
                                     </select>
@@ -1265,31 +1264,31 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Valuta</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Valuta</label>
                                     <select
                                         value={editAssetForm.currency}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, currency: e.target.value as Currency })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     >
                                         {Object.values(Currency).map(c => <option key={c} value={c}>{c}</option>)}
                                     </select>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Settore</label>
+                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Settore</label>
                                     <input
                                         value={editAssetForm.sector}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, sector: e.target.value })}
-                                        className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                        className="ui-input w-full text-sm"
                                     />
                                 </div>
                             </div>
 
                             <div>
-                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Geografia</label>
+                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Geografia</label>
                                 <select
                                     value={editAssetForm.region}
                                     onChange={e => setEditAssetForm({ ...editAssetForm, region: e.target.value as RegionKey | '' })}
-                                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none text-sm text-slate-900"
+                                    className="ui-input w-full text-sm"
                                 >
                                     <option value="">Auto / multi</option>
                                     {REGION_OPTIONS.map(opt => (
@@ -1308,7 +1307,7 @@ export const Transactions: React.FC = () => {
                                 </button>
                                 <button
                                     type="submit"
-                                    className="flex-1 bg-primary text-slate-900 py-3 rounded-xl font-bold hover:bg-blue-600 transition"
+                                    className="flex-1 ui-btn-primary py-3 rounded-xl font-bold transition"
                                 >
                                     Salva
                                 </button>
@@ -1329,7 +1328,7 @@ export const Transactions: React.FC = () => {
                     const priceTicker = instrument ? getCanonicalTicker(instrument) : group.ticker;
                     const coverageBadge = group.ticker !== "CASH" && priceTicker ? getCoverageBadge(priceTicker) : null;
                     return (
-                    <div key={group.ticker} className="bg-white rounded-xl shadow-lg border border-borderSoft overflow-hidden transition-all hover:border-primary/30">
+                    <div key={group.ticker} className="ui-panel overflow-hidden transition-all hover:border-primary/30">
 
                         {/* Summary Header */}
                         <div
@@ -1409,7 +1408,7 @@ export const Transactions: React.FC = () => {
                         {expandedTicker === group.ticker && (
                             <div className="bg-slate-50 border-t border-borderSoft animate-fade-in">
                                 <table className="w-full text-sm text-left">
-                                    <thead className="text-xs text-slate-500 uppercase bg-black/5 border-b border-borderSoft">
+                                    <thead className="text-xs text-slate-500 uppercase bg-slate-50 border-b border-borderSoft">
                                         <tr>
                                             <th className="px-6 py-3 font-semibold">Data</th>
                                             <th className="px-6 py-3 font-semibold">Tipo</th>
@@ -1442,14 +1441,14 @@ export const Transactions: React.FC = () => {
                                                     <div className="flex items-center justify-center gap-1 opacity-100 transition-opacity">
                                                         <button
                                                             onClick={() => handleOpenTxModal(group.ticker, t)}
-                                                            className="p-1.5 rounded-lg hover:bg-black/5 text-slate-400 hover:text-primary transition-colors"
+                                                            className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-primary transition-colors"
                                                             title="Modifica"
                                                         >
                                                             <span className="material-symbols-outlined text-[18px]">edit</span>
                                                         </button>
                                                         <button
                                                             onClick={() => handleDeleteTransaction(t.id)}
-                                                            className="p-1.5 rounded-lg hover:bg-black/5 text-slate-400 hover:text-negative transition-colors"
+                                                            className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-negative transition-colors"
                                                             title="Elimina"
                                                         >
                                                             <span className="material-symbols-outlined text-[18px]">delete</span>
@@ -1463,7 +1462,7 @@ export const Transactions: React.FC = () => {
                                 <div className="p-3 text-center border-t border-borderSoft">
                                     <button
                                         onClick={() => handleOpenTxModal(group.ticker)}
-                                        className="text-xs text-[#0052a3] font-bold uppercase tracking-wide hover:text-blue-400 flex items-center justify-center gap-1 w-full py-2 hover:bg-white/5 rounded transition-colors"
+                                        className="text-xs text-[#0052a3] font-bold uppercase tracking-wide hover:text-blue-400 flex items-center justify-center gap-1 w-full py-2 hover:bg-slate-50 rounded transition-colors"
                                     >
                                         <span className="material-symbols-outlined text-[18px]">add</span> Registra acquisto / vendita
                                     </button>
@@ -1474,7 +1473,7 @@ export const Transactions: React.FC = () => {
                 )})}
 
                 {!transactions?.length && (
-                    <div className="text-center py-16 text-slate-500 bg-white rounded-2xl border border-dashed border-borderSoft">
+                    <div className="ui-panel-subtle text-center py-16 text-slate-500 border border-dashed border-borderSoft">
                         <span className="material-symbols-outlined text-4xl mb-3 opacity-30">receipt_long</span>
                         <p>Nessuna transazione presente.</p>
                         <p className="text-sm">Inizia aggiungendo il tuo primo strumento con il tasto in alto.</p>
@@ -1484,6 +1483,10 @@ export const Transactions: React.FC = () => {
         </div>
     );
 };
+
+
+
+
 
 
 

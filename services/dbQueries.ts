@@ -1,6 +1,6 @@
 import Dexie from 'dexie';
 import { db } from '../db';
-import { FxRate, PricePoint } from '../types';
+import { FxRate, PricePoint, TransactionType } from '../types';
 import { subDaysYmd } from './dateUtils';
 
 const priceRangeCache = new Map<string, { ts: number; data: PricePoint[] }>();
@@ -157,4 +157,106 @@ export const queryPriceBoundsForTickers = async (params: {
   }));
 
   return { firstPriceDate, lastPriceDate };
+};
+
+export const countTransactionsForTicker = async (params: {
+  ticker: string;
+  portfolioId?: string;
+}): Promise<number> => {
+  const { ticker, portfolioId } = params;
+  if (!ticker) return 0;
+  let query = db.transactions.where('instrumentTicker').equals(ticker);
+  if (portfolioId) {
+    query = query.and(tx => (tx.portfolioId || '') === portfolioId);
+  }
+  return query.count();
+};
+
+export const countTransactionsForTickerPortfolio = async (ticker: string, portfolioId: string): Promise<number> => {
+  return countTransactionsForTicker({ ticker, portfolioId });
+};
+
+export const countTransactionsForTickerGlobal = async (ticker: string): Promise<number> => {
+  return countTransactionsForTicker({ ticker });
+};
+
+export const deleteInstrumentSafely = async (params: {
+  ticker: string;
+  portfolioId?: string;
+  deletePrices?: boolean;
+}): Promise<{ ok: boolean; reason?: 'has_transactions' | 'error'; deletedInstrument?: number; deletedPrices?: number; txCount?: number }> => {
+  const { ticker, portfolioId, deletePrices } = params;
+  if (!ticker) return { ok: false, reason: 'error' };
+  const txCount = await countTransactionsForTicker({ ticker, portfolioId });
+  if (txCount > 0) {
+    return { ok: false, reason: 'has_transactions', txCount };
+  }
+  let deletedInstrument = 0;
+  let deletedPrices = 0;
+  try {
+    await db.transaction('rw', [db.instruments, db.prices], async () => {
+      deletedInstrument = await db.instruments
+        .where('ticker')
+        .equals(ticker)
+        .and(inst => !portfolioId || (inst.portfolioId || '') === portfolioId)
+        .delete();
+      if (deletePrices) {
+        deletedPrices = await db.prices
+          .where('[ticker+date]')
+          .between([ticker, Dexie.minKey], [ticker, Dexie.maxKey])
+          .and(p => !portfolioId || (p.portfolioId || '') === portfolioId)
+          .delete();
+      }
+    });
+    return { ok: true, deletedInstrument, deletedPrices };
+  } catch {
+    return { ok: false, reason: 'error' };
+  }
+};
+
+export const deleteInstrumentGloballySafely = async (params: {
+  ticker: string;
+  deletePrices?: boolean;
+}): Promise<{ ok: boolean; reason?: 'has_transactions' | 'error'; deletedInstrument?: number; deletedPrices?: number; txCount?: number }> => {
+  const { ticker, deletePrices } = params;
+  if (!ticker) return { ok: false, reason: 'error' };
+  const txCount = await countTransactionsForTickerGlobal(ticker);
+  if (txCount > 0) {
+    return { ok: false, reason: 'has_transactions', txCount };
+  }
+  let deletedInstrument = 0;
+  let deletedPrices = 0;
+  try {
+    await db.transaction('rw', [db.instruments, db.prices], async () => {
+      deletedInstrument = await db.instruments.where('ticker').equals(ticker).delete();
+      if (deletePrices) {
+        deletedPrices = await db.prices
+          .where('[ticker+date]')
+          .between([ticker, Dexie.minKey], [ticker, Dexie.maxKey])
+          .delete();
+      }
+    });
+    return { ok: true, deletedInstrument, deletedPrices };
+  } catch {
+    return { ok: false, reason: 'error' };
+  }
+};
+
+export const getNetPositionForTicker = async (params: {
+  ticker: string;
+  portfolioId?: string;
+}): Promise<number> => {
+  const { ticker, portfolioId } = params;
+  if (!ticker) return 0;
+  let query = db.transactions.where('instrumentTicker').equals(ticker);
+  if (portfolioId) {
+    query = query.and(tx => (tx.portfolioId || '') === portfolioId);
+  }
+  const rows = await query.toArray();
+  let net = 0;
+  rows.forEach(tx => {
+    if (tx.type === TransactionType.Buy) net += (tx.quantity || 0);
+    if (tx.type === TransactionType.Sell) net -= (tx.quantity || 0);
+  });
+  return net;
 };

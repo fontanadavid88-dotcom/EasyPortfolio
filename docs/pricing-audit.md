@@ -1,14 +1,14 @@
 # Pricing audit (2026-01-26)
 
 ## Current flow (as-is)
-- Settings ? “Aggiorna prezzi” calls `services/priceService.syncPrices()` which fetches EODHD history (or Sheets latest as fallback) and upserts `db.prices`.
+- Settings -> "Aggiorna prezzi" calls `services/priceService.syncPrices()` which fetches EODHD history (or Sheets latest as fallback) and upserts `db.prices`.
 - Backfill uses `services/priceService.backfillPricesForPortfolio()` ? EODHD history ? `db.prices`.
 - Coverage uses `services/priceService.getPriceCoverage()` + `buildCoverageRows()`.
 - Canonical price ticker is `preferredListing.symbol` (fallback `instrument.ticker`).
 - Provider config is stored in `AppSettings.priceTickerConfig` keyed by canonical ticker.
 
 ## Key risk points
-- Listing mismatch (instrument ticker vs preferredListing symbol) leads to “0/7” coverage and 404s.
+- Listing mismatch (instrument ticker vs preferredListing symbol) leads to "0/7" coverage and 404s.
 - Missing ISIN reduces auto-mapping quality when instruments are created.
 - Currency tagging from EODHD was hardcoded and could mislabel CHF/EUR listings.
 

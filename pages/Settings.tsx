@@ -6,12 +6,14 @@ import { fetchJsonWithDiagnostics, toNum, FetchJsonDiagnostics } from '../servic
 import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
 import { importFxCsv, FxRateRow, backfillFxRatesForPortfolio, getFxPairsForPortfolio, FxBackfillSummary } from '../services/fxService';
+import { detectFormat, importToDb, ImportReport, ImportTableName, validateAndNormalize } from '../services/importExportService';
 import { fetchAppsScriptPing, fetchAssetsMap, fetchMacro, applyAssetsMapToSettings, applyMacroRowsToDexie, syncFxRates, AppsScriptFxRow, APPS_SCRIPT_DISABLED_MESSAGE } from '../services/appsScriptService';
 import { checkProxyHealth } from '../services/apiHealthService';
 import type { ProxyHealth } from '../services/apiHealthService';
+import { deleteInstrumentGloballySafely } from '../services/dbQueries';
+import { addHiddenTicker, getHiddenTickersForPortfolio, removeHiddenTicker, removeHiddenTickerEverywhere } from '../services/portfolioVisibility';
 import { isIsin, normalizeTicker, resolveEodhdSymbol, hasExchangeSuffix } from '../services/symbolUtils';
 import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType, Transaction } from '../types';
-import { createUuid } from '../services/idUtils';
 import { InfoPopover } from '../components/InfoPopover';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { format, subDays } from 'date-fns';
@@ -31,6 +33,19 @@ type InstrumentListingRow = {
 };
 
 type FxRateRowWithId = FxRateRow & { id?: number };
+type ActiveSection = 'prices' | 'connections' | 'coverage' | 'backup' | 'advanced';
+
+const SETTINGS_SECTIONS: { key: ActiveSection; label: string }[] = [
+  { key: 'prices', label: 'Prezzi & Backfill' },
+  { key: 'connections', label: 'Provider & Connessioni' },
+  { key: 'coverage', label: 'Ticker / Listings / Coverage' },
+  { key: 'backup', label: 'Backup & Import' },
+  { key: 'advanced', label: 'Avanzate' }
+];
+
+const isActiveSection = (value: string | null | undefined): value is ActiveSection => {
+  return SETTINGS_SECTIONS.some(section => section.key === value);
+};
 
 export const Settings: React.FC = () => {
   const [config, setConfig] = useState<AppSettings>({
@@ -47,6 +62,9 @@ export const Settings: React.FC = () => {
   const location = useLocation();
   const [isConfigModalOpen, setConfigModalOpen] = useState(false);
   const [coverageExpanded, setCoverageExpanded] = useState(false);
+  const [showExcludedTickers, setShowExcludedTickers] = useState(false);
+  const [showHiddenTickers, setShowHiddenTickers] = useState(false);
+  const [hiddenTickers, setHiddenTickers] = useState<string[]>(() => getHiddenTickersForPortfolio(getCurrentPortfolioId()));
   const [coverage, setCoverage] = useState<{
     earliestCoveredDate?: string;
     latestCoveredDate?: string;
@@ -67,6 +85,16 @@ export const Settings: React.FC = () => {
   const [eodhdTests, setEodhdTests] = useState<Record<string, { status: string; symbol?: string; message?: string; httpStatus?: number; sample?: string; contentType?: string; rawPreview?: string; parseError?: string; url?: string }>>({});
   const [rawModal, setRawModal] = useState<{ open: boolean; title: string; content: string }>({ open: false, title: '', content: '' });
   const [rawModalLoading, setRawModalLoading] = useState(false);
+  const [deleteInstrumentModal, setDeleteInstrumentModal] = useState<{ open: boolean; ticker?: string; name?: string }>({ open: false });
+  const [deleteInstrumentWithPrices, setDeleteInstrumentWithPrices] = useState(false);
+  const [deleteInstrumentConfirmed, setDeleteInstrumentConfirmed] = useState(false);
+  const [deleteInstrumentLoading, setDeleteInstrumentLoading] = useState(false);
+  const [deleteInstrumentError, setDeleteInstrumentError] = useState('');
+  const [importReport, setImportReport] = useState<ImportReport | null>(null);
+  const [importWarnings, setImportWarnings] = useState<string[]>([]);
+  const [importErrors, setImportErrors] = useState<string[]>([]);
+  const [importStatus, setImportStatus] = useState('');
+  const [importRunning, setImportRunning] = useState(false);
   const [eodhdSymbolErrors, setEodhdSymbolErrors] = useState<Record<string, string>>({});
   const [isTestingAll, setIsTestingAll] = useState(false);
   const [testAllProgress, setTestAllProgress] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
@@ -79,6 +107,15 @@ export const Settings: React.FC = () => {
   const focusHandledRef = useRef<string | null>(null);
   const [settingsId, setSettingsId] = useState<number | undefined>(undefined);
   const currentPortfolioId = getCurrentPortfolioId();
+  const [activeSection, setActiveSection] = useState<ActiveSection>(() => {
+    if (typeof window === 'undefined') return 'prices';
+    const stored = localStorage.getItem(`settings.activeSection.${currentPortfolioId}`);
+    return isActiveSection(stored) ? stored : 'prices';
+  });
+  const [expertMode, setExpertMode] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return localStorage.getItem('settings.expertMode') === '1';
+  });
   const [portfolios, setPortfolios] = useState<{ id?: number; portfolioId: string; name: string }[]>([]);
   const [newPortfolioName, setNewPortfolioName] = useState('');
   const [instruments, setInstruments] = useState<Instrument[]>([]);
@@ -118,6 +155,16 @@ export const Settings: React.FC = () => {
     []
   ) as InstrumentListingRow[];
   const fxRates = useLiveQuery(() => db.fxRates.toArray(), [], []) as FxRateRowWithId[];
+  const allTransactions = useLiveQuery(
+    () => db.transactions.toArray(),
+    [],
+    []
+  ) as Transaction[];
+  const portfolioTransactions = useLiveQuery(
+    () => db.transactions.where('portfolioId').equals(currentPortfolioId).toArray(),
+    [currentPortfolioId],
+    []
+  ) as Transaction[];
   const missingInstrumentTransactions = useLiveQuery(
     () => db.transactions
       .where('portfolioId')
@@ -128,6 +175,17 @@ export const Settings: React.FC = () => {
     []
   ) as Transaction[];
   const [txRepairSelection, setTxRepairSelection] = useState<Record<number, string>>({});
+
+  const importTableLabels: Record<ImportTableName, string> = {
+    portfolios: 'Portafogli',
+    settings: 'Impostazioni',
+    instruments: 'Strumenti',
+    instrumentListings: 'Listings',
+    transactions: 'Transazioni',
+    prices: 'Prezzi',
+    fxRates: 'FX',
+    macro: 'Macro'
+  };
 
   useEffect(() => {
     setAutoGapEnabled(getAutoGapFillEnabled(currentPortfolioId));
@@ -156,6 +214,26 @@ export const Settings: React.FC = () => {
     });
   }, [currentPortfolioId]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const stored = localStorage.getItem(`settings.activeSection.${currentPortfolioId}`);
+    setActiveSection(isActiveSection(stored) ? stored : 'prices');
+  }, [currentPortfolioId]);
+
+  useEffect(() => {
+    setHiddenTickers(getHiddenTickersForPortfolio(currentPortfolioId));
+  }, [currentPortfolioId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(`settings.activeSection.${currentPortfolioId}`, activeSection);
+  }, [activeSection, currentPortfolioId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('settings.expertMode', expertMode ? '1' : '0');
+  }, [expertMode]);
+
   const instrumentByKey = useMemo(() => {
     const map = new Map<string, Instrument>();
     instruments.forEach(inst => {
@@ -172,6 +250,28 @@ export const Settings: React.FC = () => {
   const missingTxRows = useMemo(() => {
     return (missingInstrumentTransactions || []).filter(tx => !tx.instrumentId);
   }, [missingInstrumentTransactions]);
+  const globalTxCountByTicker = useMemo(() => {
+    const map = new Map<string, number>();
+    (allTransactions || []).forEach(tx => {
+      const key = tx.instrumentTicker;
+      if (!key) return;
+      map.set(key, (map.get(key) || 0) + 1);
+    });
+    return map;
+  }, [allTransactions]);
+  const netPositionByTicker = useMemo(() => {
+    const map = new Map<string, number>();
+    (portfolioTransactions || []).forEach(tx => {
+      const key = tx.instrumentTicker;
+      if (!key) return;
+      if (tx.type === 'Buy') {
+        map.set(key, (map.get(key) || 0) + (tx.quantity || 0));
+      } else if (tx.type === 'Sell') {
+        map.set(key, (map.get(key) || 0) - (tx.quantity || 0));
+      }
+    });
+    return map;
+  }, [portfolioTransactions]);
   useEffect(() => {
     const params = new URLSearchParams(location.search || "");
     if (params.get("focus") !== "listing") return;
@@ -180,6 +280,10 @@ export const Settings: React.FC = () => {
     const focusKey = `${tickerParam}|${isinParam}`;
     if (focusHandledRef.current === focusKey) return;
     if (!instruments || instruments.length === 0) return;
+    if (activeSection !== 'coverage') {
+      setActiveSection('coverage');
+      return;
+    }
     const instrument = instruments.find(i => {
       if (isinParam && i.isin === isinParam) return true;
       if (!tickerParam) return false;
@@ -194,7 +298,7 @@ export const Settings: React.FC = () => {
     listingsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     requestAnimationFrame(() => listingSelectRef.current?.focus());
     focusHandledRef.current = focusKey;
-  }, [location.search, instruments]);
+  }, [location.search, instruments, activeSection]);
 
   const loadProxyHealth = async (apiKey?: string, force = false) => {
     setProxyHealthLoading(true);
@@ -252,7 +356,7 @@ export const Settings: React.FC = () => {
       const global = dates.length
         ? dates.reduce((min, d) => (d < min ? d : min), dates[0])
         : 'N/D';
-      setFxLastDateInfo({ global, details: details.join(' · '), pairs });
+      setFxLastDateInfo({ global, details: details.join(' ? '), pairs });
     } catch {
       setFxLastDateInfo({ global: undefined, details: '', pairs: [] });
     } finally {
@@ -374,7 +478,7 @@ export const Settings: React.FC = () => {
   };
 
   const loadCoverage = async () => {
-    const tickers = await getTickersForBackfill(currentPortfolioId, config.priceBackfillScope || 'current');
+    const tickers = await getTickersForBackfill(currentPortfolioId, config.priceBackfillScope || 'current', { includeHidden: true });
     const cov = await getPriceCoverage(currentPortfolioId, tickers, config.minHistoryDate || '2020-01-01');
     setCoverage({ ...cov, total: tickers.length });
   };
@@ -385,6 +489,27 @@ export const Settings: React.FC = () => {
   }, [config.priceBackfillScope, config.minHistoryDate, currentPortfolioId]);
 
   const getRowConfig = (ticker: string) => resolvePriceSyncConfig(ticker, config);
+
+  const flashSaveNotice = (message: string) => {
+    setSaveNotice(message);
+    setTimeout(() => setSaveNotice(''), 2500);
+  };
+
+  const handleRemoveFromPortfolio = (ticker: string, isHeld: boolean) => {
+    if (isHeld) {
+      flashSaveNotice(`Non puoi rimuovere ${ticker}: strumento detenuto nel portafoglio.`);
+      return;
+    }
+    addHiddenTicker(currentPortfolioId, ticker);
+    setHiddenTickers(getHiddenTickersForPortfolio(currentPortfolioId));
+    flashSaveNotice(`Ticker ${ticker} rimosso dal portafoglio.`);
+  };
+
+  const handleRestoreToPortfolio = (ticker: string) => {
+    removeHiddenTicker(currentPortfolioId, ticker);
+    setHiddenTickers(getHiddenTickersForPortfolio(currentPortfolioId));
+    flashSaveNotice(`Ticker ${ticker} ripristinato nel portafoglio.`);
+  };
 
   const updateTickerConfig = async (ticker: string, patch: Partial<PriceTickerConfig>) => {
     const nextConfig: AppSettings = {
@@ -412,6 +537,90 @@ export const Settings: React.FC = () => {
         delete copy[ticker];
         return copy;
       });
+    }
+  };
+
+  const removeTickerConfigEntry = async (ticker: string) => {
+    if (!config.priceTickerConfig?.[ticker]) return;
+    const nextConfig: AppSettings = {
+      ...config,
+      priceTickerConfig: { ...(config.priceTickerConfig || {}) }
+    };
+    delete nextConfig.priceTickerConfig?.[ticker];
+    setConfig(nextConfig);
+    await db.settings.put({ ...nextConfig, id: settingsId, portfolioId: currentPortfolioId });
+    setEodhdTests(prev => {
+      const copy = { ...prev };
+      delete copy[ticker];
+      return copy;
+    });
+    setSheetTests(prev => {
+      const copy = { ...prev };
+      delete copy[ticker];
+      return copy;
+    });
+  };
+
+  const removeTickerConfigEverywhere = async (ticker: string) => {
+    const allSettings = await db.settings.toArray();
+    await Promise.all(allSettings.map(async (row) => {
+      if (row.portfolioId === currentPortfolioId) return;
+      if (!row.priceTickerConfig?.[ticker]) return;
+      const next = { ...row, priceTickerConfig: { ...(row.priceTickerConfig || {}) } };
+      delete next.priceTickerConfig?.[ticker];
+      await db.settings.put(next);
+    }));
+  };
+
+  const handleToggleExclude = async (ticker: string, nextExcluded: boolean) => {
+    await updateTickerConfig(ticker, { exclude: nextExcluded });
+    flashSaveNotice(nextExcluded
+      ? `Ticker ${ticker} escluso dal sync/backfill. Attiva "Mostra esclusi" per rivederlo.`
+      : `Ticker ${ticker} riattivato.`);
+  };
+
+  const openDeleteInstrumentModal = (ticker: string, name?: string) => {
+    setDeleteInstrumentModal({ open: true, ticker, name });
+    setDeleteInstrumentWithPrices(false);
+    setDeleteInstrumentConfirmed(false);
+    setDeleteInstrumentError('');
+  };
+
+  const closeDeleteInstrumentModal = () => {
+    setDeleteInstrumentModal({ open: false });
+    setDeleteInstrumentWithPrices(false);
+    setDeleteInstrumentConfirmed(false);
+    setDeleteInstrumentError('');
+  };
+
+  const handleConfirmDeleteInstrument = async () => {
+    const ticker = deleteInstrumentModal.ticker;
+    if (!ticker || deleteInstrumentLoading) return;
+    setDeleteInstrumentLoading(true);
+    setDeleteInstrumentError('');
+    try {
+      const result = await deleteInstrumentGloballySafely({
+        ticker,
+        deletePrices: deleteInstrumentWithPrices
+      });
+      if (!result.ok) {
+        setDeleteInstrumentError(result.reason === 'has_transactions'
+          ? 'Non eliminabile: strumento usato in transazioni.'
+          : 'Errore durante eliminazione.');
+        return;
+      }
+      await removeTickerConfigEntry(ticker);
+      await removeTickerConfigEverywhere(ticker);
+      removeHiddenTickerEverywhere(ticker);
+      const refreshed = await db.instruments.where('portfolioId').equals(currentPortfolioId).toArray();
+      setInstruments(refreshed as Instrument[]);
+      if (refreshed.length > 0) setSelectedInstrumentId(String(refreshed[0].id));
+      if (refreshed.length === 0) setSelectedInstrumentId(undefined);
+      await loadCoverage();
+      flashSaveNotice(`Strumento ${ticker} eliminato definitivamente.`);
+      closeDeleteInstrumentModal();
+    } finally {
+      setDeleteInstrumentLoading(false);
     }
   };
 
@@ -797,7 +1006,7 @@ export const Settings: React.FC = () => {
   };
 
   const handleReset = async () => {
-    if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione ï¿½ irreversibile. Vuoi procedere?')) {
+    if (confirm('ATTENZIONE: Stai per cancellare tutti i dati (Transazioni, Strumenti, Prezzi). L\'azione è irreversibile. Vuoi procedere?')) {
       await (db as any).delete();
       window.location.reload();
     }
@@ -829,72 +1038,47 @@ export const Settings: React.FC = () => {
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setImportRunning(true);
+    setImportReport(null);
+    setImportWarnings([]);
+    setImportErrors([]);
+    setImportStatus('Import in corso...');
     try {
       const text = await file.text();
       const json = JSON.parse(text);
       if (!json || typeof json !== 'object') throw new Error('Formato JSON non valido');
 
-      if (!confirm('Importare il backup sovrascriverï¿½ i dati attuali. Procedere?')) return;
+      if (!confirm("L'import aggiunge/aggiorna dati esistenti (merge). Continuare?")) {
+        setImportStatus('Import annullato.');
+        return;
+      }
 
-      const rawInstruments = Array.isArray(json.instruments) ? json.instruments : [];
-      const importedInstruments: Instrument[] = rawInstruments.map((inst: any) => {
-        const symbol = String(inst.symbol || inst.ticker || '').trim();
-        const ticker = String(inst.ticker || symbol || '').trim();
-        return {
-          ...inst,
-          id: typeof inst.id === 'string' && inst.id ? inst.id : createUuid(),
-          symbol,
-          ticker
-        } as Instrument;
-      });
-      const instrumentByKey = new Map<string, Instrument>();
-      importedInstruments.forEach(inst => {
-        if (inst.symbol) instrumentByKey.set(inst.symbol, inst);
-        if (inst.ticker) instrumentByKey.set(inst.ticker, inst);
-      });
+      const formatInfo = detectFormat(json);
+      const { normalized, report, warnings, errors } = validateAndNormalize(json);
+      const result = await importToDb(normalized, { defaultPortfolioId: currentPortfolioId }, report);
 
-      const txs = (json.transactions || []).map((t: any) => {
-        const instrumentId = t.instrumentId ? String(t.instrumentId)
-          : (t.instrumentTicker ? instrumentByKey.get(t.instrumentTicker)?.id : undefined);
-        const instrument = instrumentId
-          ? importedInstruments.find(inst => inst.id === instrumentId)
-          : undefined;
-        const instrumentTicker = instrument?.symbol || instrument?.ticker || t.instrumentTicker;
-        return {
-          ...t,
-          date: t.date ? new Date(t.date) : new Date(),
-          instrumentId,
-          instrumentTicker
-        };
-      });
-      const importedPrices = (json.prices || []).map((p: any) => {
-        const instrumentId = p.instrumentId ? String(p.instrumentId)
-          : (p.ticker ? instrumentByKey.get(p.ticker)?.id : undefined);
-        return { ...p, instrumentId };
-      });
+      const allWarnings = [...formatInfo.warnings, ...warnings, ...result.warnings];
+      const allErrors = [...errors, ...result.errors];
+      setImportReport(result.report);
+      setImportWarnings(allWarnings);
+      setImportErrors(allErrors);
 
-      await db.transaction('rw', [db.portfolios, db.settings, db.instruments, db.transactions, db.prices, db.macro], async () => {
-        await db.portfolios.clear();
-        await db.settings.clear();
-        await db.instruments.clear();
-        await db.transactions.clear();
-        await db.prices.clear();
-        await db.macro.clear();
-
-        if (json.portfolios) await db.portfolios.bulkAdd(json.portfolios);
-        if (json.settings) await db.settings.bulkAdd(json.settings);
-        if (importedInstruments.length) await db.instruments.bulkAdd(importedInstruments);
-        if (txs) await db.transactions.bulkAdd(txs);
-        if (importedPrices.length) await db.prices.bulkAdd(importedPrices);
-        if (json.macro) await db.macro.bulkAdd(json.macro);
-      });
-
-      alert('Import completato. Ricarico la pagina.');
-      window.location.reload();
+      const discarded = Object.values(result.report.tables).some(t => t.discarded > 0);
+      const hasErrors = allErrors.length > 0;
+      if (hasErrors) {
+        setImportStatus('Import completato con errori.');
+      } else if (discarded) {
+        setImportStatus('Import parziale: alcuni record scartati.');
+      } else {
+        setImportStatus('Import completato.');
+      }
     } catch (err: any) {
       console.error('Import error', err);
-      alert(`Errore import: ${err.message || err}`);
+      setImportErrors([err?.message || String(err)]);
+      setImportStatus('Errore import: vedi dettagli.');
+      alert('Errore import: ' + (err?.message || err));
     } finally {
+      setImportRunning(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
@@ -1109,7 +1293,7 @@ export const Settings: React.FC = () => {
     if (!selectedInstrumentId) return;
     const sum = Object.values(regionAllocation || {}).reduce((s, v) => s + (v || 0), 0);
     if (sum < 99.5 || sum > 100.5) {
-      if (!confirm('La somma delle percentuali non ï¿½ 100%. Procedere lo stesso?')) return;
+      if (!confirm('La somma delle percentuali non ? 100%. Procedere lo stesso?')) return;
     }
     const regionTarget = getInstrumentByIdString(selectedInstrumentId);
     if (!regionTarget?.ticker) return;
@@ -1228,7 +1412,7 @@ export const Settings: React.FC = () => {
     ? new Date(autoSyncMeta.lastRun).toLocaleString('it-IT')
     : 'N/D';
   const gapFillLabel = autoSyncMeta?.gapsUpdated !== undefined
-    ? `${autoSyncMeta.gapsUpdated} upd${autoSyncMeta.gapsSkipped ? ` · skip ${autoSyncMeta.gapsSkipped}` : ''}${autoSyncMeta.stoppedByBudget ? ' · budget' : ''}${autoSyncMeta.gapError ? ' · err' : ''}`
+    ? `${autoSyncMeta.gapsUpdated} upd${autoSyncMeta.gapsSkipped ? ` ? skip ${autoSyncMeta.gapsSkipped}` : ''}${autoSyncMeta.stoppedByBudget ? ' ? budget' : ''}${autoSyncMeta.gapError ? ' ? err' : ''}`
     : 'N/D';
 
   const excludedTickers = useMemo(() => {
@@ -1239,8 +1423,26 @@ export const Settings: React.FC = () => {
     return set;
   }, [config.priceTickerConfig]);
 
+  const explicitlyExcludedTickers = useMemo(() => {
+    const set = new Set<string>();
+    Object.entries(config.priceTickerConfig || {}).forEach(([ticker, cfg]) => {
+      if (cfg?.exclude) set.add(ticker);
+    });
+    return set;
+  }, [config.priceTickerConfig]);
+
+  const hiddenTickersSet = useMemo(() => new Set(hiddenTickers), [hiddenTickers]);
+
+  const visibleCoverageRows = useMemo(() => {
+    return coverage.perTicker.filter(row => {
+      if (!showExcludedTickers && explicitlyExcludedTickers.has(row.ticker)) return false;
+      if (!showHiddenTickers && hiddenTickersSet.has(row.ticker)) return false;
+      return true;
+    });
+  }, [coverage.perTicker, explicitlyExcludedTickers, showExcludedTickers, hiddenTickersSet, showHiddenTickers]);
+
   const coverageSummary = useMemo(() => {
-    const rows = coverage.perTicker.filter(row => !excludedTickers.has(row.ticker));
+    const rows = coverage.perTicker.filter(row => !excludedTickers.has(row.ticker) && !hiddenTickersSet.has(row.ticker));
     const okCount = rows.filter(row => row.status === 'OK').length;
     let earliest: string | undefined;
     let latest: string | undefined;
@@ -1255,7 +1457,7 @@ export const Settings: React.FC = () => {
       earliest,
       latest
     };
-  }, [coverage.perTicker, excludedTickers]);
+  }, [coverage.perTicker, excludedTickers, hiddenTickersSet]);
 
   const sourcesStatus = useMemo(() => {
     const sheetsConfigured = Boolean(config.googleSheetUrl?.trim());
@@ -1330,7 +1532,7 @@ export const Settings: React.FC = () => {
     const usage = listingUsage.get(row.symbol);
     const hasRefs = Boolean(usage?.count);
     const confirmMessage = hasRefs
-      ? `Il listing ${row.symbol} ï¿½ ancora usato da ${usage?.count} strumento/i. Verrï¿½ rimosso dai riferimenti. Continuare?`
+      ? `Il listing ${row.symbol} ? ancora usato da ${usage?.count} strumento/i. Verr? rimosso dai riferimenti. Continuare?`
       : `Eliminare il listing ${row.symbol}?`;
     if (!confirm(confirmMessage)) return;
     await db.transaction('rw', [db.instrumentListings, db.instruments], async () => {
@@ -1372,38 +1574,38 @@ export const Settings: React.FC = () => {
   return (
     <div className="space-y-8 max-w-6xl animate-fade-in text-textPrimary">
       {isConfigModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
-          <div className="bg-backgroundElevated rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden max-h-[90vh] overflow-y-auto border border-borderSoft">
-            <div className="p-6 border-b border-borderSoft flex justify-between items-center sticky top-0 bg-backgroundElevated z-10">
-              <h3 className="text-lg font-bold text-textPrimary">Impostazioni base</h3>
-              <button onClick={() => setConfigModalOpen(false)} className="text-gray-400 hover:text-slate-900 transition-colors">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-md animate-fade-in">
+          <div className="ui-panel-dense w-full max-w-2xl overflow-hidden max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200/70 flex justify-between items-center sticky top-0 bg-white/90 z-10">
+              <h3 className="text-lg font-bold text-slate-900">Impostazioni base</h3>
+              <button onClick={() => setConfigModalOpen(false)} className="text-slate-400 hover:text-slate-700 transition-colors">
                 <span className="material-symbols-outlined">close</span>
               </button>
             </div>
             <form onSubmit={handleSaveConfig} className="p-6 space-y-5">
               <div>
-                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">EODHD API Key</label>
+                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">EODHD API Key</label>
                 <input
                   type="password"
-                  className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
+                  className="ui-input w-full"
                   value={config.eodhdApiKey}
                   onChange={e => setConfig({ ...config, eodhdApiKey: e.target.value })}
                 />
               </div>
               <div>
-                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Price Sheet URL</label>
+                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Price Sheet URL</label>
                 <input
-                  className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl text-sm text-slate-900 focus:ring-2 focus:ring-primary focus:outline-none transition-all"
+                  className="ui-input w-full text-sm"
                   value={config.googleSheetUrl}
                   onChange={e => setConfig({ ...config, googleSheetUrl: e.target.value })}
                 />
-                <p className="text-xs text-gray-500 mt-1">Endpoint pubblico JSON o Google Viz API.</p>
+                <p className="text-xs text-slate-400 mt-1">Endpoint pubblico JSON o Google Viz API.</p>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Valuta base</label>
+                  <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Valuta base</label>
                   <select
-                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
+                    className="ui-input w-full"
                     value={config.baseCurrency}
                     onChange={e => setConfig({ ...config, baseCurrency: e.target.value as Currency })}
                   >
@@ -1413,9 +1615,9 @@ export const Settings: React.FC = () => {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Ordine exchange</label>
+                  <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Ordine exchange</label>
                   <input
-                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl text-sm text-slate-900 focus:ring-2 focus:ring-primary focus:outline-none transition-all"
+                    className="ui-input w-full text-sm"
                     value={(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(',')}
                     onChange={e => setConfig({ ...config, preferredExchangesOrder: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
                   />
@@ -1423,17 +1625,17 @@ export const Settings: React.FC = () => {
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Backfill da data</label>
+                  <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Backfill da data</label>
                   <input
                     type="date"
-                    className="w-full border border-borderSoft bg-slate-50 p-3 rounded-xl focus:ring-2 focus:ring-primary focus:outline-none transition-all text-slate-900"
+                    className="ui-input w-full"
                     value={config.minHistoryDate || '2020-01-01'}
                     onChange={e => setConfig({ ...config, minHistoryDate: e.target.value })}
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Ambito backfill</label>
-                  <div className="flex flex-col gap-2 text-sm text-slate-700">
+                  <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Ambito backfill</label>
+                  <div className="flex flex-col gap-2 text-sm text-slate-600">
                     <label className="flex items-center gap-2">
                       <input
                         type="radio"
@@ -1459,13 +1661,13 @@ export const Settings: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => setConfigModalOpen(false)}
-                  className="flex-1 border border-borderSoft text-slate-700 py-3 rounded-xl font-bold hover:bg-slate-50 transition"
+                  className="flex-1 ui-btn-secondary py-3 rounded-xl font-bold transition"
                 >
                   Annulla
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 bg-primary text-slate-900 py-3 rounded-xl font-bold hover:bg-blue-600 transition"
+                  className="flex-1 ui-btn-primary py-3 rounded-xl font-bold transition"
                 >
                   Salva
                 </button>
@@ -1474,7 +1676,7 @@ export const Settings: React.FC = () => {
           </div>
         </div>
       )}
-      <div className="bg-white p-6 rounded-2xl shadow-lg border border-borderSoft">
+      <div className="ui-panel p-6">
         <h2 className="text-lg font-bold mb-4 flex items-center gap-2 text-slate-900">
           <span className="material-symbols-outlined text-primary">layers</span>
           Portafogli
@@ -1483,7 +1685,7 @@ export const Settings: React.FC = () => {
           <div className="flex items-center gap-2">
             <span className="text-sm text-slate-600">Seleziona:</span>
             <select
-              className="border border-borderSoft rounded-lg px-3 py-2 text-sm text-slate-800 bg-white shadow-inner"
+              className="ui-input rounded-lg px-3 py-2 text-sm"
               value={currentPortfolioId}
               onChange={e => handleSwitchPortfolio(e.target.value)}
             >
@@ -1494,14 +1696,14 @@ export const Settings: React.FC = () => {
           </div>
           <div className="flex items-center gap-2">
             <input
-              className="border border-borderSoft rounded-lg px-3 py-2 text-sm text-slate-800 bg-white"
+              className="ui-input rounded-lg px-3 py-2 text-sm"
               placeholder="Nuovo portafoglio"
               value={newPortfolioName}
               onChange={e => setNewPortfolioName(e.target.value)}
             />
             <button
               onClick={handleCreatePortfolio}
-              className="bg-[#0052a3] text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-blue-600 transition shadow-sm"
+              className="ui-btn-primary px-4 py-2 rounded-lg text-sm font-bold transition shadow-sm"
             >
               Crea
             </button>
@@ -1509,31 +1711,98 @@ export const Settings: React.FC = () => {
         </div>
       </div>
 
-      {import.meta.env.DEV && (
-        <div className="bg-amber-50 p-4 rounded-2xl border border-amber-200 shadow-sm">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-xs font-bold uppercase text-amber-700">Dev Tools</div>
-              <div className="text-sm text-amber-800">Diagnostica dati e controlli qualita.</div>
-            </div>
-            <a
-              href="#/data"
-              className="px-3 py-2 rounded-lg text-xs font-bold bg-amber-600 text-white hover:bg-amber-700 transition"
-            >
-              Apri Data Inspector
-            </a>
-          </div>
-        </div>
-      )}
-
-      <div className="bg-white p-8 rounded-2xl shadow-lg border border-borderSoft">
-        <h2 className="text-xl font-bold mb-6 flex items-center gap-2 text-slate-900">
-          <span className="material-symbols-outlined text-primary">database</span>
-          Fonti Dati
+      <div className="ui-panel p-6">
+        <h2 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-900">
+          <span className="material-symbols-outlined text-primary">bolt</span>
+          Azioni rapide
         </h2>
-        <div className="space-y-6">
-                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 text-sm text-slate-700">
+        <div className="text-xs text-slate-600">Le azioni piu usate per aggiornare dati e diagnosticare problemi.</div>
+        <div className="flex flex-wrap gap-3 mt-3">
+          <button
+            onClick={handleSync}
+            disabled={loading}
+            className="ui-btn-primary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+          >
+            {loading ? (
+              <>
+                <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
+                Aggiornamento...
+              </>
+            ) : (
+              <>
+                <span className="material-symbols-outlined text-sm">sync</span>
+                Aggiorna prezzi
+              </>
+            )}
+          </button>
+          <button
+            onClick={handleBackfill}
+            disabled={bfLoading}
+            className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+          >
+            {bfLoading ? (
+              <>
+                <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
+                Scaricamento...
+              </>
+            ) : (
+              <>
+                <span className="material-symbols-outlined text-sm">download</span>
+                Scarica storico prezzi
+              </>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={handleAutoGapNow}
+            disabled={autoGapRunning || !config.eodhdApiKey?.trim()}
+            className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+          >
+            <span className="material-symbols-outlined text-sm">timeline</span>
+            {autoGapRunning ? 'Gap-fill in corso...' : 'Esegui gap-fill ora'}
+          </button>
+          <a
+            href="#/data?tab=checks"
+            className="ui-btn-ghost px-4 py-2 rounded-lg text-xs font-bold transition border border-slate-200/70"
+          >
+            Apri Data Inspector
+          </a>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        {SETTINGS_SECTIONS.map(section => {
+          const isActive = activeSection === section.key;
+          return (
+            <button
+              key={section.key}
+              type="button"
+              onClick={() => setActiveSection(section.key)}
+              aria-current={isActive ? 'page' : undefined}
+              className={clsx(
+                'px-4 py-2 rounded-full text-xs font-bold border transition',
+                isActive
+                  ? 'bg-[#0052a3] text-white border-[#0052a3] shadow-sm'
+                  : 'bg-white/80 text-slate-700 border-slate-200/70 hover:bg-slate-50'
+              )}
+            >
+              {section.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {activeSection !== 'advanced' && (
+        <div className="ui-panel p-8">
+          <h2 className="text-xl font-bold mb-6 flex items-center gap-2 text-slate-900">
+            <span className="material-symbols-outlined text-primary">database</span>
+            {SETTINGS_SECTIONS.find(section => section.key === activeSection)?.label || 'Impostazioni'}
+          </h2>
+          <div className="space-y-6">
+            {activeSection === 'connections' && (
+              <>
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            <div className="ui-panel-dense p-4 text-sm text-slate-700">
               <div className="flex items-start justify-between gap-3">
                 <div>
                     <div className="text-sm font-bold text-slate-900">Impostazioni base</div>
@@ -1588,7 +1857,7 @@ export const Settings: React.FC = () => {
                     )}
                     {!quotaInfo && quotaDiag && (
                       <div className="text-xs text-slate-600 mt-1">
-                        HTTP {quotaDiag.httpStatus} · {quotaDiag.contentType || 'n/a'}
+                        HTTP {quotaDiag.httpStatus} ? {quotaDiag.contentType || 'n/a'}
                       </div>
                     )}
                     {quotaError && (
@@ -1625,7 +1894,7 @@ export const Settings: React.FC = () => {
               </div>
             </div>
 
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 text-sm text-slate-700">
+            <div className="ui-panel-dense p-4 text-sm text-slate-700">
               <div className="flex items-center justify-between gap-3 flex-wrap">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-bold uppercase text-slate-500">Proxy &amp; API</span>
@@ -1674,7 +1943,7 @@ export const Settings: React.FC = () => {
                 )}
                 {(!proxyHealth?.tested) && !proxyHealthLoading && (
                   <div className="text-slate-500">
-                    Stato non testato: premi “Test connessione” per verificare.
+                    Stato non testato: premi "Test connessione" per verificare.
                   </div>
                 )}
                 {proxyHealth?.tested && !proxyHealth.ok && (
@@ -1688,7 +1957,7 @@ export const Settings: React.FC = () => {
                       <a href="#/data?tab=checks" className="text-[#0052a3] font-bold hover:underline">
                         Apri Data Inspector
                       </a>
-                      <span className="mx-2 text-slate-400">·</span>
+                      <span className="mx-2 text-slate-400">?</span>
                       <span className="text-slate-500">Documentazione locale: usa `dev:vercel`</span>
                     </div>
                   </div>
@@ -1701,8 +1970,8 @@ export const Settings: React.FC = () => {
                 )}
               </div>
             </div>
-
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
+            </div>
+            <div className="ui-panel-dense p-4 space-y-3 text-sm text-slate-700">
               <div className="flex items-center justify-between gap-3 flex-wrap">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-bold uppercase text-slate-500">Apps Script</span>
@@ -1717,20 +1986,20 @@ export const Settings: React.FC = () => {
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Apps Script URL (exec)</label>
+                  <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Apps Script URL (exec)</label>
                   <input
                     type="text"
-                    className="w-full border border-borderSoft bg-white p-2 rounded-lg text-sm text-slate-800"
+                    className="ui-input w-full text-sm"
                     placeholder="https://script.google.com/macros/s/.../exec"
                     value={config.appsScriptUrl || ''}
                     onChange={e => setConfig({ ...config, appsScriptUrl: e.target.value })}
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">Apps Script API key</label>
+                  <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Apps Script API key</label>
                   <input
                     type="password"
-                    className="w-full border border-borderSoft bg-white p-2 rounded-lg text-sm text-slate-800"
+                    className="ui-input w-full text-sm"
                     placeholder="API key"
                     value={config.appsScriptApiKey || ''}
                     onChange={e => setConfig({ ...config, appsScriptApiKey: e.target.value })}
@@ -1774,46 +2043,46 @@ export const Settings: React.FC = () => {
               {appsScriptTests.assets && (
                 <div className="text-[11px] text-slate-600">
                   Asset Map: {appsScriptTests.assets.status.toUpperCase()}
-                  {appsScriptTests.assets.count !== undefined ? ` · count=${appsScriptTests.assets.count}` : ''}
-                  {appsScriptTests.assets.sample ? ` · ${appsScriptTests.assets.sample}` : ''}
+                  {appsScriptTests.assets.count !== undefined ? ` ? count=${appsScriptTests.assets.count}` : ''}
+                  {appsScriptTests.assets.sample ? ` ? ${appsScriptTests.assets.sample}` : ''}
                 </div>
               )}
               {appsScriptTests.macro && (
                 <div className="text-[11px] text-slate-600">
                   Macro: {appsScriptTests.macro.status.toUpperCase()}
-                  {appsScriptTests.macro.count !== undefined ? ` · count=${appsScriptTests.macro.count}` : ''}
-                  {appsScriptTests.macro.sample ? ` · ${appsScriptTests.macro.sample}` : ''}
+                  {appsScriptTests.macro.count !== undefined ? ` ? count=${appsScriptTests.macro.count}` : ''}
+                  {appsScriptTests.macro.sample ? ` ? ${appsScriptTests.macro.sample}` : ''}
                 </div>
               )}
               {appsScriptTests.fx && (
                 <div className="text-[11px] text-slate-600">
                   FX: {appsScriptTests.fx.status.toUpperCase()}
-                  {appsScriptTests.fx.count !== undefined ? ` · count=${appsScriptTests.fx.count}` : ''}
-                  {appsScriptTests.fx.sample ? ` · ${appsScriptTests.fx.sample}` : ''}
+                  {appsScriptTests.fx.count !== undefined ? ` ? count=${appsScriptTests.fx.count}` : ''}
+                  {appsScriptTests.fx.sample ? ` ? ${appsScriptTests.fx.sample}` : ''}
                 </div>
               )}
               {appsScriptTests.ping && (
                 <div className="text-[11px] text-slate-600">
                   Ping: {appsScriptTests.ping.status.toUpperCase()}
-                  {appsScriptTests.ping.message ? ` · ${appsScriptTests.ping.message}` : ''}
+                  {appsScriptTests.ping.message ? ` ? ${appsScriptTests.ping.message}` : ''}
                 </div>
               )}
               {appsScriptTests.assets?.diag && appsScriptTests.assets.status === 'err' && (
                 <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
-                  HTTP {appsScriptTests.assets.diag.httpStatus} · {appsScriptTests.assets.diag.contentType || 'n/a'}
-                  {appsScriptTests.assets.diag.rawPreview ? ` · ${appsScriptTests.assets.diag.rawPreview}` : ''}
+                  HTTP {appsScriptTests.assets.diag.httpStatus} - {appsScriptTests.assets.diag.contentType || 'n/a'}
+                  {appsScriptTests.assets.diag.rawPreview ? ` ? ${appsScriptTests.assets.diag.rawPreview}` : ''}
                 </div>
               )}
               {appsScriptTests.macro?.diag && appsScriptTests.macro.status === 'err' && (
                 <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
-                  HTTP {appsScriptTests.macro.diag.httpStatus} · {appsScriptTests.macro.diag.contentType || 'n/a'}
-                  {appsScriptTests.macro.diag.rawPreview ? ` · ${appsScriptTests.macro.diag.rawPreview}` : ''}
+                  HTTP {appsScriptTests.macro.diag.httpStatus} - {appsScriptTests.macro.diag.contentType || 'n/a'}
+                  {appsScriptTests.macro.diag.rawPreview ? ` ? ${appsScriptTests.macro.diag.rawPreview}` : ''}
                 </div>
               )}
               {appsScriptTests.fx?.diag && appsScriptTests.fx.status === 'err' && (
                 <div className="text-[10px] text-amber-700 whitespace-pre-wrap">
-                  HTTP {appsScriptTests.fx.diag.httpStatus} · {appsScriptTests.fx.diag.contentType || 'n/a'}
-                  {appsScriptTests.fx.diag.rawPreview ? ` · ${appsScriptTests.fx.diag.rawPreview}` : ''}
+                  HTTP {appsScriptTests.fx.diag.httpStatus} - {appsScriptTests.fx.diag.contentType || 'n/a'}
+                  {appsScriptTests.fx.diag.rawPreview ? ` ? ${appsScriptTests.fx.diag.rawPreview}` : ''}
                 </div>
               )}
               {appsScriptTests.fx && appsScriptTests.fx.status === 'err' && (
@@ -1827,13 +2096,17 @@ export const Settings: React.FC = () => {
               )}
             </div>
 
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
+              </>
+            )}
+
+            {activeSection === 'prices' && (
+            <div className="ui-panel-dense p-4 space-y-3 text-sm text-slate-700">
               <div className="text-sm font-bold text-slate-900">Prezzi &amp; Backfill</div>
               <div className="text-xs text-slate-600">
                 Copertura: {coverageSummary.okCount}/{coverageSummary.total} tickers - {coverageSummary.earliest || coverage.earliestCoveredDate || 'N/D'} - {coverageSummary.latest || coverage.latestCoveredDate || 'N/D'}
               </div>
               <div className="text-xs text-slate-600 space-y-1">
-                <div><span className="font-semibold text-slate-700">Aggiorna prezzi:</span> aggiorna i valori di oggi (Sheets/EODHD) e rinfresca l’app.</div>
+                <div><span className="font-semibold text-slate-700">Aggiorna prezzi:</span> aggiorna i valori di oggi (Sheets/EODHD) e rinfresca l'app.</div>
                 <div><span className="font-semibold text-slate-700">Scarica storico:</span> usa quando mancano periodi o hai appena importato nuovi strumenti.</div>
               </div>
               <div className="flex flex-wrap gap-3">
@@ -1938,7 +2211,7 @@ export const Settings: React.FC = () => {
                   {syncSummary.failedTickers.length > 0 && (
                     <div className="text-amber-700">
                       Errori: {syncSummary.failedTickers.slice(0, 5).map(f => f.ticker).join(', ')}
-                      {syncSummary.failedTickers.length > 5 ? 'ï¿½' : ''}
+                      {syncSummary.failedTickers.length > 5 ? '...' : ''}
                     </div>
                   )}
                     {syncSummary.sheet.enabled ? null : (
@@ -1970,7 +2243,7 @@ export const Settings: React.FC = () => {
                       checked={autoGapEnabled}
                       onChange={e => handleToggleAutoGap(e.target.checked)}
                     />
-                    Auto riempi buchi all’avvio
+                    Auto riempi buchi all'avvio
                   </label>
                   <div className="flex items-center gap-2">
                     <span className="text-slate-500">Scope:</span>
@@ -1993,15 +2266,17 @@ export const Settings: React.FC = () => {
                   </button>
                 </div>
                 <div className="text-[11px] text-slate-500">
-                  Ultimo auto-sync: {autoSyncLabel} · Gap-fill: {gapFillLabel} · Budget oggi usato: {budgetStatus.used}
+                  Ultimo auto-sync: {autoSyncLabel} ? Gap-fill: {gapFillLabel} ? Budget oggi usato: {budgetStatus.used}
                 </div>
                 {autoGapStatus && (
                   <div className="text-[11px] text-slate-600">{autoGapStatus}</div>
                 )}
               </div>
             </div>
+            )}
 
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 text-sm text-slate-700">
+            {activeSection === 'backup' && (
+            <div className="ui-panel-dense p-4 space-y-3 text-sm text-slate-700">
               <div className="text-sm font-bold text-slate-900">Backup &amp; Import</div>
               <div className="flex flex-wrap gap-3">
                 <button
@@ -2012,9 +2287,10 @@ export const Settings: React.FC = () => {
                 </button>
                 <button
                   onClick={handleImportClick}
-                  className="bg-white text-slate-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-slate-50 transition border border-borderSoft"
+                  disabled={importRunning}
+                  className="bg-white text-slate-700 px-4 py-2 rounded-lg text-xs font-bold hover:bg-slate-50 transition border border-borderSoft disabled:opacity-60"
                 >
-                  Importa Backup
+                  {importRunning ? 'Import in corso...' : 'Importa Backup'}
                 </button>
                 <input
                   type="file"
@@ -2024,10 +2300,66 @@ export const Settings: React.FC = () => {
                   className="hidden"
                 />
               </div>
+              {importStatus && (
+                <div className="text-xs text-slate-600">{importStatus}</div>
+              )}
+              {(importWarnings.length > 0 || importErrors.length > 0 || importReport) && (
+                <details className="text-xs text-slate-600">
+                  <summary className="cursor-pointer font-bold text-slate-700">Dettagli import</summary>
+                  {importWarnings.length > 0 && (
+                    <div className="mt-2 text-amber-700">
+                      <div className="font-semibold">Avvisi</div>
+                      <ul className="list-disc list-inside">
+                        {importWarnings.map((w, idx) => (
+                          <li key={`w-${idx}`}>{w}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {importErrors.length > 0 && (
+                    <div className="mt-2 text-red-700">
+                      <div className="font-semibold">Errori</div>
+                      <ul className="list-disc list-inside">
+                        {importErrors.map((w, idx) => (
+                          <li key={`e-${idx}`}>{w}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {importReport && (
+                    <div className="mt-2 space-y-2">
+                      {Object.entries(importReport.tables).map(([table, info]) => (
+                        <div key={table} className="ui-panel-dense p-2">
+                          <div className="font-semibold text-slate-700">
+                            {importTableLabels[table as ImportTableName] || table}
+                          </div>
+                          <div className="text-[11px] text-slate-600">
+                            Totali: {info.total} ? Importati: {info.imported} ? Scartati: {info.discarded}
+                          </div>
+                          {info.error && (
+                            <div className="text-[11px] text-red-700">Errore tabella: {info.error}</div>
+                          )}
+                          {info.reasons?.length > 0 && (
+                            <div className="text-[11px] text-slate-600 mt-1">
+                              {info.reasons.map(reason => (
+                                <div key={reason.code}>
+                                  {reason.code}: {reason.count}{reason.examples.length ? ' (es. ' + reason.examples.join(', ') + ')' : ''}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </details>
+              )}
             </div>
-          </div>
+            )}
 
-          <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3 relative">
+            {activeSection === 'coverage' && (
+              <>
+                <div className="ui-panel-dense p-4 space-y-3 relative">
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-sm font-bold text-slate-900">Copertura prezzi (portafoglio attivo)</div>
@@ -2039,6 +2371,22 @@ export const Settings: React.FC = () => {
                 {coverageSummary.okCount < (coverageSummary.total || 1) && (
                   <span className="text-xs font-bold text-amber-600 bg-amber-100 px-2 py-1 rounded-lg">Dati incompleti</span>
                 )}
+                <label className="inline-flex items-center gap-2 text-xs text-slate-600">
+                  <input
+                    type="checkbox"
+                    checked={showExcludedTickers}
+                    onChange={() => setShowExcludedTickers(prev => !prev)}
+                  />
+                  Mostra esclusi{explicitlyExcludedTickers.size ? ` (${explicitlyExcludedTickers.size})` : ''}
+                </label>
+                <label className="inline-flex items-center gap-2 text-xs text-slate-600">
+                  <input
+                    type="checkbox"
+                    checked={showHiddenTickers}
+                    onChange={() => setShowHiddenTickers(prev => !prev)}
+                  />
+                  Mostra rimossi{hiddenTickers.length ? ` (${hiddenTickers.length})` : ''}
+                </label>
                 <InfoPopover
                   ariaLabel="Info Copertura prezzi"
                   title="Come leggere la copertura prezzi"
@@ -2047,9 +2395,10 @@ export const Settings: React.FC = () => {
                       <ul className="list-disc list-inside space-y-1">
                         <li>La tabella mostra per ogni strumento il range di date per cui abbiamo prezzi salvati nel database.</li>
                         <li>Se vedi PARZIALE/INCOMPLETO, i grafici (ritorni annuali, drawdown, CAGR) possono risultare incompleti o N/D.</li>
-                        <li>Per estendere lo storico: usa ï¿½Scarica storico prezziï¿½ oppure importa un CSV prezzi dal tuo provider.</li>
-                        <li>Lo strumento mostrato (ticker) ï¿½ il listing usato per i prezzi; se ï¿½ sbagliato, correggilo in ï¿½Listings & FXï¿½.</li>
+                        <li>Per estendere lo storico: usa "Scarica storico prezzi" oppure importa un CSV prezzi dal tuo provider.</li>
+                        <li>Lo strumento mostrato (ticker) è il listing usato per i prezzi; se è sbagliato, correggilo in "Listings & FX".</li>
                         <li>Consiglio: per SIX/CHF usa un listing .SW e importa prezzi in CHF (SIX-first).</li>
+                        <li><strong>Escludi</strong> blocca il sync/backfill a livello globale. <strong>Rimuovi dal portafoglio</strong> nasconde solo per questo portafoglio.</li>
                       </ul>
                       <div className="flex flex-wrap gap-2 pt-1 text-xs">
                         <button
@@ -2073,7 +2422,7 @@ export const Settings: React.FC = () => {
               </div>
             </div>
             {coverageExpanded ? (
-              <div className="overflow-auto max-h-56 border border-borderSoft rounded-lg bg-white">
+              <div className="ui-panel-dense overflow-auto max-h-56">
                 <table className="w-full text-sm">
                   <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
                     <tr>
@@ -2086,39 +2435,63 @@ export const Settings: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody>
-                    {coverage.perTicker.map((row, index) => {
+                    {visibleCoverageRows.map((row, index) => {
                                             const instrument = resolveInstrumentForRow(row);
                       const rowConfig = getRowConfig(row.ticker);
                       const rawConfig = config.priceTickerConfig?.[row.ticker] || {};
                       const provider = rowConfig.provider as PriceProviderType;
                       const isNeedsMapping = Boolean(rowConfig.needsMapping);
-                      const isExcluded = !isNeedsMapping && (rowConfig.excluded || provider === 'MANUAL');
+                      const isExplicitlyExcluded = Boolean(rawConfig.exclude);
+                      const isManual = provider === 'MANUAL';
+                      const isHidden = hiddenTickersSet.has(row.ticker);
+                      const isExcluded = isExplicitlyExcluded || isManual;
                       const effectiveSymbol = provider === 'SHEETS'
                         ? rowConfig.sheetSymbol
                         : provider === 'EODHD'
                           ? resolveEodhdSymbol(rowConfig.eodhdSymbol, instrument?.type)
                           : '--';
-                      const statusLabel = isNeedsMapping ? 'MAPPING' : isExcluded ? (provider === 'MANUAL' ? 'MANUAL' : 'ESCLUSO') : row.status;
+                      const statusLabel = isNeedsMapping
+                        ? 'MAPPING'
+                        : isHidden
+                          ? 'RIMOSSO'
+                          : isExplicitlyExcluded
+                            ? 'ESCLUSO'
+                            : isManual
+                              ? 'MANUAL'
+                              : row.status;
                       const statusClass = isNeedsMapping
                         ? 'bg-red-100 text-red-700'
-                        : isExcluded
-                          ? 'bg-slate-100 text-slate-600'
-                          : row.status === 'OK'
-                            ? 'bg-green-100 text-green-700'
-                            : row.status === 'PARZIALE'
-                              ? 'bg-amber-100 text-amber-700'
-                              : 'bg-red-100 text-red-700';
+                        : isHidden
+                          ? 'bg-amber-100 text-amber-700'
+                          : isExplicitlyExcluded
+                            ? 'bg-slate-100 text-slate-600'
+                            : isManual
+                              ? 'bg-slate-100 text-slate-600'
+                              : row.status === 'OK'
+                              ? 'bg-green-100 text-green-700'
+                              : row.status === 'PARZIALE'
+                                ? 'bg-amber-100 text-amber-700'
+                                : 'bg-red-100 text-red-700';
                       const eodhdBadge = getEodhdBadge(eodhdTests[row.ticker]?.status);
                       const sheetBadge = getSheetBadge(sheetTests[row.ticker]);
                       const sheetReason = sheetTests[row.ticker]?.reason;
+                      const globalTxCount = globalTxCountByTicker.get(row.ticker) || 0;
+                      const canDelete = globalTxCount === 0;
+                      const netQty = netPositionByTicker.get(row.ticker) || 0;
+                      const isHeld = Math.abs(netQty) > 1e-8;
 
                       return (
                         <tr key={`${row.ticker}-${row.instrumentId ?? index}`} className="border-t border-borderSoft align-top">
                           <td className="px-3 py-2">
                             <div className="flex flex-col">
                               <span className="font-semibold text-slate-900">{row.ticker}</span>
+                              {isHeld && (
+                                <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full w-fit mt-1">
+                                  DETENUTO
+                                </span>
+                              )}
                               <span className="text-xs text-slate-600">
-                                ISIN: {row.isin || 'ï¿½'}{row.name ? ` - ${row.name}` : ''}
+                                ISIN: {row.isin || 'N/D'}{row.name ? ` - ${row.name}` : ''}
                               </span>
                               {!isExcluded && row.status !== 'OK' && (
                                 <button
@@ -2146,10 +2519,10 @@ export const Settings: React.FC = () => {
                               <label className="inline-flex items-center gap-2 text-[11px] text-slate-500">
                                 <input
                                   type="checkbox"
-                                  checked={Boolean(rawConfig.exclude)}
-                                  onChange={() => updateTickerConfig(row.ticker, { exclude: !rawConfig.exclude })}
+                                  checked={isExplicitlyExcluded}
+                                  onChange={() => handleToggleExclude(row.ticker, !isExplicitlyExcluded)}
                                 />
-                                Escludi dal sync/backfill
+                                {isExplicitlyExcluded ? 'Includi nel sync/backfill (globale)' : 'Escludi dal sync/backfill (globale)'}
                               </label>
                             </div>
                           </td>
@@ -2238,10 +2611,10 @@ export const Settings: React.FC = () => {
                               {eodhdTests[row.ticker] && (
                                 <div className="text-[10px] text-slate-500 mt-1">
                                   {eodhdTests[row.ticker]?.httpStatus ? `HTTP ${eodhdTests[row.ticker]?.httpStatus}` : ''}
-                                  {eodhdTests[row.ticker]?.contentType ? ` · ${eodhdTests[row.ticker]?.contentType}` : ''}
-                                  {eodhdTests[row.ticker]?.message ? ` · ${eodhdTests[row.ticker]?.message}` : ''}
-                                  {eodhdTests[row.ticker]?.sample ? ` · ${eodhdTests[row.ticker]?.sample}` : ''}
-                                  {eodhdTests[row.ticker]?.parseError ? ` · parseError: ${eodhdTests[row.ticker]?.parseError}` : ''}
+                                  {eodhdTests[row.ticker]?.contentType ? ` ? ${eodhdTests[row.ticker]?.contentType}` : ''}
+                                  {eodhdTests[row.ticker]?.message ? ` ? ${eodhdTests[row.ticker]?.message}` : ''}
+                                  {eodhdTests[row.ticker]?.sample ? ` ? ${eodhdTests[row.ticker]?.sample}` : ''}
+                                  {eodhdTests[row.ticker]?.parseError ? ` ? parseError: ${eodhdTests[row.ticker]?.parseError}` : ''}
                                 </div>
                               )}
                               {eodhdTests[row.ticker]?.rawPreview && eodhdTests[row.ticker]?.status !== 'OK' && (
@@ -2289,12 +2662,38 @@ export const Settings: React.FC = () => {
                               >
                                 Reset prezzi ticker
                               </button>
+                              <div className="flex items-center gap-2 flex-wrap pt-1">
+                                <button
+                                  type="button"
+                                  className={clsx(
+                                    'text-[10px] font-bold text-slate-700 underline',
+                                    (!isHidden && isHeld) && 'opacity-40 cursor-not-allowed'
+                                  )}
+                                  onClick={() => (isHidden ? handleRestoreToPortfolio(row.ticker) : handleRemoveFromPortfolio(row.ticker, isHeld))}
+                                  disabled={!isHidden && isHeld}
+                                  title={!isHidden && isHeld ? 'Non puoi rimuovere: strumento detenuto nel portafoglio (posizione ? 0)' : undefined}
+                                >
+                                  {isHidden ? 'Ripristina nel portafoglio' : 'Rimuovi dal portafoglio'}
+                                </button>
+                                <button
+                                  type="button"
+                                  className={clsx(
+                                    'text-[10px] font-bold text-red-600 hover:text-red-700',
+                                    !canDelete && 'opacity-40 cursor-not-allowed'
+                                  )}
+                                  disabled={!canDelete}
+                                  title={canDelete ? 'Elimina definitivamente (nessuna transazione in alcun portafoglio)' : 'Non eliminabile: usato in transazioni (altro portafoglio)'}
+                                  onClick={() => openDeleteInstrumentModal(row.ticker, instrument?.name)}
+                                >
+                                  Elimina definitivamente
+                                </button>
+                              </div>
                             </div>
                           </td>
                         </tr>
                       );
                     })}
-                    {coverage.perTicker.length === 0 && (
+                    {visibleCoverageRows.length === 0 && (
                       <tr>
                         <td className="px-3 py-2 text-slate-500 text-sm" colSpan={6}>Nessun ticker da mostrare.</td>
                       </tr>
@@ -2308,7 +2707,7 @@ export const Settings: React.FC = () => {
 
           </div>
 
-          <div ref={listingsSectionRef} className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-4 relative">
+          <div ref={listingsSectionRef} className="ui-panel-dense p-4 space-y-4 relative">
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div>
                 <div className="text-sm font-bold text-slate-900">Listings &amp; FX</div>
@@ -2328,7 +2727,7 @@ export const Settings: React.FC = () => {
                       isSixFirst
                         ? 'Stai usando il listing SIX in CHF. I prezzi devono essere importati/aggiornati in CHF. FX non necessario.'
                         : needsFx
-                          ? 'Il listing selezionato ï¿½ in valuta estera. Per mostrare valori in CHF servono tassi FX (USD?CHF, EUR?CHF, GBP?CHF).'
+                          ? 'Il listing selezionato ? in valuta estera. Per mostrare valori in CHF servono tassi FX (USD/CHF, EUR/CHF, GBP/CHF).'
                           : 'Listing OK'
                     }
                   >
@@ -2357,7 +2756,7 @@ export const Settings: React.FC = () => {
                       <li>Scegli il listing che userai per i prezzi e lo storico (es. SIX: .SW).</li>
                       <li>I prezzi importati devono avere la stessa valuta del listing selezionato (es. listing CHF -&gt; CSV CHF).</li>
                       <li>Se selezioni un listing estero (USD/EUR/GBP), per vedere tutto in CHF devi importare anche i tassi FX (USD-&gt;CHF, ecc.).</li>
-                      <li>Salva sempre il listing preferito prima di importare prezzi, cosï¿½ l'import finisce sul ticker corretto.</li>
+                      <li>Salva sempre il listing preferito prima di importare prezzi, cos? l'import finisce sul ticker corretto.</li>
                       <li>Se la search non trova SIX, aggiungi manualmente un listing SW (.SW) in CHF (SIX-first).</li>
                       </ul>
                       <div className="flex flex-wrap gap-2 pt-1 text-xs">
@@ -2376,7 +2775,7 @@ export const Settings: React.FC = () => {
                           Importa FX (CSV)
                         </button>
                         <details className="text-slate-600 text-xs">
-                          <summary className="cursor-pointer text-[#0052a3] font-bold">Cosï¿½ï¿½ SIX-first?</summary>
+                          <summary className="cursor-pointer text-[#0052a3] font-bold">Cos'? SIX-first?</summary>
                           <div className="mt-1">
                             Usa un listing SIX (.SW) in CHF per evitare conversioni FX sui prezzi. Importa prezzi direttamente in CHF per allineare reporting e base currency.
                           </div>
@@ -2426,7 +2825,7 @@ export const Settings: React.FC = () => {
               </div>
             </div>
 
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4 space-y-3">
+            <div className="ui-panel-dense p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <div className="text-sm font-bold text-slate-900">Distribuzione geografica (strumento)</div>
                 <InfoPopover
@@ -2435,7 +2834,7 @@ export const Settings: React.FC = () => {
                   renderContent={() => (
                     <div className="text-sm space-y-1">
                       <p>Inserisci le percentuali per area (somma ~100%).</p>
-                      <p>Se non definite, la Dashboard mostrerï¿½ ï¿½Non definitoï¿½.</p>
+                      <p>Se non definite, la Dashboard mostrer? "Non definito".</p>
                     </div>
                   )}
                 />
@@ -2501,7 +2900,7 @@ export const Settings: React.FC = () => {
                         />
                         <span className="text-sm font-bold text-slate-900">{l.symbol}</span>
                       </div>
-                      <span className="text-xs text-slate-600">{l.exchangeCode} ï¿½ {l.currency}</span>
+                      <span className="text-xs text-slate-600">{l.exchangeCode} - {l.currency}</span>
                       {l.name && <span className="text-xs text-slate-500">{l.name}</span>}
                     </label>
                   ))}
@@ -2581,14 +2980,14 @@ export const Settings: React.FC = () => {
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4">
+            <div className="ui-panel-dense p-4">
               <div className="flex items-center justify-between">
                 <div>
                   <div className="text-sm font-bold text-slate-900">Gestione Listings</div>
                   <div className="text-xs text-slate-600">Voci salvate: {listingRows.length}</div>
                 </div>
               </div>
-              <div className="mt-3 max-h-56 overflow-auto border border-borderSoft rounded-lg bg-white">
+              <div className="ui-panel-dense mt-3 max-h-56 overflow-auto">
                 <table className="w-full text-sm">
                   <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
                     <tr>
@@ -2636,14 +3035,14 @@ export const Settings: React.FC = () => {
               </div>
             </div>
 
-            <div className="bg-slate-50 border border-borderSoft rounded-xl p-4">
+            <div className="ui-panel-dense p-4">
               <div className="flex items-center justify-between">
                 <div>
                   <div className="text-sm font-bold text-slate-900">Gestione FX</div>
                   <div className="text-xs text-slate-600">Coppie: {fxPairs.length}</div>
                 </div>
               </div>
-              <div className="mt-3 max-h-56 overflow-auto border border-borderSoft rounded-lg bg-white">
+              <div className="ui-panel-dense mt-3 max-h-56 overflow-auto">
                 <table className="w-full text-sm">
                   <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
                     <tr>
@@ -2688,11 +3087,55 @@ export const Settings: React.FC = () => {
               </div>
             </div>
           </div>
+              </>
+            )}
         </div>
       </div>
 
-      {/* REPAIR IMPORTED TRANSACTIONS */}
-      <div className="bg-slate-50 border border-borderSoft rounded-2xl p-6 space-y-3">
+      )}
+
+      {activeSection === 'advanced' && (
+      <div className="ui-panel p-8">
+        <h2 className="text-xl font-bold mb-6 flex items-center gap-2 text-slate-900">
+          <span className="material-symbols-outlined text-primary">tune</span>
+          Avanzate
+        </h2>
+          <div className="space-y-6">
+            {!expertMode ? (
+              <div className="ui-panel-dense p-4 text-sm text-slate-700 space-y-2">
+                <div className="text-sm font-bold text-slate-900">Expert mode disattivato</div>
+                <div className="text-xs text-slate-600">
+                  Attiva per accedere a strumenti avanzati, diagnostica e azioni di manutenzione.
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setExpertMode(true)}
+                  className="bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-blue-600 transition shadow-sm"
+                >
+                  Attiva Expert mode
+                </button>
+              </div>
+            ) : (
+              <>
+                {import.meta.env.DEV && (
+                  <div className="bg-amber-50 p-4 rounded-2xl border border-amber-200 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-xs font-bold uppercase text-amber-700">Dev Tools</div>
+                        <div className="text-sm text-amber-800">Diagnostica dati e controlli qualita.</div>
+                      </div>
+                      <a
+                        href="#/data"
+                        className="px-3 py-2 rounded-lg text-xs font-bold bg-amber-600 text-white hover:bg-amber-700 transition"
+                      >
+                        Apri Data Inspector
+                      </a>
+                    </div>
+                  </div>
+                )}
+
+                {/* REPAIR IMPORTED TRANSACTIONS */}
+      <div className="ui-panel-dense p-6 space-y-3">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-sm font-bold text-slate-900">Ripara transazioni importate</div>
@@ -2702,7 +3145,7 @@ export const Settings: React.FC = () => {
         {missingTxRows.length === 0 ? (
           <div className="text-xs text-slate-500">Nessuna transazione da riparare.</div>
         ) : (
-          <div className="border border-borderSoft rounded-xl overflow-auto bg-white">
+          <div className="ui-panel-dense overflow-auto">
             <table className="w-full text-sm">
               <thead className="bg-slate-100 text-xs text-slate-600 uppercase">
                 <tr>
@@ -2721,7 +3164,7 @@ export const Settings: React.FC = () => {
                   return (
                     <tr key={tx.id ?? `${txDate}-${tx.instrumentTicker || 'no-ticker'}`} className="border-t border-borderSoft">
                       <td className="px-3 py-2 text-slate-700">{txDate}</td>
-                      <td className="px-3 py-2 font-semibold">{tx.instrumentTicker || 'â€”'}</td>
+                      <td className="px-3 py-2 font-semibold">{tx.instrumentTicker || '—'}</td>
                       <td className="px-3 py-2">{tx.type}</td>
                       <td className="px-3 py-2 text-right">{Number(tx.quantity || 0).toLocaleString('it-CH')}</td>
                       <td className="px-3 py-2">
@@ -2735,7 +3178,7 @@ export const Settings: React.FC = () => {
                         >
                           <option value="">Seleziona...</option>
                           {instruments.map(inst => {
-                            const label = `${inst.symbol || inst.ticker}${inst.name ? ` - ${inst.name}` : ''}${inst.isin ? ` · ${inst.isin}` : ''}`;
+                            const label = `${inst.symbol || inst.ticker}${inst.name ? ` - ${inst.name}` : ''}${inst.isin ? ` ? ${inst.isin}` : ''}`;
                             return (
                               <option key={String(inst.id)} value={String(inst.id)}>{label}</option>
                             );
@@ -2772,7 +3215,7 @@ export const Settings: React.FC = () => {
         </h2>
         <p className="text-sm text-red-700/70 mb-6 leading-relaxed">
           Se l'applicazione non visualizza i dati corretti o hai conflitti con versioni precedenti, puoi resettare il database.
-          Questo cancellerï¿½ tutto e ricaricherï¿½ i dati demo.
+          Questo canceller? tutto e ricaricher? i dati demo.
         </p>
         <button
           onClick={handleReset}
@@ -2782,21 +3225,101 @@ export const Settings: React.FC = () => {
         </button>
       </div>
 
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setExpertMode(false)}
+                    className="text-xs font-bold text-slate-600 hover:text-slate-800"
+                  >
+                    Disattiva Expert mode
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {deleteInstrumentModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-md animate-fade-in">
+          <div className="ui-panel-dense w-full max-w-lg overflow-hidden">
+            <div className="p-4 border-b border-slate-200/70 flex justify-between items-center bg-white/90">
+              <div className="font-bold text-slate-900 text-sm">Elimina definitivamente</div>
+              <button
+                onClick={closeDeleteInstrumentModal}
+                className="text-slate-400 hover:text-slate-700 transition-colors"
+                aria-label="Chiudi"
+              >
+                <span className="material-symbols-outlined">close</span>
+              </button>
+            </div>
+            <div className="p-4 space-y-3 text-sm text-slate-600">
+              <div>
+                Stai per eliminare definitivamente: <span className="font-semibold">{deleteInstrumentModal.ticker}</span>
+                {deleteInstrumentModal.name ? ` - ${deleteInstrumentModal.name}` : ''}
+              </div>
+              <label className="flex items-center gap-2 text-xs text-slate-400">
+                <input
+                  type="checkbox"
+                  checked={deleteInstrumentWithPrices}
+                  onChange={() => setDeleteInstrumentWithPrices(prev => !prev)}
+                />
+                Elimina anche i prezzi salvati (consigliato solo se non servono piu)
+              </label>
+              <label className="flex items-center gap-2 text-xs text-red-400">
+                <input
+                  type="checkbox"
+                  checked={deleteInstrumentConfirmed}
+                  onChange={() => setDeleteInstrumentConfirmed(prev => !prev)}
+                />
+                Capisco che questa azione e irreversibile
+              </label>
+              <div className="text-xs text-slate-400">
+                Questa azione e possibile solo se lo strumento non e presente in alcuna transazione.
+              </div>
+              {deleteInstrumentError && (
+                <div className="text-xs text-red-400">{deleteInstrumentError}</div>
+              )}
+              <div className="flex gap-2 justify-end pt-2">
+                <button
+                  type="button"
+                  onClick={closeDeleteInstrumentModal}
+                  className="px-4 py-2 text-xs font-bold ui-btn-secondary rounded-lg"
+                >
+                  Annulla
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmDeleteInstrument}
+                  disabled={deleteInstrumentLoading || !deleteInstrumentConfirmed}
+                  className={clsx(
+                    'px-4 py-2 text-xs font-bold rounded-lg text-white',
+                    (deleteInstrumentLoading || !deleteInstrumentConfirmed) ? 'bg-slate-400' : 'bg-red-600 hover:bg-red-700'
+                  )}
+                >
+                  {deleteInstrumentLoading ? 'Elimino...' : 'Elimina'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {rawModal.open && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="bg-white rounded-xl shadow-xl max-w-3xl w-full border border-borderSoft">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-borderSoft">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md p-4">
+          <div className="ui-panel-dense max-w-3xl w-full">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200/70 bg-white/90">
               <div className="font-bold text-slate-900 text-sm">{rawModal.title || 'Risposta raw'}</div>
               <button
                 type="button"
                 onClick={closeRawModal}
-                className="text-xs font-bold text-slate-600 hover:text-slate-800"
+                className="text-xs font-bold text-slate-600 hover:text-slate-900"
               >
                 Chiudi
               </button>
             </div>
             <div className="p-4">
-              <pre className="text-xs text-slate-700 whitespace-pre-wrap break-words bg-slate-50 border border-borderSoft rounded-lg p-3 max-h-96 overflow-auto">
+              <pre className="text-xs text-slate-700 whitespace-pre-wrap break-words bg-slate-50 border border-slate-200/70 rounded-lg p-3 max-h-96 overflow-auto">
                 {rawModal.content || 'N/D'}
               </pre>
             </div>
@@ -2806,6 +3329,18 @@ export const Settings: React.FC = () => {
     </div>
   );
 };
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

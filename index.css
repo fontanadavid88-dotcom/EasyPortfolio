@@ -4,20 +4,98 @@
 
 :root {
   font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  /* Background motif control (default: network) */
+  --bg-motif-network-opacity: 0;
+  --bg-motif-chart-opacity: 0;
 }
 
 body {
   margin: 0;
   min-height: 100vh;
-  background: linear-gradient(90deg, #020617 0%, #1e1b4b 100%);
-  /* Deep Dark to Deep Indigo */
-  color: #f9fafb;
-  /* textPrimary */
+  color: #e2e8f0;
+  font-variant-numeric: tabular-nums;
+  background-color: #0b1120;
+  background-image:
+    radial-gradient(60rem 40rem at 100% -10%, rgba(0, 82, 163, 0.16), transparent 60%),
+    radial-gradient(45rem 35rem at -10% 85%, rgba(249, 115, 22, 0.10), transparent 60%),
+    linear-gradient(180deg, #0b1120 0%, #0f172a 55%, #020617 100%),
+    radial-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: auto, auto, auto, 34px 34px;
+  background-position: center, center, center, 0 0;
+  background-attachment: fixed;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-repeat: no-repeat;
+  background-position: center 75%;
+  background-size: 1400px 820px;
+  filter: blur(0.2px) brightness(1.1) contrast(1.05) saturate(1.1);
+  opacity: var(--bg-motif-network-opacity);
+  mix-blend-mode: screen;
+  /* Network motif (default ON) */
+  background-image: url("/assets/motif-network.svg");
+  z-index: 0;
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-repeat: no-repeat;
+  background-position: center 75%;
+  background-size: 1400px 820px;
+  filter: blur(0.2px) brightness(1.1) contrast(1.05) saturate(1.1);
+  opacity: var(--bg-motif-chart-opacity);
+  /* Chart motif (optional) */
+  mix-blend-mode: screen;
+  background-image: url("/assets/motif-chart.svg");
 }
 
 .app-shell {
   height: 100vh;
   overflow: hidden;
+  position: relative;
+  z-index: 1;
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+/* === GLOBAL FINTECH BACKGROUND === */
+.app-background {
+  position: relative;
+  min-height: 100vh;
+  background-image: url('/Sfondo.webp');
+  background-size: cover;
+  background-position: center calc(50% + var(--bg-parallax-y, 0px));
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+
+.app-overlay {
+  position: fixed;
+  inset: 0;
+  background: linear-gradient(
+    to bottom,
+    rgba(2, 6, 23, 0.12),
+    rgba(2, 6, 23, 0.18)
+  );
+  pointer-events: none;
+  z-index: 0;
+  backdrop-filter: blur(1.5px);
+}
+
+.app-content {
+  position: relative;
+  z-index: 1;
 }
 
 .app-main {
@@ -25,6 +103,84 @@ body {
   overflow: auto;
   padding-top: calc(var(--app-header-h) + 12px);
   padding-bottom: 24px;
+}
+
+@layer components {
+  .ui-panel {
+    @apply rounded-2xl border border-slate-200 bg-white;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.14);
+  }
+  .ui-panel-dense {
+    @apply rounded-2xl border border-slate-200 bg-white;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+  }
+  .ui-panel-subtle {
+    @apply rounded-2xl border border-slate-200/70 bg-white;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+  }
+  .ui-panel, .ui-panel-dense, .ui-panel-subtle {
+    color: #0f172a;
+  }
+  .ui-input {
+    @apply w-full border border-slate-200 bg-white text-slate-900 placeholder:text-slate-400 rounded-xl px-3 py-2 focus:ring-2 focus:ring-primary focus:outline-none;
+  }
+  .ui-input-sm {
+    @apply w-full border border-slate-200 bg-white text-slate-900 placeholder:text-slate-400 rounded-lg px-2 py-1 text-xs focus:ring-2 focus:ring-primary focus:outline-none;
+  }
+  .ui-btn-primary {
+    @apply bg-primary text-white px-4 py-2 rounded-lg font-bold hover:bg-blue-600 transition focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-transparent;
+  }
+  .ui-btn-secondary {
+    @apply bg-white text-slate-900 border border-slate-200 px-4 py-2 rounded-lg font-bold hover:bg-slate-50 transition;
+  }
+  .ui-btn-ghost {
+    @apply text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition;
+  }
+}
+
+/* Recharts readability on dark panels */
+.recharts-cartesian-axis-tick text {
+  fill: rgba(100, 116, 139, 0.9);
+}
+.recharts-cartesian-grid line {
+  stroke: rgba(148, 163, 184, 0.35);
+}
+.recharts-default-tooltip {
+  background-color: rgba(255, 255, 255, 0.98) !important;
+  border: 1px solid rgba(226, 232, 240, 0.9) !important;
+  color: #0f172a !important;
+  backdrop-filter: blur(10px);
+}
+.recharts-tooltip-label,
+.recharts-tooltip-item {
+  color: #0f172a !important;
+}
+
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #111827 !important;
+  }
+  body::before {
+    display: none;
+  }
+  body::after {
+    display: none;
+  }
+  .app-background {
+    background: #ffffff !important;
+  }
+  .app-overlay {
+    display: none;
+  }
+  .ui-panel,
+  .ui-panel-dense,
+  .ui-panel-subtle {
+    background: #ffffff !important;
+    border-color: #e5e7eb !important;
+    box-shadow: none !important;
+    color: #111827 !important;
+  }
 }
 
 /* Material Symbols Outlined Class Configuration */

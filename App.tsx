@@ -1,6 +1,7 @@
 import React, { Suspense, useEffect, useState } from 'react';
 import { createHashRouter, RouterProvider, Navigate, Outlet } from 'react-router-dom';
 import { Layout } from './components/Layout';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { db, initSettings, seedDatabase, ensureDefaultPortfolio } from './db';
 import { runSymbolMigrationOnce } from './services/symbolMigration';
 
@@ -203,11 +204,12 @@ const App: React.FC = () => {
 
   return (
     <InitErrorContext.Provider value={initError}>
-      <RouterProvider router={router} />
+      <ErrorBoundary>\n      <RouterProvider router={router} />\n    </ErrorBoundary>
     </InitErrorContext.Provider>
   );
 };
 
 export default App;
+
 
 
