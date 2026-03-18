@@ -1,13 +1,20 @@
-import React, { useState, useMemo } from 'react';
+﻿import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { calculateHoldings, calculateRebalancing, getCanonicalTicker, getLatestPricePoint, getValuationDateForHoldings } from '../services/financeUtils';
-import { RebalanceStrategy, AssetType, AssetClass, Instrument, Currency, RegionKey, PortfolioPosition } from '../types';
+import { computeHoldingsPriceDateStats } from '../services/dataFreshness';
+import { diffDaysYmd } from '../services/dateUtils';
+import { RebalanceStrategy, AssetType, AssetClass, Instrument, Currency, RegionKey, PortfolioPosition, RebalancePlan } from '../types';
 import { convertAmountFromSeries } from '../services/fxService';
 import { analyzeRebalanceQuality, getIssueHelp } from '../services/dataQuality';
 import { queryLatestFxForPairs, queryLatestPricesForTickers } from '../services/dbQueries';
 import { InfoPopover } from '../components/InfoPopover';
+import { DataStatusBar } from '../components/DataStatusBar';
 import { computeRebalanceUnits } from '../services/rebalanceUtils';
+import { clearDraft, getDraftAgeLabel, loadDraft, saveDraft, type RebalanceDraftV1 } from '../services/rebalanceDraft';
+import { deletePlan, duplicatePlan, listPlans, savePlan as saveRebalancePlan } from '../services/rebalancePlanService';
+import { buildRebalancePlanCsv, downloadCsv } from '../services/csvExport';
+import { formatQuantity } from '../services/quantityFormat';
 
 import clsx from 'clsx';
 
@@ -86,6 +93,17 @@ export const Rebalance: React.FC = () => {
         region: '' as RegionKey | ''
     });
     const [editAssetInitialRegion, setEditAssetInitialRegion] = useState<RegionKey | ''>('');
+    const defaultStrategy = RebalanceStrategy.Accumulate;
+    const defaultCashInjection = 0;
+    const [draft, setDraft] = useState<RebalanceDraftV1 | null>(null);
+    const [draftReady, setDraftReady] = useState(false);
+    const saveTimeoutRef = useRef<number | null>(null);
+    const lastSnapshotRef = useRef<string | null>(null);
+    const [isPlanModalOpen, setPlanModalOpen] = useState(false);
+    const [planList, setPlanList] = useState<RebalancePlan[]>([]);
+    const [planNotice, setPlanNotice] = useState<string | null>(null);
+    const [planLoading, setPlanLoading] = useState(false);
+    const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
 
     const transactions = useLiveQuery(() => db.transactions.where('portfolioId').equals(currentPortfolioId).toArray(), [currentPortfolioId], []);
     const instruments = useLiveQuery(() => db.instruments.where('portfolioId').equals(currentPortfolioId).toArray(), [currentPortfolioId], []);
@@ -142,61 +160,167 @@ export const Rebalance: React.FC = () => {
         return calculateHoldings(transactions || []);
     }, [transactions]);
 
+    const priceStats = useMemo(() => {
+        return computeHoldingsPriceDateStats(transactions || [], instruments || [], latestPricesAll || []);
+    }, [transactions, instruments, latestPricesAll]);
+
     const valuationDate = useMemo(() => {
         if (!transactions || !latestPricesAll) return '';
         return getValuationDateForHoldings(transactions, latestPricesAll, instruments || []) || '';
     }, [transactions, latestPricesAll, instruments]);
 
+    const priceLatestAsOf = priceStats.priceLatestAsOf;
+    const rebalanceDate = priceLatestAsOf || valuationDate || '';
+
+    const draftSnapshotBase = useCallback(() => ({
+        v: 1 as const,
+        portfolioId: currentPortfolioId,
+        valuationDate: rebalanceDate || undefined,
+        baseCurrency: Currency.CHF,
+        strategy,
+        totalAmount: cashInjection
+    }), [currentPortfolioId, rebalanceDate, strategy, cashInjection]);
+
+    const buildDraftSnapshot = useCallback(() => JSON.stringify(draftSnapshotBase()), [draftSnapshotBase]);
+
+    const persistDraft = useCallback((force = false) => {
+        if (!draftReady) return;
+        const snapshot = buildDraftSnapshot();
+        if (!force && snapshot === lastSnapshotRef.current) return;
+        const payload: RebalanceDraftV1 = { ...draftSnapshotBase(), savedAt: Date.now() };
+        saveDraft(currentPortfolioId, payload);
+        setDraft(payload);
+        lastSnapshotRef.current = snapshot;
+    }, [buildDraftSnapshot, currentPortfolioId, draftReady, draftSnapshotBase]);
+
+    const isDraftStale = draft ? Date.now() - draft.savedAt > 30 * 24 * 60 * 60 * 1000 : false;
+    const isDraftApplied = !!draft && draft.strategy === strategy && (draft.totalAmount ?? 0) === cashInjection;
+    const draftAgeLabel = draft ? getDraftAgeLabel(draft.savedAt) : '';
+
+    useEffect(() => {
+        setDraftReady(false);
+        const loaded = loadDraft(currentPortfolioId);
+        setDraft(loaded);
+        const initialSnapshot = JSON.stringify({
+            v: 1,
+            portfolioId: currentPortfolioId,
+            valuationDate: rebalanceDate || undefined,
+            baseCurrency: Currency.CHF,
+            strategy: defaultStrategy,
+            totalAmount: defaultCashInjection
+        });
+        lastSnapshotRef.current = loaded ? JSON.stringify({
+            v: 1,
+            portfolioId: loaded.portfolioId,
+            valuationDate: loaded.valuationDate,
+            baseCurrency: loaded.baseCurrency,
+            strategy: loaded.strategy ?? defaultStrategy,
+            totalAmount: loaded.totalAmount ?? defaultCashInjection
+        }) : initialSnapshot;
+        setDraftReady(true);
+
+        const isLoadedStale = loaded ? Date.now() - loaded.savedAt > 30 * 24 * 60 * 60 * 1000 : false;
+        const canAutoApply = strategy === defaultStrategy && cashInjection === defaultCashInjection;
+        if (loaded && !isLoadedStale && canAutoApply) {
+            setStrategy((loaded.strategy as RebalanceStrategy) || defaultStrategy);
+            setCashInjection(typeof loaded.totalAmount === 'number' ? loaded.totalAmount : defaultCashInjection);
+        }
+    }, [currentPortfolioId]);
+
+    useEffect(() => {
+        if (!draftReady) return;
+        const snapshot = buildDraftSnapshot();
+        if (snapshot === lastSnapshotRef.current) return;
+        if (saveTimeoutRef.current) window.clearTimeout(saveTimeoutRef.current);
+        saveTimeoutRef.current = window.setTimeout(() => {
+            persistDraft();
+        }, 450);
+        return () => {
+            if (saveTimeoutRef.current) window.clearTimeout(saveTimeoutRef.current);
+        };
+    }, [buildDraftSnapshot, draftReady, persistDraft]);
+
+    useEffect(() => {
+        if (!draftReady) return;
+        const handleBeforeUnload = () => {
+            persistDraft(true);
+        };
+        window.addEventListener('beforeunload', handleBeforeUnload);
+        return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+    }, [draftReady, persistDraft]);
+
+    const handleRestoreDraft = useCallback(() => {
+        if (!draft) return;
+        setStrategy((draft.strategy as RebalanceStrategy) || defaultStrategy);
+        setCashInjection(typeof draft.totalAmount === 'number' ? draft.totalAmount : defaultCashInjection);
+    }, [draft, defaultCashInjection, defaultStrategy]);
+
+    const handleResetDraft = useCallback(() => {
+        clearDraft(currentPortfolioId);
+        setDraft(null);
+        setStrategy(defaultStrategy);
+        setCashInjection(defaultCashInjection);
+        lastSnapshotRef.current = JSON.stringify({
+            v: 1,
+            portfolioId: currentPortfolioId,
+            valuationDate: rebalanceDate || undefined,
+            baseCurrency: Currency.CHF,
+            strategy: defaultStrategy,
+            totalAmount: defaultCashInjection
+        });
+    }, [currentPortfolioId, defaultCashInjection, defaultStrategy, rebalanceDate]);
+
+
     const prices = useLiveQuery(
         async () => {
-            if (!priceTickers.length || !valuationDate) return [];
+            if (!priceTickers.length || !rebalanceDate) return [];
             const t0 = performance.now();
             const rows = await queryLatestPricesForTickers({
                 portfolioId: currentPortfolioId,
                 tickers: priceTickers,
-                upToDate: valuationDate
+                upToDate: rebalanceDate
             });
             if (import.meta.env.DEV) {
                 console.log('[PERF][Rebalance] prices at valuation', Math.round(performance.now() - t0), 'ms', {
                     tickers: priceTickers.length,
                     count: rows.length,
-                    valuationDate
+                    valuationDate: rebalanceDate
                 });
             }
             return rows;
         },
-        [currentPortfolioId, priceTickersKey, valuationDate],
+        [currentPortfolioId, priceTickersKey, rebalanceDate],
         []
     );
 
     const fxRates = useLiveQuery(
         async () => {
-            if (!fxPairs.length || !valuationDate) return [];
+            if (!fxPairs.length || !rebalanceDate) return [];
             const t0 = performance.now();
             const rows = await queryLatestFxForPairs({
                 pairs: fxPairs,
-                upToDate: valuationDate
+                upToDate: rebalanceDate
             });
             if (import.meta.env.DEV) {
                 console.log('[PERF][Rebalance] latest fx', Math.round(performance.now() - t0), 'ms', {
                     pairs: fxPairs.length,
                     count: rows.length,
-                    upToDate: valuationDate
+                    upToDate: rebalanceDate
                 });
             }
             return rows;
         },
-        [fxPairsKey, valuationDate],
+        [fxPairsKey, rebalanceDate],
         []
     );
 
     const rebalanceQuality = useMemo(() => {
-        if (!transactions || !prices || !instruments || !fxRates || !valuationDate) return null;
-        return analyzeRebalanceQuality(holdings, instruments, prices, fxRates, valuationDate, Currency.CHF);
-    }, [transactions, prices, instruments, fxRates, valuationDate, holdings]);
+        if (!transactions || !prices || !instruments || !fxRates || !rebalanceDate) return null;
+        return analyzeRebalanceQuality(holdings, instruments, prices, fxRates, rebalanceDate, Currency.CHF);
+    }, [transactions, prices, instruments, fxRates, rebalanceDate, holdings]);
 
     const rebalanceData = useMemo(() => {
-        if (!transactions || !prices || !instruments || !fxRates || !valuationDate) return null;
+        if (!transactions || !prices || !instruments || !fxRates || !rebalanceDate) return null;
         const uniqueInstruments = Array.from(
             new Map(instruments.map(inst => [inst.ticker, inst])).values()
         );
@@ -210,7 +334,7 @@ export const Rebalance: React.FC = () => {
             const instr = uniqueInstruments.find(i => i.ticker === ticker);
             if (!instr) return;
             const priceTicker = getCanonicalTicker(instr);
-            const pricePoint = getLatestPricePoint(priceTicker, valuationDate, prices);
+            const pricePoint = getLatestPricePoint(priceTicker, rebalanceDate, prices);
             const price = pricePoint?.close || 0;
             const priceCurrency = (pricePoint?.currency || instr.currency || Currency.CHF) as Currency;
             const valueLocal = qty * price;
@@ -219,10 +343,10 @@ export const Rebalance: React.FC = () => {
             let valueCHF = 0;
             if (priceCurrency === Currency.CHF) {
                 fxRateToChf = 1;
-                fxDate = valuationDate;
+                fxDate = rebalanceDate;
                 valueCHF = valueLocal;
             } else {
-                const converted = convertAmountFromSeries(valueLocal, priceCurrency, Currency.CHF, valuationDate, fxRates);
+                const converted = convertAmountFromSeries(valueLocal, priceCurrency, Currency.CHF, rebalanceDate, fxRates);
                 if (converted) {
                     fxRateToChf = converted.lookup.rate;
                     fxDate = converted.lookup.date;
@@ -259,7 +383,24 @@ export const Rebalance: React.FC = () => {
         const oldestFxDate = fxDates.length ? fxDates.sort()[0] : '';
 
         return { positions, totalValueCHF, valuationMeta, oldestFxDate };
-    }, [transactions, prices, instruments, fxRates, valuationDate, holdings]);
+    }, [transactions, prices, instruments, fxRates, rebalanceDate, holdings]);
+
+    const usedPriceDates = useMemo(() => {
+        if (!rebalanceData?.valuationMeta) return [];
+        return Array.from(rebalanceData.valuationMeta.entries()).map(([ticker, meta]) => ({
+            ticker,
+            date: meta.priceDate
+        }));
+    }, [rebalanceData]);
+
+    useEffect(() => {
+        if (!import.meta.env.DEV) return;
+        if (!rebalanceDate || !usedPriceDates.length) return;
+        console.log('[Rebalance][DEBUG] used price dates', {
+            rebalanceDate,
+            usedPriceDates
+        });
+    }, [rebalanceDate, usedPriceDates]);
 
     // 2. Calculate Rebalancing Suggestions
     const rebalancingPlan = useMemo(() => {
@@ -271,6 +412,133 @@ export const Rebalance: React.FC = () => {
         if (!rebalanceData) return new Map<string, PortfolioPosition>();
         return new Map(rebalanceData.positions.map(pos => [pos.ticker, pos]));
     }, [rebalanceData]);
+
+    const hasActionablePlan = useMemo(() => {
+        return rebalancingPlan.some(p => (p.action === 'COMPRA' || p.action === 'VENDI') && p.amount > 0);
+    }, [rebalancingPlan]);
+
+    const buildPlanItems = useCallback(() => {
+        return rebalancingPlan.map(p => {
+            const instr = instruments?.find(i => i.ticker === p.ticker);
+            const position = positionByTicker.get(p.ticker);
+            const meta = rebalanceData?.valuationMeta.get(p.ticker);
+            const price = position?.currentPrice ?? 0;
+            const priceCurrency = (meta?.priceCurrency || instr?.currency || Currency.CHF) as Currency;
+            const instrumentCurrency = (instr?.currency || position?.currency || priceCurrency) as Currency;
+            const signedDelta = p.action === 'VENDI' ? -p.amount : p.amount;
+            const unitsResult = price > 0
+                ? computeRebalanceUnits({
+                    deltaBase: signedDelta,
+                    baseCurrency: Currency.CHF,
+                    instrumentCurrency,
+                    price,
+                    priceCurrency,
+                    fxRates,
+                    valuationDate: rebalanceDate
+                })
+                : { reason: 'missing_price' as const };
+            const units = unitsResult.units ?? (p.quantity > 0 ? p.quantity : undefined);
+            const reason = !units
+                ? (unitsResult.reason || (price <= 0 ? 'missing_price' : undefined))
+                : undefined;
+            return {
+                ticker: p.ticker,
+                action: p.action as 'COMPRA' | 'VENDI' | 'NEUTRO',
+                amountBase: p.amount,
+                units,
+                instrumentCurrency,
+                price,
+                priceCurrency,
+                reason
+            };
+        });
+    }, [rebalancingPlan, instruments, positionByTicker, rebalanceData, fxRates, rebalanceDate]);
+
+    const handleSavePlan = useCallback(async () => {
+        if (!rebalanceData || !hasActionablePlan) return;
+        const items = buildPlanItems();
+        const labelBase = rebalanceDate || new Date().toISOString().slice(0, 10);
+        const saved = await saveRebalancePlan({
+            portfolioId: currentPortfolioId,
+            valuationDate: rebalanceDate || undefined,
+            baseCurrency: Currency.CHF,
+            strategy,
+            totalAmount: cashInjection,
+            items,
+            label: `Rebalance ${labelBase}`
+        });
+        setPlanList(prev => [saved, ...prev]);
+        setPlanNotice('Piano salvato');
+    }, [rebalanceData, hasActionablePlan, buildPlanItems, currentPortfolioId, rebalanceDate, strategy, cashInjection]);
+
+    const handleApplyPlan = useCallback((plan: RebalancePlan) => {
+        const nextStrategy = plan.strategy === RebalanceStrategy.Maintain
+            ? RebalanceStrategy.Maintain
+            : RebalanceStrategy.Accumulate;
+        setStrategy(nextStrategy);
+        setCashInjection(typeof plan.totalAmount === 'number' ? plan.totalAmount : defaultCashInjection);
+        setPlanNotice(`Piano applicato${plan.valuationDate ? ` (${plan.valuationDate})` : ''}`);
+        setPlanModalOpen(false);
+    }, [defaultCashInjection]);
+
+    const handleDeletePlan = useCallback(async (planId?: string) => {
+        if (!planId) return;
+        await deletePlan(planId);
+        setPlanList(prev => prev.filter(p => p.id !== planId));
+    }, []);
+
+    const handleDuplicatePlan = useCallback(async (planId?: string) => {
+        if (!planId) return;
+        const duplicated = await duplicatePlan(planId);
+        setPlanList(prev => [duplicated, ...prev]);
+        setPlanNotice('Piano duplicato');
+    }, []);
+
+    const handleLoadDraftFromPlan = useCallback((plan: RebalancePlan) => {
+        const payload: RebalanceDraftV1 = {
+            v: 1,
+            portfolioId: currentPortfolioId,
+            savedAt: Date.now(),
+            valuationDate: plan.valuationDate,
+            baseCurrency: plan.baseCurrency || Currency.CHF,
+            strategy: plan.strategy,
+            totalAmount: plan.totalAmount
+        };
+        saveDraft(currentPortfolioId, payload);
+        setDraft(payload);
+        setPlanNotice('Bozza salvata');
+        setPlanModalOpen(false);
+    }, [currentPortfolioId]);
+
+    const hasExportableItems = useCallback((plan: RebalancePlan) => {
+        return plan.items.some(item =>
+            (item.action === 'COMPRA' || item.action === 'VENDI')
+            && typeof item.amountBase === 'number'
+            && item.amountBase > 0
+        );
+    }, []);
+
+    const handleExportPlan = useCallback((plan: RebalancePlan) => {
+        if (!hasExportableItems(plan)) return;
+        const csv = buildRebalancePlanCsv(plan);
+        const dateTag = plan.valuationDate || new Date(plan.createdAt).toISOString().slice(0, 10);
+        const filename = `rebalance_${plan.portfolioId}_${dateTag}.csv`;
+        downloadCsv(filename, csv);
+    }, [hasExportableItems]);
+
+    useEffect(() => {
+        if (!isPlanModalOpen) return;
+        let isMounted = true;
+        setPlanLoading(true);
+        listPlans(currentPortfolioId)
+            .then(rows => {
+                if (isMounted) setPlanList(rows);
+            })
+            .finally(() => {
+                if (isMounted) setPlanLoading(false);
+            });
+        return () => { isMounted = false; };
+    }, [isPlanModalOpen, currentPortfolioId]);
 
     const hasFxStale = useMemo(() => {
         if (!rebalanceQuality?.issues) return false;
@@ -300,7 +568,7 @@ export const Rebalance: React.FC = () => {
             .shift();
         const fxIssues = issues.filter(i => i.type === 'fxMissing' || i.type === 'fxStale');
         const fxPairs = Array.from(new Set(
-            fxIssues.map(i => `${i.fxBase || 'FX'}→${i.fxQuote || 'CHF'}`)
+            fxIssues.map(i => `${i.fxBase || 'FX'}â†’${i.fxQuote || 'CHF'}`)
         )).slice(0, 3);
         const fxOldestDate = fxIssues
             .map(i => i.fxDate)
@@ -632,19 +900,194 @@ export const Rebalance: React.FC = () => {
                 </div>
             )}
 
+            {isPlanModalOpen && (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 backdrop-blur-md px-4">
+                    <div className="ui-panel w-full max-w-3xl p-6">
+                        <div className="flex items-center justify-between mb-4">
+                            <div>
+                                <h3 className="text-lg font-bold text-slate-900">Storico ribilanciamenti</h3>
+                                <p className="text-xs text-slate-600">Piani salvati per il portafoglio corrente.</p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setPlanModalOpen(false)}
+                                className="ui-btn-ghost px-3 py-1 text-xs font-bold"
+                            >
+                                Chiudi
+                            </button>
+                        </div>
+
+                        {planLoading ? (
+                            <div className="text-sm text-slate-500">Caricamento...</div>
+                        ) : planList.length === 0 ? (
+                            <div className="text-sm text-slate-500">Nessun piano salvato.</div>
+                        ) : (
+                            <div className="space-y-3">
+                                {planList.map(plan => (
+                                    <div key={plan.id || `${plan.createdAt}-${plan.label || 'plan'}`} className="ui-panel-dense p-4 flex flex-col gap-3">
+                                        <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                                            <div className="space-y-1">
+                                                <div className="flex items-center gap-2">
+                                                    <div className="font-semibold text-slate-900">{plan.label || 'Piano ribilanciamento'}</div>
+                                                    {plan.valuationDate && (
+                                                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">
+                                                            Snapshot {plan.valuationDate}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <div className="text-xs text-slate-600 flex flex-wrap items-center gap-2">
+                                                    <span>{new Date(plan.createdAt).toLocaleString('it-CH')}</span>
+                                                    {typeof plan.totalAmount === 'number' && <span>· CHF {plan.totalAmount.toLocaleString('it-CH')}</span>}
+                                                    <span>· {plan.items.length} righe</span>
+                                                </div>
+                                            </div>
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setExpandedPlanId(expandedPlanId === plan.id ? null : (plan.id || null))}
+                                                    className="ui-btn-ghost px-3 py-2 text-xs font-bold"
+                                                >
+                                                    {expandedPlanId === plan.id ? 'Nascondi dettagli' : 'Dettagli'}
+                                                </button>
+                                                <div className="hidden md:block h-6 w-px bg-slate-200" />
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleLoadDraftFromPlan(plan)}
+                                                    className="ui-btn-secondary px-3 py-2 text-xs font-bold"
+                                                >
+                                                    Carica come bozza
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleExportPlan(plan)}
+                                                    disabled={!hasExportableItems(plan)}
+                                                    title={!hasExportableItems(plan) ? 'Nessun ordine esportabile' : undefined}
+                                                    className="ui-btn-secondary px-3 py-2 text-xs font-bold"
+                                                >
+                                                    Esporta CSV
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleDuplicatePlan(plan.id)}
+                                                    className="ui-btn-ghost px-3 py-2 text-xs font-bold"
+                                                >
+                                                    Duplica
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleApplyPlan(plan)}
+                                                    className="ui-btn-primary px-3 py-2 text-xs font-bold"
+                                                >
+                                                    Applica
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleDeletePlan(plan.id)}
+                                                    className="ui-btn-ghost px-3 py-2 text-xs font-bold text-rose-700 hover:text-rose-800"
+                                                >
+                                                    Elimina
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        {expandedPlanId === plan.id && (
+                                            <div className="ui-panel-subtle p-3">
+                                                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 mb-2">
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        <span className="px-2 py-0.5 rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700 font-bold">
+                                                            {plan.items.filter(i => i.action === 'COMPRA').length} azioni
+                                                        </span>
+                                                        <span className="px-2 py-0.5 rounded-full border border-rose-200 bg-rose-50 text-rose-700 font-bold">
+                                                            {plan.items.filter(i => i.action === 'VENDI').length} vendite
+                                                        </span>
+                                                        <span className="px-2 py-0.5 rounded-full border border-slate-200 bg-slate-100 text-slate-600 font-bold">
+                                                            {plan.items.filter(i => i.action === 'NEUTRO').length} neutre
+                                                        </span>
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => handleExportPlan(plan)}
+                                                        disabled={!hasExportableItems(plan)}
+                                                        title={!hasExportableItems(plan) ? 'Nessun ordine esportabile' : undefined}
+                                                        className="ui-btn-ghost px-2 py-0.5 text-[11px] font-bold"
+                                                    >
+                                                        CSV
+                                                    </button>
+                                                </div>
+                                                <div className="max-h-64 overflow-auto">
+                                                    <table className="w-full text-xs text-left">
+                                                        <thead className="text-slate-500 uppercase tracking-wider">
+                                                            <tr>
+                                                                <th className="py-2 px-2">Ticker</th>
+                                                                <th className="py-2 px-2">Azione</th>
+                                                                <th className="py-2 px-2 text-right whitespace-nowrap">CHF</th>
+                                                                <th className="py-2 px-2 text-right whitespace-nowrap">Quote</th>
+                                                                <th className="py-2 px-2">Note</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody className="divide-y divide-slate-200/70">
+                                                            {plan.items.map((item, idx) => (
+                                                                <tr key={`${item.ticker}-${idx}`}>
+                                                                    <td className="py-2 px-2 font-semibold text-slate-900">{item.ticker}</td>
+                                                                    <td className="py-2 px-2">
+                                                                        <span className={clsx(
+                                                                            'rebalance-action-chip',
+                                                                            item.action === 'COMPRA' ? 'rebalance-action-buy'
+                                                                                : item.action === 'VENDI' ? 'rebalance-action-sell'
+                                                                                    : 'rebalance-action-neutral'
+                                                                        )}>
+                                                                            {item.action}
+                                                                        </span>
+                                                                    </td>
+                                                                    <td className="py-2 px-2 text-right font-mono text-slate-700 whitespace-nowrap">
+                                                                        {typeof item.amountBase === 'number'
+                                                                            ? `CHF ${item.amountBase.toLocaleString('it-CH', { maximumFractionDigits: 0 })}`
+                                                                            : '—'}
+                                                                    </td>
+                                                                    <td className="py-2 px-2 text-right font-mono text-slate-700 whitespace-nowrap">
+                                                                        {typeof item.units === 'number'
+                                                                            ? formatQuantity(item.units, instruments?.find(i => i.ticker === item.ticker), item.ticker)
+                                                                            : '—'}
+                                                                    </td>
+                                                                    <td className="py-2 px-2 text-slate-500">{item.reason || ''}</td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+
             {/* HEADER CONTROLS */}
             <div className="ui-panel p-6">
                 <h2 className="text-xl font-bold mb-6 flex items-center gap-2 text-slate-900">
                     <span className="material-symbols-outlined text-[#0052a3]">balance</span>
                     Pannello Ribilanciamento
                 </h2>
-                {valuationDate && (
+                <DataStatusBar
+                    portfolioId={currentPortfolioId}
+                    transactions={transactions || []}
+                    instruments={instruments || []}
+                    prices={latestPricesAll || []}
+                    fxUsed={rebalanceData?.oldestFxDate || undefined}
+                    variant="rebalance"
+                    rebalanceDate={rebalanceDate || undefined}
+                    usedPriceDates={usedPriceDates}
+                />
+                {rebalanceDate && (
                     <div className="text-xs text-slate-500 mb-4 flex flex-wrap items-center gap-2">
                         <span>Base currency: CHF</span>
-                        <span>•</span>
-                        <span>Valuation date: {valuationDate}</span>
-                        <span>•</span>
-                        <span>FX used: {rebalanceData?.oldestFxDate || 'N/D'}</span>
+                        <span>·</span>
+                        <span>Prezzi (rebalance): {rebalanceDate || 'N/D'}</span>
+                        <span>·</span>
+                        <span>FX (usato): {rebalanceData?.oldestFxDate || 'N/D'}</span>
                         {hasFxStale && (
                             <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 font-bold border border-amber-200">
                                 FX stale
@@ -652,8 +1095,55 @@ export const Rebalance: React.FC = () => {
                         )}
                     </div>
                 )}
+                {draft && (
+                    <div className="text-xs text-slate-500 mb-4 flex flex-wrap items-center gap-2">
+                        <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200">
+                            Bozza salvata • {draftAgeLabel}
+                        </span>
+                        {isDraftStale && (
+                            <span className="text-amber-600">Bozza vecchia</span>
+                        )}
+                        {!isDraftApplied && (
+                            <button
+                                type="button"
+                                onClick={handleRestoreDraft}
+                                className="ui-btn-secondary px-3 py-1 text-xs font-bold"
+                            >
+                                Ripristina bozza
+                            </button>
+                        )}
+                        <button
+                            type="button"
+                            onClick={handleResetDraft}
+                            className="ui-btn-ghost px-3 py-1 text-xs font-bold"
+                        >
+                            Reset bozza
+                        </button>
+                    </div>
+                )}
+                <div className="flex flex-wrap items-center gap-2 mb-4">
+                    <button
+                        type="button"
+                        onClick={handleSavePlan}
+                        disabled={!hasActionablePlan}
+                        title={!hasActionablePlan ? 'Nessun piano da salvare' : undefined}
+                        className="ui-btn-primary px-4 py-2 text-xs font-bold"
+                    >
+                        Salva piano
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => setPlanModalOpen(true)}
+                        className="ui-btn-secondary px-4 py-2 text-xs font-bold"
+                    >
+                        Storico
+                    </button>
+                    {planNotice && (
+                        <span className="text-xs text-slate-500">{planNotice}</span>
+                    )}
+                </div>
                 {isRebalanceBlocked && (
-                    <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800 flex flex-col gap-2">
+                    <div className="ui-panel-subtle border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800 flex flex-col gap-2">
                         <div className="font-bold">Alcuni strumenti hanno dati incompleti. Il rebalance e limitato.</div>
                         <div>Ticker senza valutazione: {unvaluedTickers.join(', ')}</div>
                         {issueHighlights.length > 0 && (
@@ -681,7 +1171,7 @@ export const Rebalance: React.FC = () => {
                                 href="#/settings"
                                 className="inline-flex items-center gap-1 text-amber-700 font-bold hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
                             >
-                                Vai a Settings → Sync/FX
+                                Vai a Settings â†’ Sync/FX
                             </a>
                         </div>
                     </div>
@@ -744,8 +1234,8 @@ export const Rebalance: React.FC = () => {
                                 </div>
                             </th>
                             <th className="px-4 py-4 font-bold text-right w-[15%]">Attuale / Quote</th>
-                            <th className="px-4 py-4 font-bold text-right w-[10%]">Quote</th>
-                            <th className="px-4 py-4 font-bold text-right w-[15%]">Azione Consigliata</th>
+                            <th className="px-4 py-4 font-bold text-right w-[10%] rebalance-emph-col min-w-[120px]">Quote</th>
+                            <th className="px-4 py-4 font-bold text-right w-[15%] rebalance-emph-col min-w-[170px] whitespace-nowrap">Azione Consigliata</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-borderSoft">
@@ -814,6 +1304,9 @@ export const Rebalance: React.FC = () => {
                                         const isTradable = !isRebalanceBlocked && status === 'OK';
                                         const hasMismatch = sortedIssues.some(issue => issue.type === 'currencyMismatch');
                                         const priceValue = position?.currentPrice ?? 0;
+                                        const isStalePrice = Boolean(meta?.priceDate && rebalanceDate && meta.priceDate < rebalanceDate);
+                                        const lagDays = isStalePrice && meta?.priceDate ? diffDaysYmd(rebalanceDate, meta.priceDate) : 0;
+                                        const showPriceDate = Boolean(meta?.priceDate && (meta.priceDate !== rebalanceDate || isStalePrice));
                                         const formatPrice = (value: number) => {
                                             if (!Number.isFinite(value) || value <= 0) return '—';
                                             const decimals = value < 1 ? 4 : 2;
@@ -825,6 +1318,7 @@ export const Rebalance: React.FC = () => {
                                         const isCashLike = instr?.type === AssetType.Cash;
                                         const signedDelta = p.action === 'VENDI' ? -p.amount : p.amount;
                                         const isUnvalued = unvaluedTickers.includes(p.ticker);
+                                        const isActionRow = p.action === 'COMPRA' || p.action === 'VENDI';
                                         const unitsResult = (!isTradable || isUnvalued || isCashLike)
                                             ? { reason: 'invalid' as const }
                                             : computeRebalanceUnits({
@@ -834,17 +1328,12 @@ export const Rebalance: React.FC = () => {
                                                 price: priceValue,
                                                 priceCurrency,
                                                 fxRates,
-                                                valuationDate
+                                                valuationDate: rebalanceDate
                                             });
-                                        const formatUnits = (value: number) => {
-                                            if (!Number.isFinite(value)) return '—';
-                                            const decimals = instr?.type === AssetType.Crypto ? 6 : 4;
-                                            return value.toLocaleString('it-CH', { minimumFractionDigits: 0, maximumFractionDigits: decimals });
-                                        };
                                         const unitsLabel = isNeutral
-                                            ? '0'
+                                            ? formatQuantity(0, instr, p.ticker)
                                             : (unitsResult.units !== undefined && Number.isFinite(unitsResult.units))
-                                                ? formatUnits(unitsResult.units)
+                                                ? formatQuantity(unitsResult.units, instr, p.ticker)
                                                 : '—';
                                         const unitsTitle = unitsLabel === '—'
                                             ? (unitsResult.reason === 'currency_mismatch'
@@ -855,7 +1344,13 @@ export const Rebalance: React.FC = () => {
                                             : undefined;
 
                                         return (
-                                            <tr key={p.ticker} className="hover:bg-slate-50 transition-colors group">
+                                            <tr
+                                                key={p.ticker}
+                                                className={clsx(
+                                                    "hover:bg-slate-50 transition-colors group",
+                                                    isActionRow && "rebalance-row-active"
+                                                )}
+                                            >
                                                 {/* Ticker & Name */}
                                                 <td className="px-4 py-3 pl-8">
                                                     <div className="flex items-start justify-between gap-2">
@@ -918,27 +1413,30 @@ export const Rebalance: React.FC = () => {
                                                 </td>
 
                                                 {/* Current / Quantity */}
-                                                <td className="px-4 py-3 text-right">
+                                                <td className="px-4 py-3 text-right rebalance-emph-col min-w-[120px]">
                                                     <div className="text-xs font-medium text-slate-600">
                                                         {assetCurrency} {currentValue.toLocaleString('it-CH', { maximumFractionDigits: 2 })}
                                                     </div>
                                                     <div className="text-[11px] text-slate-400">
-                                                        Quote: {heldQty.toLocaleString('it-CH', { maximumFractionDigits: 6 })}
+                                                        Quote: {formatQuantity(heldQty, instr, p.ticker)}
                                                     </div>
-                                                    <div className="text-[11px] text-slate-400">
+                                                    <div className={clsx('text-[11px]', isStalePrice ? 'text-amber-600' : 'text-slate-400')}>
                                                         Px: {assetCurrency} {formatPrice(priceValue)}
-                                                        {meta?.priceDate && meta.priceDate !== valuationDate ? ` (${meta.priceDate})` : ''}
+                                                        {showPriceDate && meta?.priceDate ? ` (${meta.priceDate})` : ''}
+                                                        {isStalePrice && lagDays > 0 && (
+                                                            <span className="ml-1 text-[10px] font-semibold">-{lagDays} g</span>
+                                                        )}
                                                         {hasMismatch ? ' (mismatch)' : ''}
                                                     </div>
                                                 </td>
 
                                                 {/* Units */}
-                                                <td className="px-4 py-3 text-right">
+                                                <td className="px-4 py-3 text-right rebalance-emph-col min-w-[170px]">
                                                     <div
-                                                        className={clsx('text-xs font-mono', unitsLabel === '—' ? 'text-slate-400' : 'text-slate-600')}
+                                                        className={clsx('text-xs font-mono', unitsLabel === '—' ? 'text-slate-400' : 'text-slate-700')}
                                                         title={unitsTitle}
                                                     >
-                                                        {unitsLabel}
+                                                        {unitsLabel === '—' ? unitsLabel : <span className="rebalance-emph-cell">{unitsLabel}</span>}
                                                     </div>
                                                 </td>
 
@@ -950,7 +1448,7 @@ export const Rebalance: React.FC = () => {
                                                                 ariaLabel="Dettagli dati incompleti"
                                                                 title="Dati incompleti"
                                                                 triggerContent="Dati incompleti"
-                                                                triggerClassName="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-amber-100 text-amber-700 focus:outline-none focus:ring-2 focus:ring-primary"
+                                                                triggerClassName="rebalance-action-chip bg-amber-100 text-amber-700 focus:outline-none focus:ring-2 focus:ring-primary"
                                                                 popoverClassName="right-0"
                                                                 renderContent={() => (
                                                                     <div className="space-y-2">
@@ -978,22 +1476,22 @@ export const Rebalance: React.FC = () => {
                                                             />
                                                         ) : (
                                                             <span className={clsx(
-                                                                "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider",
-                                                                p.action === 'COMPRA' ? "bg-green-500/20 text-green-400" :
-                                                                    p.action === 'VENDI' ? "bg-red-500/20 text-red-400" :
-                                                                        "bg-gray-500/20 text-gray-500"
+                                                                "rebalance-action-chip",
+                                                                p.action === 'COMPRA' ? "rebalance-action-buy" :
+                                                                    p.action === 'VENDI' ? "rebalance-action-sell" :
+                                                                        "rebalance-action-neutral"
                                                             )}>
                                                                 {p.action}
                                                             </span>
                                                         )}
                                                         {isTradable && p.amount > 0 && (
-                                                            <span className="text-xs font-mono text-slate-500">
+                                                            <span className="rebalance-emph-cell">
                                                                 CHF {p.amount.toLocaleString('it-CH', { maximumFractionDigits: 0 })}
                                                             </span>
                                                         )}
                                                         {isTradable && p.amount > 0 && amountLocal !== null && (
                                                             <span className="text-[11px] text-slate-400">
-                                                                ≈ {assetCurrency} {amountLocal.toLocaleString('it-CH', { maximumFractionDigits: 0 })}
+                                                                ˜ {assetCurrency} {amountLocal.toLocaleString('it-CH', { maximumFractionDigits: 0 })}
                                                             </span>
                                                         )}
                                                     </div>
@@ -1015,6 +1513,19 @@ export const Rebalance: React.FC = () => {
         </div>
     );
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

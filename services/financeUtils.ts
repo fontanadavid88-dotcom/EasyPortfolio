@@ -1177,37 +1177,7 @@ export const calculateRegionExposure = (
     pct: totalValue > 0 ? (value / totalValue) * 100 : 0
   })).sort((a, b) => b.value - a.value);
 
-  const unassigned = entries.find(e => e.region === 'UNASSIGNED');
-  const explicitOther = entries.find(e => e.region === 'OTHER');
-  const assigned = entries.filter(e => e.region !== 'UNASSIGNED' && e.region !== 'OTHER');
-
-  const maxItems = 8;
-  const minPct = 2;
-  const major: typeof assigned = [];
-  const minor: typeof assigned = [];
-
-  assigned.forEach((entry, idx) => {
-    if (entry.pct < minPct || idx >= maxItems) minor.push(entry);
-    else major.push(entry);
-  });
-
-  if (explicitOther) minor.push(explicitOther);
-
-  const minorValue = minor.reduce((sum, item) => sum + item.value, 0);
-  if (minorValue > 0) {
-    major.push({
-      region: 'OTHER',
-      label: getRegionLabel('OTHER'),
-      value: minorValue,
-      pct: totalValue > 0 ? (minorValue / totalValue) * 100 : 0
-    });
-  }
-
-  if (unassigned) {
-    major.push(unassigned);
-  }
-
-  return major;
+  return entries;
 };
 
 export const calculateAllocationByAssetClass = (

@@ -814,7 +814,7 @@ export const Transactions: React.FC = () => {
                 </button>
             </div>
             {assetAttachNotice && (
-                <div className="bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold px-4 py-2 rounded-xl">
+                <div className="ui-panel-subtle border-amber-200 bg-amber-50 px-4 py-2 text-xs font-semibold text-amber-700">
                     {assetAttachNotice}
                 </div>
             )}
@@ -832,7 +832,7 @@ export const Transactions: React.FC = () => {
                         <form onSubmit={handleSaveAsset} className="p-6 space-y-5">
                             {/* Ticker Section */}
                             <div className="relative">
-                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Ticker (symbol EODHD)</label>
+                                <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Ticker (symbol EODHD)</label>
                                 <input
                                     ref={tickerInputRef}
                                     placeholder="Es. AAPL.US o BTC-USD.CC" required
@@ -885,7 +885,7 @@ export const Transactions: React.FC = () => {
                             </div>
 
                             <div>
-                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">ISIN (opzionale)</label>
+                                <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">ISIN (opzionale)</label>
                                 <input
                                     placeholder="Es. IE00B4L5Y983"
                                     value={assetForm.isin}
@@ -950,7 +950,7 @@ export const Transactions: React.FC = () => {
                                 )}
                             </div>
                             <div>
-                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Nome Strumento</label>
+                                <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Nome Strumento</label>
                                 <input
                                     placeholder="Nome completo" required
                                     value={assetForm.name}
@@ -961,7 +961,7 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Tipo</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Tipo</label>
                                     <select
                                         value={assetForm.type}
                                         onChange={e => setAssetForm({ ...assetForm, type: e.target.value as AssetType })}
@@ -971,7 +971,7 @@ export const Transactions: React.FC = () => {
                                     </select>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Valuta</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Valuta</label>
                                     <select
                                         value={assetForm.currency}
                                         onChange={e => setAssetForm({ ...assetForm, currency: e.target.value as Currency })}
@@ -992,7 +992,7 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Data</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Data</label>
                                     <input
                                         ref={assetDateRef}
                                         type="date" required
@@ -1002,7 +1002,7 @@ export const Transactions: React.FC = () => {
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Quantità</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Quantità</label>
                                     <input
                                         type="number" placeholder="0" step="0.0001" required
                                         value={numberValue(assetForm.quantity)}
@@ -1014,7 +1014,7 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Prezzo Acquisto</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Prezzo Acquisto</label>
                                     <input
                                         type="number" placeholder="0.00" step="0.01" required
                                         value={numberValue(assetForm.price)}
@@ -1061,7 +1061,7 @@ export const Transactions: React.FC = () => {
                                     </label>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Commissioni</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Commissioni</label>
                                     <input
                                         type="number" placeholder="0.00" step="0.01"
                                         value={numberValue(assetForm.fees)}
@@ -1099,7 +1099,7 @@ export const Transactions: React.FC = () => {
                         <form onSubmit={handleSaveTransaction} className="p-6 space-y-4">
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Data</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Data</label>
                                     <input
                                         type="date"
                                         className="ui-input w-full text-sm dark-date-input"
@@ -1109,7 +1109,7 @@ export const Transactions: React.FC = () => {
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Tipo</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Tipo</label>
                                     <select
                                         className="ui-input w-full text-sm"
                                         value={txForm.type}
@@ -1122,7 +1122,7 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Prezzo Unitario</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Prezzo Unitario</label>
                                     <input
                                         type="number" placeholder="0.00"
                                         className="ui-input w-full text-sm font-mono"
@@ -1171,7 +1171,7 @@ export const Transactions: React.FC = () => {
                                     </label>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Quantità</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Quantità</label>
                                     <input
                                         type="number" placeholder="0"
                                         className="ui-input w-full text-sm font-mono"
@@ -1185,7 +1185,7 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Commissioni</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Commissioni</label>
                                     <input
                                         type="number" placeholder="0.00"
                                         className="ui-input w-full text-sm font-mono"
@@ -1195,7 +1195,7 @@ export const Transactions: React.FC = () => {
                                     />
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Valuta</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Valuta</label>
                                     <select
                                         className="ui-input w-full text-sm"
                                         value={txForm.currency}
@@ -1230,7 +1230,7 @@ export const Transactions: React.FC = () => {
                         </div>
                         <form onSubmit={handleSaveAssetMeta} className="p-6 space-y-4">
                             <div>
-                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Nome</label>
+                                <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Nome</label>
                                 <input
                                     value={editAssetForm.name}
                                     onChange={e => setEditAssetForm({ ...editAssetForm, name: e.target.value })}
@@ -1241,7 +1241,7 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Tipo</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Tipo</label>
                                     <select
                                         value={editAssetForm.type}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, type: e.target.value as AssetType })}
@@ -1251,7 +1251,7 @@ export const Transactions: React.FC = () => {
                                     </select>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Asset class</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Asset class</label>
                                     <select
                                         value={editAssetForm.assetClass}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, assetClass: e.target.value as AssetClass })}
@@ -1264,7 +1264,7 @@ export const Transactions: React.FC = () => {
 
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Valuta</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Valuta</label>
                                     <select
                                         value={editAssetForm.currency}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, currency: e.target.value as Currency })}
@@ -1274,7 +1274,7 @@ export const Transactions: React.FC = () => {
                                     </select>
                                 </div>
                                 <div>
-                                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Settore</label>
+                                    <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Settore</label>
                                     <input
                                         value={editAssetForm.sector}
                                         onChange={e => setEditAssetForm({ ...editAssetForm, sector: e.target.value })}
@@ -1284,7 +1284,7 @@ export const Transactions: React.FC = () => {
                             </div>
 
                             <div>
-                                <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Geografia</label>
+                                <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">Geografia</label>
                                 <select
                                     value={editAssetForm.region}
                                     onChange={e => setEditAssetForm({ ...editAssetForm, region: e.target.value as RegionKey | '' })}
@@ -1483,6 +1483,8 @@ export const Transactions: React.FC = () => {
         </div>
     );
 };
+
+
 
 
 

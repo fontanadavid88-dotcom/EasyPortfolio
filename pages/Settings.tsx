@@ -1,13 +1,15 @@
-﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { db, getCurrentPortfolioId, setCurrentPortfolioId } from '../db';
-import { syncPrices, getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary, resolvePriceSyncConfig, testSheetLatestPrice, SheetTestResult, getResolvedSymbol, getEodhdQuotaInfo, EodhdQuotaInfo, getEodhdDailyBudgetStatus } from '../services/priceService';
+import { getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary, resolvePriceSyncConfig, testSheetLatestPrice, SheetTestResult, getResolvedSymbol, getEodhdQuotaInfo, EodhdQuotaInfo, getEodhdDailyBudgetStatus } from '../services/priceService';
 import { AutoGapScope, getAutoGapFillEnabled, setAutoGapFillEnabled, getAutoGapFillScope, setAutoGapFillScope, getAutoSyncMeta, setAutoSyncMeta } from '../services/autoSyncService';
 import { fetchJsonWithDiagnostics, toNum, FetchJsonDiagnostics } from '../services/diagnostics';
 import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
 import { importFxCsv, FxRateRow, backfillFxRatesForPortfolio, getFxPairsForPortfolio, FxBackfillSummary } from '../services/fxService';
+import { runGapFill, runLatestSync } from '../services/syncActionsService';
 import { detectFormat, importToDb, ImportReport, ImportTableName, validateAndNormalize } from '../services/importExportService';
 import { fetchAppsScriptPing, fetchAssetsMap, fetchMacro, applyAssetsMapToSettings, applyMacroRowsToDexie, syncFxRates, AppsScriptFxRow, APPS_SCRIPT_DISABLED_MESSAGE } from '../services/appsScriptService';
+import { getLastGapFillAt, getLastLatestSyncAt } from '../services/syncStatusService';
 import { checkProxyHealth } from '../services/apiHealthService';
 import type { ProxyHealth } from '../services/apiHealthService';
 import { deleteInstrumentGloballySafely } from '../services/dbQueries';
@@ -47,6 +49,28 @@ const isActiveSection = (value: string | null | undefined): value is ActiveSecti
   return SETTINGS_SECTIONS.some(section => section.key === value);
 };
 
+const readLocalValue = (key: string): string | null => {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+};
+
+const getPriceSyncMeta = (portfolioId: string) => ({
+  lastSyncAt: readLocalValue(`prices:lastSyncAt:${portfolioId}`),
+  lastBackfillAt: readLocalValue(`prices:lastBackfillAt:${portfolioId}`),
+  lastSyncStatus: readLocalValue(`prices:lastSyncStatus:${portfolioId}`)
+});
+
+const formatLocalDateTime = (iso?: string | null) => {
+  if (!iso) return 'mai';
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return iso;
+  return parsed.toLocaleString('it-IT');
+};
+
 export const Settings: React.FC = () => {
   const [config, setConfig] = useState<AppSettings>({
     eodhdApiKey: '',
@@ -76,6 +100,11 @@ export const Settings: React.FC = () => {
   const [bfStatus, setBfStatus] = useState('');
   const [loading, setLoading] = useState(false);
   const [syncSummary, setSyncSummary] = useState<SyncPricesSummary | null>(null);
+  const [latestSyncDetail, setLatestSyncDetail] = useState('');
+  const [gapFillAllRunning, setGapFillAllRunning] = useState(false);
+  const [gapFillAllStatus, setGapFillAllStatus] = useState('');
+  const [lastLatestSyncAt, setLastLatestSyncAtState] = useState<string | null>(() => getLastLatestSyncAt(getCurrentPortfolioId()));
+  const [lastGapFillAt, setLastGapFillAtState] = useState<string | null>(() => getLastGapFillAt(getCurrentPortfolioId()));
   const [saveNotice, setSaveNotice] = useState('');
   const [fxBackfillLoading, setFxBackfillLoading] = useState(false);
   const [fxBackfillStatus, setFxBackfillStatus] = useState('');
@@ -107,6 +136,12 @@ export const Settings: React.FC = () => {
   const focusHandledRef = useRef<string | null>(null);
   const [settingsId, setSettingsId] = useState<number | undefined>(undefined);
   const currentPortfolioId = getCurrentPortfolioId();
+  const [priceSyncMeta, setPriceSyncMeta] = useState(() => getPriceSyncMeta(currentPortfolioId));
+  useEffect(() => {
+    setLastLatestSyncAtState(getLastLatestSyncAt(currentPortfolioId));
+    setLastGapFillAtState(getLastGapFillAt(currentPortfolioId));
+    setPriceSyncMeta(getPriceSyncMeta(currentPortfolioId));
+  }, [currentPortfolioId]);
   const [activeSection, setActiveSection] = useState<ActiveSection>(() => {
     if (typeof window === 'undefined') return 'prices';
     const stored = localStorage.getItem(`settings.activeSection.${currentPortfolioId}`);
@@ -814,39 +849,49 @@ export const Settings: React.FC = () => {
   const handleSync = async () => {
     setLoading(true);
     setSyncSummary(null);
+    setLatestSyncDetail('');
     setFxSyncNotice(null);
     try {
-      const result = await syncPrices(config.eodhdApiKey);
-      setSyncSummary(result);
+      const outcome = await runLatestSync({
+        portfolioId: currentPortfolioId,
+        settings: config,
+        baseCurrency: config.baseCurrency
+      });
+      setSyncSummary(outcome.priceResult);
+      const sheetCount = outcome.updatedSheetTickers.length;
+      const fallbackCount = outcome.updatedFallbackTickers.length;
+      const missing = outcome.missingTickers;
+      const updatedLabel = `Aggiornato: ${sheetCount} (Sheet)${fallbackCount ? ` + ${fallbackCount} (EODHD fallback)` : ''}`;
+      const missingLabel = missing.length
+        ? `Mancanti: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? '...' : ''}`
+        : 'Mancanti: -';
+      const summary = `${updatedLabel}. ${missingLabel}`;
+      setLatestSyncDetail(summary);
       let fxNotice: { status: 'ok' | 'warn' | 'err'; message: string } | null = null;
-      const appsScriptEnabled = Boolean(config.appsScriptUrl?.trim() && config.appsScriptApiKey?.trim());
-      if (!appsScriptEnabled) {
+      if (outcome.fx?.disabled) {
         fxNotice = { status: 'warn', message: 'FX non aggiornato: Apps Script disabilitato.' };
-      } else {
-        try {
-          const fxResult = await syncFxRates(config, 'apps_script');
-          if (!fxResult.ok) {
-            fxNotice = { status: fxResult.error === APPS_SCRIPT_DISABLED_MESSAGE ? 'warn' : 'err', message: `FX non aggiornato: ${fxResult.error}.` };
-          } else {
-            fxNotice = { status: 'ok', message: `FX aggiornati: ${fxResult.count ?? 0} righe.` };
-          }
-        } catch (e: any) {
-          fxNotice = { status: 'err', message: `FX non aggiornato: ${e?.message || 'errore Apps Script'}.` };
-        }
+      } else if (outcome.fx?.ok) {
+        fxNotice = { status: 'ok', message: `FX aggiornati: ${outcome.fx.count ?? 0} righe.` };
+      } else if (outcome.fx && !outcome.fx.ok) {
+        fxNotice = { status: outcome.fx.error === APPS_SCRIPT_DISABLED_MESSAGE ? 'warn' : 'err', message: `FX non aggiornato: ${outcome.fx.error}.` };
       }
       setFxSyncNotice(fxNotice);
+      if (outcome.latestSyncAt) {
+        setLastLatestSyncAtState(outcome.latestSyncAt);
+      }
       await loadFxLastDates();
+      setPriceSyncMeta(getPriceSyncMeta(currentPortfolioId));
       const fxSuffix = fxNotice && fxNotice.status !== 'ok' ? `\n${fxNotice.message}` : '';
-      if (result.status === 'ok') {
-        alert(`Prezzi aggiornati con successo!${fxSuffix}`);
-      } else if (result.status === 'partial') {
-        alert(`Aggiornamento parziale: alcuni ticker non sono stati aggiornati.${fxSuffix}`);
-      } else if (result.status === 'quota_exhausted') {
+      if (outcome.priceResult.status === 'ok') {
+        alert(`Prezzi aggiornati con successo!${fxSuffix}\n${summary}`);
+      } else if (outcome.priceResult.status === 'partial') {
+        alert(`Aggiornamento parziale: alcuni ticker non sono stati aggiornati.${fxSuffix}\n${summary}`);
+      } else if (outcome.priceResult.status === 'quota_exhausted') {
         alert(`Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili.${fxSuffix}`);
-      } else if (result.status === 'proxy_unreachable') {
-        alert(`${result.message || 'Proxy /api non raggiungibile.'}${fxSuffix}`);
+      } else if (outcome.priceResult.status === 'proxy_unreachable') {
+        alert(`${outcome.priceResult.message || 'Proxy /api non raggiungibile.'}${fxSuffix}`);
       } else {
-        const reason = result.message ? ` ${result.message}` : '';
+        const reason = outcome.priceResult.message ? ` ${outcome.priceResult.message}` : '';
         alert(`Aggiornamento fallito: nessun ticker aggiornato.${reason}${fxSuffix}`);
       }
     } catch (e: any) {
@@ -856,6 +901,33 @@ export const Settings: React.FC = () => {
     }
   };
 
+  const handleGapFillAll = async () => {
+    if (gapFillAllRunning) return;
+    setGapFillAllRunning(true);
+    setGapFillAllStatus('Avvio gap-fill completo...');
+    try {
+      const outcome = await runGapFill({
+        portfolioId: currentPortfolioId,
+        settings: config,
+        baseCurrency: config.baseCurrency,
+        onProgress: setGapFillAllStatus
+      });
+      if (outcome.gapFillAt) {
+        setLastGapFillAtState(outcome.gapFillAt);
+      }
+      setBudgetStatus(getEodhdDailyBudgetStatus());
+      setPriceSyncMeta(getPriceSyncMeta(currentPortfolioId));
+      if (outcome.ok) {
+        setGapFillAllStatus('Gap-fill completato.');
+      } else {
+        setGapFillAllStatus(outcome.priceResult.message || 'Gap-fill non completato');
+      }
+    } catch (e: any) {
+      setGapFillAllStatus(e?.message || 'Errore gap-fill');
+    } finally {
+      setGapFillAllRunning(false);
+    }
+  };
   const handleBackfill = async () => {
     setBfLoading(true);
     setBfStatus('Avvio backfill...');
@@ -1293,11 +1365,11 @@ export const Settings: React.FC = () => {
     if (!selectedInstrumentId) return;
     const sum = Object.values(regionAllocation || {}).reduce((s, v) => s + (v || 0), 0);
     if (sum < 99.5 || sum > 100.5) {
-      if (!confirm('La somma delle percentuali non ? 100%. Procedere lo stesso?')) return;
+      if (!confirm('La somma delle percentuali non è 100%. Procedere lo stesso?')) return;
     }
     const regionTarget = getInstrumentByIdString(selectedInstrumentId);
-    if (!regionTarget?.ticker) return;
-    await db.instruments.update(regionTarget.ticker, { regionAllocation });
+    if (!regionTarget?.id) return;
+    await db.instruments.update(regionTarget.id, { regionAllocation });
     alert('Distribuzione geografica salvata');
   };
 
@@ -1712,61 +1784,49 @@ export const Settings: React.FC = () => {
       </div>
 
       <div className="ui-panel p-6">
-        <h2 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-900">
-          <span className="material-symbols-outlined text-primary">bolt</span>
-          Azioni rapide
-        </h2>
-        <div className="text-xs text-slate-600">Le azioni piu usate per aggiornare dati e diagnosticare problemi.</div>
-        <div className="flex flex-wrap gap-3 mt-3">
-          <button
-            onClick={handleSync}
-            disabled={loading}
-            className="ui-btn-primary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-          >
-            {loading ? (
-              <>
-                <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
-                Aggiornamento...
-              </>
-            ) : (
-              <>
-                <span className="material-symbols-outlined text-sm">sync</span>
-                Aggiorna prezzi
-              </>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-900">
+              <span className="material-symbols-outlined text-primary">bolt</span>
+              Operazioni
+            </h2>
+            <div className="text-xs text-slate-600">Aggiorna i dati di oggi o riempi i buchi storici.</div>
+            <div className="text-[11px] text-slate-500 mt-2">
+              Ultimo sync: {lastLatestSyncAt ? new Date(lastLatestSyncAt).toLocaleString('it-IT') : 'mai'} · Gap-fill: {lastGapFillAt ? new Date(lastGapFillAt).toLocaleString('it-IT') : 'mai'}
+            </div>
+            {gapFillAllStatus && (
+              <div className="text-[11px] text-slate-600 mt-1">Gap-fill: {gapFillAllStatus}</div>
             )}
-          </button>
-          <button
-            onClick={handleBackfill}
-            disabled={bfLoading}
-            className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-          >
-            {bfLoading ? (
-              <>
-                <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
-                Scaricamento...
-              </>
-            ) : (
-              <>
-                <span className="material-symbols-outlined text-sm">download</span>
-                Scarica storico prezzi
-              </>
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={handleAutoGapNow}
-            disabled={autoGapRunning || !config.eodhdApiKey?.trim()}
-            className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-          >
-            <span className="material-symbols-outlined text-sm">timeline</span>
-            {autoGapRunning ? 'Gap-fill in corso...' : 'Esegui gap-fill ora'}
-          </button>
-          <a
-            href="#/data?tab=checks"
-            className="ui-btn-ghost px-4 py-2 rounded-lg text-xs font-bold transition border border-slate-200/70"
-          >
-            Apri Data Inspector
-          </a>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={handleSync}
+              disabled={loading}
+              className="ui-btn-primary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              {loading ? (
+                <>
+                  <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
+                  Aggiornamento...
+                </>
+              ) : (
+                <>
+                  <span className="material-symbols-outlined text-sm">sync</span>
+                  Aggiorna oggi
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={handleGapFillAll}
+              disabled={gapFillAllRunning || !config.eodhdApiKey?.trim()}
+              title={!config.eodhdApiKey?.trim() ? 'Inserisci la API key EODHD in Provider & Connessioni' : undefined}
+              className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+            >
+              <span className="material-symbols-outlined text-sm">timeline</span>
+              {gapFillAllRunning ? 'Riempiendo...' : 'Riempi buchi'}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -2179,11 +2239,22 @@ export const Settings: React.FC = () => {
                   Riesegui migrazione symbol
                 </button>
                 <button
-                  onClick={() => setCoverageExpanded(prev => !prev)}
+                  onClick={() => {
+                    setCoverageExpanded(prev => {
+                      const next = !prev;
+                      if (next) {
+                        setActiveSection('coverage');
+                      }
+                      return next;
+                    });
+                  }}
                   className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
                 >
                   {coverageExpanded ? 'Nascondi copertura' : 'Dettagli copertura'}
                 </button>
+              </div>
+              <div className="text-[11px] text-slate-500">
+                Ultimo sync: {formatLocalDateTime(priceSyncMeta.lastSyncAt)} · Backfill: {formatLocalDateTime(priceSyncMeta.lastBackfillAt)}
               </div>
               {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
               {fxBackfillStatus && <div className="text-xs text-slate-600 font-medium">{fxBackfillStatus}</div>}
@@ -2203,6 +2274,9 @@ export const Settings: React.FC = () => {
                     <span className="text-slate-500">Sync:</span>{' '}
                     <span className={`px-2 py-0.5 rounded-full font-bold ${syncStatusClass}`}>{syncStatusLabel}</span>
                   </div>
+                  {latestSyncDetail && (
+                    <div className="text-slate-600">{latestSyncDetail}</div>
+                  )}
                   {fxSyncNotice && (
                     <div className={fxSyncNotice.status === 'ok' ? 'text-emerald-700' : fxSyncNotice.status === 'warn' ? 'text-amber-700' : 'text-red-700'}>
                       FX: {fxSyncNotice.message}
@@ -3118,7 +3192,7 @@ export const Settings: React.FC = () => {
             ) : (
               <>
                 {import.meta.env.DEV && (
-                  <div className="bg-amber-50 p-4 rounded-2xl border border-amber-200 shadow-sm">
+                  <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-4">
                     <div className="flex items-center justify-between">
                       <div>
                         <div className="text-xs font-bold uppercase text-amber-700">Dev Tools</div>
@@ -3208,7 +3282,7 @@ export const Settings: React.FC = () => {
       </div>
 
       {/* DANGER ZONE */}
-      <div className="bg-red-50 p-8 rounded-2xl shadow-sm border border-red-200">
+      <div className="ui-panel-subtle border-red-200 bg-red-50 p-8">
         <h2 className="text-lg font-bold text-red-700 mb-2 flex items-center gap-2">
           <span className="material-symbols-outlined">warning</span>
           Zona Pericolo
@@ -3329,6 +3403,15 @@ export const Settings: React.FC = () => {
     </div>
   );
 };
+
+
+
+
+
+
+
+
+
 
 
 

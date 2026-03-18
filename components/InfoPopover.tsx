@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+﻿import React, { useEffect, useRef, useState } from 'react';
 
 interface InfoPopoverProps {
   title: string;
@@ -70,7 +70,7 @@ export const InfoPopover: React.FC<InfoPopoverProps> = ({
       {open && (
         <div
           ref={popoverRef}
-          className={`absolute right-0 mt-2 w-80 z-50 bg-white border border-borderSoft rounded-xl shadow-xl p-4 text-sm text-slate-800 ${popoverClassName || ''}`}
+          className={`absolute right-0 mt-2 w-80 z-50 ui-panel-subtle p-4 text-sm text-slate-800 ${popoverClassName || ''}`}
         >
           <div className="flex items-start justify-between gap-2 mb-2">
             <div className="font-bold text-slate-900">{title}</div>
@@ -89,3 +89,4 @@ export const InfoPopover: React.FC<InfoPopoverProps> = ({
     </div>
   );
 };
+

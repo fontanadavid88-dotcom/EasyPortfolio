@@ -55,6 +55,9 @@ export default defineConfig(() => {
     react(),
     VitePWA({
       registerType: 'autoUpdate',
+      devOptions: {
+        enabled: false
+      },
       includeAssets: ['favicon.svg'],
       manifest: {
         name: 'EasyPortfolio',

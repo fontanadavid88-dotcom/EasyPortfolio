@@ -1,5 +1,5 @@
 import Dexie, { Table, Transaction as DexieTransaction } from 'dexie';
-import { Instrument, Transaction, PricePoint, MacroIndicator, AppSettings, Currency, AssetType, TransactionType, AssetClass } from './types';
+import { Instrument, Transaction, PricePoint, MacroIndicator, AppSettings, Currency, AssetType, TransactionType, AssetClass, RebalancePlan } from './types';
 import { subDays, format } from 'date-fns';
 
 export class PortfolioDB extends Dexie {
@@ -11,6 +11,7 @@ export class PortfolioDB extends Dexie {
   portfolios!: Table<{ id?: number; portfolioId: string; name: string }>;
   instrumentListings!: Table<{ id?: number; isin: string; exchangeCode: string; symbol: string; currency: Currency; name?: string; portfolioId?: string }>;
   fxRates!: Table<{ id?: number; baseCurrency: Currency; quoteCurrency: Currency; date: string; rate: number; source?: string }>;
+  rebalancePlans!: Table<RebalancePlan>;
 
   constructor() {
     super('EasyPortfolioDB');
@@ -89,6 +90,53 @@ export class PortfolioDB extends Dexie {
     }).upgrade((tx: DexieTransaction) => {
       tx.table('instruments').toCollection().modify((obj: any) => {
         obj.regionAllocation = obj.regionAllocation || null;
+      });
+    });
+
+    (this as any).version(6).stores({
+      instruments: '++id, ticker, type, portfolioId, isin, assetClass, regionAllocation',
+      transactions: '++id, date, instrumentTicker, type, account, portfolioId',
+      prices: '++id, [ticker+date], date, portfolioId',
+      macro: '++id, date, portfolioId',
+      settings: '++id, portfolioId',
+      portfolios: '++id, portfolioId',
+      instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
+      fxRates: '++id, [baseCurrency+quoteCurrency+date]',
+      rebalancePlans: 'id, portfolioId, createdAt'
+    });
+
+    (this as any).version(7).stores({
+      instruments: '++id, ticker, type, portfolioId, isin, assetClass, regionAllocation',
+      transactions: '++id, date, instrumentTicker, type, account, portfolioId',
+      prices: '++id, [ticker+date], [instrumentId+date], date, portfolioId',
+      macro: '++id, date, portfolioId',
+      settings: '++id, portfolioId',
+      portfolios: '++id, portfolioId',
+      instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
+      fxRates: '++id, [baseCurrency+quoteCurrency+date]',
+      rebalancePlans: 'id, portfolioId, createdAt'
+    }).upgrade(async (tx: DexieTransaction) => {
+      const instruments = await tx.table('instruments').toArray();
+      const instrumentMap = new Map<string, string>();
+      const addKey = (portfolioId: string, key?: string, id?: number) => {
+        if (!key || id === undefined || id === null) return;
+        instrumentMap.set(`${portfolioId}::${key}`, String(id));
+      };
+      for (const inst of instruments as Array<Instrument>) {
+        const portfolioId = inst.portfolioId || 'default';
+        addKey(portfolioId, inst.ticker, inst.id);
+        addKey(portfolioId, inst.symbol, inst.id);
+        addKey(portfolioId, inst.preferredListing?.symbol, inst.id);
+        if (Array.isArray(inst.listings)) {
+          inst.listings.forEach(listing => addKey(portfolioId, listing?.symbol, inst.id));
+        }
+      }
+      await tx.table('prices').toCollection().modify((obj: any) => {
+        if (obj.instrumentId) return;
+        const portfolioId = obj.portfolioId || 'default';
+        const key = `${portfolioId}::${obj.ticker}`;
+        const instrumentId = instrumentMap.get(key);
+        if (instrumentId) obj.instrumentId = instrumentId;
       });
     });
   }

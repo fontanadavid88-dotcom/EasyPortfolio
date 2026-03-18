@@ -19,6 +19,7 @@ import {
   ReferenceLine
 } from 'recharts';
 import { MacroGauge } from '../components/MacroGauge';
+import { DataStatusBar } from '../components/DataStatusBar';
 import { DEFAULT_INDICATORS, computeMacroIndex, mapIndexToPhase } from '../services/macroService';
 import { db, getCurrentPortfolioId } from '../db';
 import {
@@ -1466,6 +1467,14 @@ export const Report: React.FC = () => {
       </style>
 
       <div className="report-workspace">
+        <div className="no-print" style={{ marginBottom: 10 }}>
+          <DataStatusBar
+            portfolioId={currentPortfolioId}
+            transactions={transactions || []}
+            instruments={instruments || []}
+            prices={prices || []}
+          />
+        </div>
         <div className="report-pages">
           <div className="no-print report-actions">
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>

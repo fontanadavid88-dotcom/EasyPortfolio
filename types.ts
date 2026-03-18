@@ -52,6 +52,7 @@ export interface Instrument {
   listings?: InstrumentListing[];
   assetClass?: AssetClass;
   regionAllocation?: Partial<Record<RegionKey, number>>;
+  tradePrecisionDecimals?: number;
 }
 
 export interface InstrumentListing {
@@ -90,6 +91,7 @@ export interface Transaction {
 export interface PricePoint {
   id?: number;
   portfolioId?: string;
+  instrumentId?: string;
   ticker: string;
   date: string; // YYYY-MM-DD
   close: number;
@@ -108,6 +110,31 @@ export interface MacroIndicator {
 export enum RebalanceStrategy {
   Accumulate = 'Accumulate', // Buy only
   Maintain = 'Maintain' // Sell high, buy low
+}
+
+export type RebalancePlanItem = {
+  ticker: string;
+  action: 'COMPRA' | 'VENDI' | 'NEUTRO';
+  amountBase?: number;
+  units?: number;
+  instrumentCurrency?: string;
+  price?: number;
+  priceCurrency?: string;
+  fxUsed?: Record<string, number>;
+  reason?: string;
+};
+
+export interface RebalancePlan {
+  id?: string;
+  portfolioId: string;
+  createdAt: number;
+  valuationDate?: string;
+  baseCurrency?: string;
+  strategy?: string;
+  totalAmount?: number;
+  items: RebalancePlanItem[];
+  label?: string;
+  notes?: string;
 }
 
 export interface AppSettings {

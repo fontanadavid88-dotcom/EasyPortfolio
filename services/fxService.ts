@@ -309,7 +309,7 @@ export const backfillFxRatesForPortfolio = async (
     return { ...summary, status: 'error', message: 'Impostazioni mancanti' };
   }
   const eodhdKey = apiKeyOverride?.trim() || settings.eodhdApiKey?.trim() || '';
-  const allowDirectFallback = options?.allowDirectFallback ?? true;
+  const allowDirectFallback = options?.allowDirectFallback ?? (typeof window === 'undefined');
   const health = await checkProxyHealth({ eodhdApiKey: eodhdKey });
   if (!health.ok && health.mode !== 'direct-local-key') {
     return { ...summary, status: 'proxy_unreachable', message: health.message || PROXY_HELP_MESSAGE };

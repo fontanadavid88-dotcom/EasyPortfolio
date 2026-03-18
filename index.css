@@ -128,22 +128,97 @@ body::after {
     @apply w-full border border-slate-200 bg-white text-slate-900 placeholder:text-slate-400 rounded-lg px-2 py-1 text-xs focus:ring-2 focus:ring-primary focus:outline-none;
   }
   .ui-btn-primary {
-    @apply bg-primary text-white px-4 py-2 rounded-lg font-bold hover:bg-blue-600 transition focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-transparent;
+    @apply bg-primary text-white px-4 py-2 rounded-lg font-bold hover:bg-blue-600 transition focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-transparent disabled:opacity-60 disabled:cursor-not-allowed min-h-[40px];
   }
   .ui-btn-secondary {
-    @apply bg-white text-slate-900 border border-slate-200 px-4 py-2 rounded-lg font-bold hover:bg-slate-50 transition;
+    @apply bg-white text-slate-900 border border-slate-200 px-4 py-2 rounded-lg font-bold hover:bg-slate-50 transition focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-transparent disabled:opacity-60 disabled:cursor-not-allowed min-h-[40px];
   }
   .ui-btn-ghost {
-    @apply text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition;
+    @apply text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-transparent disabled:opacity-60 disabled:cursor-not-allowed min-h-[36px];
+  }
+  .ui-accent-top {
+    position: relative;
+    overflow: hidden;
+  }
+  .ui-accent-top::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 6px;
+    background: var(--accent-color, #0052a3);
+    border-top-left-radius: 1rem;
+    border-top-right-radius: 1rem;
+    opacity: 0;
+    transition: opacity 0.18s ease;
+    pointer-events: none;
+  }
+  .ui-accent-top:hover::before {
+    opacity: 1;
+  }
+  .ui-accent-top-active::before {
+    opacity: 1;
+  }
+  .ui-kpi {
+    @apply transition-all;
+    position: relative;
+    overflow: hidden;
+  }
+  .ui-kpi:hover {
+    border-color: rgba(0, 82, 163, 0.28);
+    box-shadow: 0 16px 38px rgba(0, 82, 163, 0.16), 0 6px 18px rgba(15, 23, 42, 0.08);
+  }
+  .ui-kpi-active {
+    border-color: rgba(0, 82, 163, 0.35);
+    box-shadow: 0 18px 44px rgba(0, 82, 163, 0.2), 0 8px 20px rgba(15, 23, 42, 0.1);
+  }
+  .rebalance-emph-cell {
+    font-size: 1.05rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    background-color: rgba(29, 78, 216, 0.04);
+    padding: 0.2rem 0.5rem;
+    border-radius: 0.5rem;
+    display: inline-block;
+    white-space: nowrap;
+  }
+  .rebalance-emph-col {
+    background-color: rgba(15, 23, 42, 0.02);
+  }
+  .rebalance-action-chip {
+    @apply inline-flex items-center px-3 py-1 rounded-lg border uppercase tracking-wider whitespace-nowrap;
+    font-size: 1.05rem;
+    font-weight: 700;
+  }
+  .rebalance-action-buy {
+    @apply bg-emerald-50 text-emerald-700 border-emerald-200;
+  }
+  .rebalance-action-sell {
+    @apply bg-rose-50 text-rose-700 border-rose-200;
+  }
+  .rebalance-action-neutral {
+    @apply bg-slate-100 text-slate-600 border-slate-200;
+  }
+  .rebalance-row-active {
+    box-shadow: inset 4px 0 0 rgba(0, 82, 163, 0.28);
   }
 }
 
 /* Recharts readability on dark panels */
 .recharts-cartesian-axis-tick text {
-  fill: rgba(100, 116, 139, 0.9);
+  fill: rgba(15, 23, 42, 0.92);
+}
+.recharts-label,
+.recharts-text,
+.recharts-legend-item-text {
+  fill: rgba(15, 23, 42, 0.92);
+}
+.recharts-cartesian-axis line {
+  stroke: rgba(148, 163, 184, 0.5);
 }
 .recharts-cartesian-grid line {
-  stroke: rgba(148, 163, 184, 0.35);
+  stroke: rgba(148, 163, 184, 0.45);
 }
 .recharts-default-tooltip {
   background-color: rgba(255, 255, 255, 0.98) !important;

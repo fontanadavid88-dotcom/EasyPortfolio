@@ -49,6 +49,19 @@ Remove-Item Env:NODE_OPTIONS
 **Script sicuro**
 - Usa `npm run vercel:dev` (alias di `vercel:dev:safe`) per avviare `vercel dev` con `NODE_OPTIONS` forzato a vuoto anche su PC aziendali.
 
+## Troubleshooting Chrome (proxy gestito dall'IT)
+
+**Sintomo**
+- `localhost:3000` non si apre in Chrome, ma funziona in Firefox.
+
+**Causa**
+- Chrome forza il traffico locale attraverso il proxy aziendale, che blocca/buca il loopback.
+
+**Workaround**
+- Usa Firefox per lo sviluppo.
+- In alternativa apri `http://127.0.0.1:3000` o `http://[::1]:3000` (spesso bypassa il proxy).
+- Se Chrome ha un Service Worker PWA bloccato, rimuovilo da DevTools → Application → Service Workers.
+
 ## Vercel deploy checklist
 
 - Imposta `EODHD_API_KEY` sia su **Preview** che **Production**.

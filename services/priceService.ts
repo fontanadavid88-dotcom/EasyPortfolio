@@ -466,6 +466,11 @@ class EodhdPriceProvider implements PriceProvider {
   }
 }
 
+export const fetchLatestEodhdPrice = async (ticker: string, apiKey?: string): Promise<Partial<PricePoint> | null> => {
+  const provider = new EodhdPriceProvider(apiKey);
+  return provider.getLatestPrice(ticker);
+};
+
 export const mapEodhdHistoryRows = (ticker: string, data: unknown[]): PricePoint[] => {
   return data
     .map((row: any) => {
@@ -674,11 +679,21 @@ export const syncPrices = async (
   const portfolioId = options?.portfolioId || getCurrentPortfolioId();
   const mode = options?.mode || 'FULL';
   const latestOnly = mode === 'LATEST';
+  const persistSyncMeta = (status?: string) => {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(`prices:lastSyncAt:${portfolioId}`, new Date().toISOString());
+      localStorage.setItem(`prices:lastSyncStatus:${portfolioId}`, status || 'ok');
+    } catch {
+      // ignore localStorage failures
+    }
+  };
   let settings = await db.settings.where('portfolioId').equals(portfolioId).first();
   if (!settings) {
     summary.status = 'error';
     summary.failedTickers.push({ ticker: '*', reason: 'Impostazioni mancanti' });
     summary.sheet = { enabled: false, reason: 'Impostazioni mancanti' };
+    persistSyncMeta(summary.status);
     return summary;
   }
 
@@ -751,11 +766,13 @@ export const syncPrices = async (
     if (proxyFailure) {
       summary.status = proxyFailure.status;
       summary.message = proxyFailure.message;
+      persistSyncMeta(summary.status);
       return summary;
     }
     if (!proxyHealth.hasEodhdKey && !proxyHealth.usingLocalKey) {
       summary.status = 'error';
       summary.message = EODHD_MISSING_KEY_MESSAGE;
+      persistSyncMeta(summary.status);
       return summary;
     }
   }
@@ -930,11 +947,14 @@ export const syncPrices = async (
     }
   }
 
-  if (summary.status === 'quota_exhausted' || summary.status === 'proxy_unreachable') return summary;
+  if (summary.status === 'quota_exhausted' || summary.status === 'proxy_unreachable') {
+    persistSyncMeta(summary.status);
+    return summary;
+  }
   if (summary.failedTickers.length > 0) {
     summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
   }
-
+  persistSyncMeta(summary.status);
   return summary;
 };
 
@@ -1064,6 +1084,14 @@ export const backfillPricesForPortfolio = async (
   options?: BackfillOptions
 ): Promise<BackfillSummary> => {
   const summary: BackfillSummary = { status: 'ok', updatedTickers: [], skipped: 0, stoppedByBudget: false, mode: options?.mode || 'MANUAL_FULL' };
+  const persistBackfillAt = () => {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(`prices:lastBackfillAt:${portfolioId}`, new Date().toISOString());
+    } catch {
+      // ignore localStorage failures
+    }
+  };
   let settings = await db.settings.where('portfolioId').equals(portfolioId).first();
   if (!settings) {
     const msg = 'Impostazioni mancanti';
@@ -1398,6 +1426,7 @@ export const backfillPricesForPortfolio = async (
     }
   }
   if (onProgress) onProgress({ ticker: '', index: filtered.length, total: filtered.length, phase: 'done' });
+  persistBackfillAt();
   return summary;
 };
 

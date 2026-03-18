@@ -1,10 +1,12 @@
-﻿import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly, getCanonicalTicker } from '../services/financeUtils';
+import { calculateHoldings, calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly, getCanonicalTicker } from '../services/financeUtils';
 import { DEFAULT_INDICATORS, computeMacroIndex, mapIndexToPhase, MacroIndicatorConfig } from '../services/macroService';
-import { queryPriceBoundsForTickers, queryPricesForTickersRange } from '../services/dbQueries';
+import { queryFxForPairsRange, queryLatestFxForPairs, queryLatestPricesForTickers, queryPriceBoundsForTickers, queryPricesForTickersRange } from '../services/dbQueries';
+import { runGapFill, runLatestSync } from '../services/syncActionsService';
 import { downsampleSeries } from '../services/chartUtils';
+import { computeSyncStatus, getFxPairsForHoldings, getHoldingsTickers, getLastGapFillAt, getLastLatestSyncAt } from '../services/syncStatusService';
 import {
   PRIMARY_BLUE,
   ACCENT_ORANGE,
@@ -23,17 +25,21 @@ import {
 import { format, subMonths } from 'date-fns';
 import clsx from 'clsx';
 import { InfoPopover } from '../components/InfoPopover';
-import { RegionKey } from '../types';
+import { DataStatusBar } from '../components/DataStatusBar';
+import { Currency, RegionKey } from '../types';
 
 // --- Sub-Components ---
 
 const KPICard = ({ title, value, subValue, highlight = false, alert = false }: { title: string, value: string, subValue?: string, highlight?: boolean, alert?: boolean }) => (
-  <div className="ui-panel p-5 flex flex-col justify-between h-32 transition-transform hover:-translate-y-1 duration-300 relative overflow-hidden group">
+  <div
+    className="ui-panel ui-kpi ui-accent-top p-5 flex flex-col justify-between h-32 transition-all duration-300 hover:-translate-y-0.5 relative overflow-hidden group"
+    style={{ ['--accent-color' as any]: alert ? NEGATIVE_RED : PRIMARY_BLUE }}
+  >
     {/* Glow Effect */}
     <div className="absolute top-0 right-0 w-20 h-20 bg-[#0052a3]/5 rounded-full blur-xl -mr-10 -mt-10 transition-opacity group-hover:opacity-100 opacity-50" />
 
     <div className="flex justify-between items-start z-10">
-      <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wider">{title}</span>
+      <span className="text-[11px] font-semibold text-slate-700 uppercase tracking-wider">{title}</span>
       {highlight && <span className="w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(249,115,22,0.6)]" style={{ backgroundColor: ACCENT_ORANGE }}></span>}
       {alert && <span className="w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(220,38,38,0.6)]" style={{ backgroundColor: NEGATIVE_RED }}></span>}
     </div>
@@ -60,6 +66,18 @@ const REGION_BUBBLE_POSITIONS: Record<Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>
   AF: { x: 245.9, y: 129.8 },   // Africa
   OC: { x: 404.4, y: 152.3 }    // Oceania
 };
+
+const REGION_COLORS: Record<Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>, string> = {
+  NA: COLORS[0],
+  LATAM: COLORS[1],
+  EU: COLORS[2],
+  CH: COLORS[3],
+  AS: COLORS[4],
+  AF: COLORS[5],
+  OC: COLORS[6]
+};
+
+const getRegionColor = (rk: Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>) => REGION_COLORS[rk] || PRIMARY_BLUE;
 
 const CHART_DOWNSAMPLE_THRESHOLD = 1200;
 
@@ -138,7 +156,7 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
         onMouseLeave={handleMouseUp}
       >
         <image href="/World-map.png" x="0" y="0" width="520" height="240" preserveAspectRatio="none" />
-        {fullData.map((d, idx) => {
+        {fullData.map((d) => {
           const pos = draftPositions[d.region];
           const radiusBase = 8;
           const radius = maxPct > 0 ? radiusBase + (d.pct / maxPct) * 20 : radiusBase;
@@ -148,7 +166,7 @@ const RegionBubbleMap = ({ data }: { data: { region: RegionKey; label: string; p
                 cx={pos.x}
                 cy={pos.y}
                 r={radius}
-                fill={COLORS[idx % COLORS.length]}
+                fill={getRegionColor(d.region)}
                 fillOpacity={0.85}
                 stroke="white"
                 strokeWidth="2"
@@ -209,6 +227,27 @@ export const Dashboard: React.FC = () => {
     [currentPortfolioId],
     []
   );
+  const settings = useLiveQuery(
+    () => db.settings.where('portfolioId').equals(currentPortfolioId).first(),
+    [currentPortfolioId]
+  );
+
+  const [latestSyncRunning, setLatestSyncRunning] = useState(false);
+  const [gapFillRunning, setGapFillRunning] = useState(false);
+  const [latestSyncStatus, setLatestSyncStatus] = useState('');
+  const [gapFillStatus, setGapFillStatus] = useState('');
+  const [lastLatestSyncAt, setLastLatestSyncAtState] = useState<string | null>(() => getLastLatestSyncAt(currentPortfolioId));
+  const [lastGapFillAt, setLastGapFillAtState] = useState<string | null>(() => getLastGapFillAt(currentPortfolioId));
+
+  useEffect(() => {
+    setLastLatestSyncAtState(getLastLatestSyncAt(currentPortfolioId));
+    setLastGapFillAtState(getLastGapFillAt(currentPortfolioId));
+  }, [currentPortfolioId]);
+
+  const holdings = useMemo(() => {
+    if (!transactions) return new Map<string, number>();
+    return calculateHoldings(transactions);
+  }, [transactions]);
 
   const priceTickers = useMemo(() => {
     const set = new Set<string>();
@@ -221,6 +260,14 @@ export const Dashboard: React.FC = () => {
     });
     return Array.from(set.values());
   }, [transactions, instruments]);
+  const baseCurrency = settings?.baseCurrency || Currency.CHF;
+  const holdingTickers = useMemo(() => getHoldingsTickers(holdings), [holdings]);
+  const holdingTickersKey = useMemo(() => holdingTickers.slice().sort().join('|'), [holdingTickers]);
+  const fxPairs = useMemo(
+    () => getFxPairsForHoldings(holdings, instruments || [], baseCurrency),
+    [holdings, instruments, baseCurrency]
+  );
+  const fxPairsKey = useMemo(() => fxPairs.slice().sort().join('|'), [fxPairs]);
 
   const priceTickersKey = useMemo(() => priceTickers.slice().sort().join('|'), [priceTickers]);
 
@@ -277,6 +324,51 @@ export const Dashboard: React.FC = () => {
     []
   );
 
+
+  const latestPrices = useLiveQuery(
+    () => {
+      if (!holdingTickers.length) return Promise.resolve([]);
+      return queryLatestPricesForTickers({
+        portfolioId: currentPortfolioId,
+        tickers: holdingTickers,
+        upToDate: priceQueryEnd || undefined
+      });
+    },
+    [currentPortfolioId, holdingTickersKey, priceQueryEnd],
+    []
+  );
+
+  const latestFx = useLiveQuery(
+    () => {
+      if (!fxPairs.length) return Promise.resolve([]);
+      return queryLatestFxForPairs({ pairs: fxPairs, upToDate: priceQueryEnd || undefined });
+    },
+    [fxPairsKey, priceQueryEnd],
+    []
+  );
+
+  const fxRatesRange = useLiveQuery(
+    () => {
+      if (!fxPairs.length || !priceQueryStart || !priceQueryEnd) return Promise.resolve([]);
+      return queryFxForPairsRange({ pairs: fxPairs, startDate: priceQueryStart, endDate: priceQueryEnd });
+    },
+    [fxPairsKey, priceQueryStart, priceQueryEnd],
+    []
+  );
+
+  const syncStatus = useMemo(() => {
+    return computeSyncStatus({
+      baseCurrency,
+      holdings,
+      instruments: instruments || [],
+      latestPrices: latestPrices || [],
+      latestFx: latestFx || [],
+      prices: prices || [],
+      fxRates: fxRatesRange || [],
+      valuationDate: priceQueryEnd || undefined,
+      today: format(new Date(), 'yyyy-MM-dd')
+    });
+  }, [baseCurrency, holdings, instruments, latestPrices, latestFx, prices, fxRatesRange, priceQueryEnd]);
   const hasTransactions = (transactions?.length || 0) > 0;
   const hasAnyPrices = (prices?.length || 0) > 0;
 
@@ -569,6 +661,8 @@ export const Dashboard: React.FC = () => {
   const regionData = useMemo(() => regionExposure.filter(r => r.region !== 'UNASSIGNED'), [regionExposure]);
   const unassignedRegion = useMemo(() => regionExposure.find(r => r.region === 'UNASSIGNED'), [regionExposure]);
   const hasIncompleteRegionData = !!(unassignedRegion && unassignedRegion.value > 0);
+  const regionPctSum = useMemo(() => regionData.reduce((sum, r) => sum + (r.pct || 0), 0), [regionData]);
+  const hasRegionPctWarning = regionData.length > 0 && Math.abs(regionPctSum - 100) > 0.5;
 
   // 3. Annual Returns (Full History)
   const annualReturns = useMemo(() => {
@@ -605,6 +699,77 @@ export const Dashboard: React.FC = () => {
   const maxDrawdownValue = analytics?.maxDrawdown ?? 0;
   const chartGranularityLabel = chartGranularity === 'monthly' ? 'Monthly' : 'Daily';
   const kpiGranularityLabel = kpiGranularity === 'monthly' ? 'Monthly' : 'Daily';
+  const handleLatestSync = async () => {
+    if (latestSyncRunning) return;
+    if (!settings) {
+      setLatestSyncStatus('Impostazioni mancanti.');
+      return;
+    }
+    setLatestSyncRunning(true);
+    setLatestSyncStatus('Aggiornamento in corso...');
+    try {
+      const outcome = await runLatestSync({
+        portfolioId: currentPortfolioId,
+        settings,
+        baseCurrency
+      });
+      if (outcome.latestSyncAt) {
+        setLastLatestSyncAtState(outcome.latestSyncAt);
+      }
+      const fxLabel = outcome.fx?.disabled
+        ? 'FX: Apps Script off'
+        : outcome.fx?.ok
+          ? `FX ${outcome.fx.count ?? 0}`
+          : `FX: ${outcome.fx?.error || 'errore'}`;
+      const sheetCount = outcome.updatedSheetTickers.length;
+      const fallbackCount = outcome.updatedFallbackTickers.length;
+      const missing = outcome.missingTickers;
+      const updatedLabel = `Aggiornato: ${sheetCount} (Sheet)${fallbackCount ? ` + ${fallbackCount} (EODHD fallback)` : ''}`;
+      const missingLabel = missing.length
+        ? `Mancanti: ${missing.slice(0, 4).join(', ')}${missing.length > 4 ? '...' : ''}`
+        : 'Mancanti: -';
+      const summary = `${updatedLabel}. ${missingLabel}`;
+      if (outcome.priceResult.status === 'ok' || outcome.priceResult.status === 'partial') {
+        setLatestSyncStatus(`${summary}${fxLabel ? ` · ${fxLabel}` : ''}`);
+      } else {
+        setLatestSyncStatus(outcome.priceResult.message || 'Aggiornamento incompleto');
+      }
+    } catch (e: any) {
+      setLatestSyncStatus(e?.message || 'Errore aggiornamento dati.');
+    } finally {
+      setLatestSyncRunning(false);
+    }
+  };
+
+  const handleGapFill = async () => {
+    if (gapFillRunning) return;
+    if (!settings) {
+      setGapFillStatus('Impostazioni mancanti.');
+      return;
+    }
+    setGapFillRunning(true);
+    setGapFillStatus('Avvio gap-fill...');
+    try {
+      const outcome = await runGapFill({
+        portfolioId: currentPortfolioId,
+        settings,
+        baseCurrency,
+        onProgress: setGapFillStatus
+      });
+      if (outcome.gapFillAt) {
+        setLastGapFillAtState(outcome.gapFillAt);
+      }
+      if (outcome.ok) {
+        setGapFillStatus('Gap-fill completato.');
+      } else {
+        setGapFillStatus(outcome.priceResult.message || 'Gap-fill non completato');
+      }
+    } catch (e: any) {
+      setGapFillStatus(e?.message || 'Errore gap-fill.');
+    } finally {
+      setGapFillRunning(false);
+    }
+  };
 
 
   return (
@@ -621,6 +786,86 @@ export const Dashboard: React.FC = () => {
         </a>
       </div>
 
+      <DataStatusBar
+        portfolioId={currentPortfolioId}
+        transactions={transactions || []}
+        instruments={instruments || []}
+        prices={prices || []}
+      />
+
+      <div className="ui-panel p-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex flex-wrap gap-6">
+            <div className="flex items-start gap-2">
+              <span className={clsx('mt-1 h-2.5 w-2.5 rounded-full', syncStatus.latestPricesOk ? 'bg-emerald-500' : 'bg-amber-400')} />
+              <div>
+                <div className="text-xs font-bold text-slate-700">Prezzi latest (Sheet)</div>
+                <div className="text-[11px] text-slate-500">
+                  Ultimo: {syncStatus.latestPricesAt || '—'} · {syncStatus.priceCoverage.ok}/{syncStatus.priceCoverage.total}
+                </div>
+                {syncStatus.missingTickers.length > 0 && (
+                  <div className="text-[11px] text-amber-700">
+                    Mancanti: {syncStatus.missingTickers.slice(0, 4).join(', ')}{syncStatus.missingTickers.length > 4 ? '…' : ''}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className={clsx('mt-1 h-2.5 w-2.5 rounded-full', syncStatus.latestFxOk ? 'bg-emerald-500' : 'bg-amber-400')} />
+              <div>
+                <div className="text-xs font-bold text-slate-700">FX latest (Sheet)</div>
+                <div className="text-[11px] text-slate-500">Ultimo: {syncStatus.latestFxAt || '—'}</div>
+                {syncStatus.missingPairs.length > 0 && (
+                  <div className="text-[11px] text-amber-700">
+                    Coppie mancanti: {syncStatus.missingPairs.slice(0, 3).join(', ')}{syncStatus.missingPairs.length > 3 ? '…' : ''}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex items-start gap-2">
+              <span className={clsx('mt-1 h-2.5 w-2.5 rounded-full', syncStatus.quality.ok ? 'bg-emerald-500' : 'bg-amber-400')} />
+              <div>
+                <div className="text-xs font-bold text-slate-700">Data Quality</div>
+                <div className="text-[11px] text-slate-500">
+                  Missing prezzi: {syncStatus.quality.missingPrices} · Missing FX: {syncStatus.quality.missingFx}
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  Mismatch valuta: {syncStatus.quality.currencyMismatch} · Stale: {syncStatus.quality.stale}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2 min-w-[220px]">
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={handleLatestSync}
+                disabled={latestSyncRunning}
+                className="ui-btn-primary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-60"
+              >
+                {latestSyncRunning ? 'Aggiorno...' : 'Aggiorna oggi'}
+              </button>
+              <button
+                type="button"
+                onClick={handleGapFill}
+                disabled={gapFillRunning || !settings?.eodhdApiKey?.trim()}
+                className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-60"
+              >
+                {gapFillRunning ? 'Riempiendo...' : 'Riempi buchi'}
+              </button>
+            </div>
+            <div className="text-[11px] text-slate-500">
+              Ultimo sync: {lastLatestSyncAt ? new Date(lastLatestSyncAt).toLocaleString('it-IT') : 'mai'} · Gap-fill: {lastGapFillAt ? new Date(lastGapFillAt).toLocaleString('it-IT') : 'mai'}
+            </div>
+            {(latestSyncStatus || gapFillStatus) && (
+              <div className="text-[11px] text-slate-600">
+                {latestSyncStatus ? `Sync: ${latestSyncStatus}` : ''}{latestSyncStatus && gapFillStatus ? ' · ' : ''}{gapFillStatus ? `Gap: ${gapFillStatus}` : ''}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
       {!hasTransactions && (
         <div className="ui-panel p-5">
           <div className="text-sm font-bold text-slate-900">Start here</div>
@@ -645,7 +890,7 @@ export const Dashboard: React.FC = () => {
       )}
 
       {hasTransactions && hasIncompleteData && (
-        <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5 text-xs text-amber-900">
+        <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-5 text-xs text-amber-900">
           <div className="font-bold">Dati incompleti per prezzi/FX</div>
           <div className="text-amber-800 mt-1">
             Alcuni prezzi o tassi FX mancano/sono datati. Aggiorna i dati per sbloccare KPI e grafici.
@@ -703,76 +948,6 @@ export const Dashboard: React.FC = () => {
           />
       </div>
 
-      {/* GLOBAL FILTERS TOOLBAR */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 py-4 px-4 sticky top-[75px] ui-panel-dense z-20 mb-6 mx-0.5">
-        <h2 className="text-lg font-bold text-slate-900 hidden md:block pl-2">Analisi Temporale</h2>
-        <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
-          {/* Metric Toggle (BLUE) */}
-          <div className="flex ui-panel-subtle p-1">
-            {(['PERF', 'TWRR', 'MWRR'] as const).map(m => (
-              <button
-                key={m}
-                onClick={() => setMetric(m)}
-                className={clsx(
-                  "px-4 py-1.5 rounded-lg text-xs font-bold transition-all",
-                  metric === m ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-                )}
-              >
-                {m === 'PERF' ? 'Valore' : m}
-              </button>
-            ))}
-          </div>
-
-          {/* Value/Performance Toggle */}
-          <div className={clsx(
-            "flex ui-panel-subtle p-1",
-            metric !== 'PERF' && "opacity-60 pointer-events-none"
-          )}>
-            {([
-              { key: 'NAV', label: 'Valore (NAV)' },
-              { key: 'PERF_INDEX', label: 'Performance' }
-            ] as const).map(option => (
-              <button
-                key={option.key}
-                onClick={() => setValueMode(option.key)}
-                className={clsx(
-                  "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
-                  valueMode === option.key ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-                )}
-                title={option.key === 'PERF_INDEX' ? 'Indice 100 rebased sul range' : 'NAV in valuta base'}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Time Toggle (ORANGE ACCENT) */}
-          <div className="flex ui-panel-subtle p-1 overflow-x-auto no-scrollbar">
-            {(['3M', '6M', '1Y', '5Y', 'YTD', 'MAX'] as const).map(t => (
-              <button
-                key={t}
-                onClick={() => setTimeRange(t)}
-                className={clsx(
-                  "px-3 py-1.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap",
-                  timeRange === t ? "text-white shadow-md bg-[#f97316]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-                )}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="text-[11px] text-slate-600 mt-2 md:mt-0 md:ml-auto">
-          {`Chart: ${chartGranularityLabel} (KPI: ${kpiGranularityLabel})`}
-          {kpiGranularity === 'monthly' && (
-            <span className="ml-2 px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">KPI Monthly</span>
-          )}
-          {metric === 'PERF' && valueMode === 'PERF_INDEX' && !hasPerfBase && (
-            <span className="ml-2 text-amber-300 font-bold">Base NAV non disponibile</span>
-          )}
-        </div>
-      </div>
-
       {/* ROW 2: Performance Chart */}
       <div className="ui-panel p-6 relative">
         <div className="flex items-start justify-between mb-4">
@@ -793,6 +968,77 @@ export const Dashboard: React.FC = () => {
               </div>
             )}
           />
+        </div>
+
+        <div className="ui-panel-subtle p-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-4">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] font-semibold text-slate-700 uppercase tracking-wide">Analisi Temporale</span>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-3 w-full lg:w-auto">
+            {/* Metric Toggle (BLUE) */}
+            <div className="flex ui-panel-subtle p-1">
+              {(['PERF', 'TWRR', 'MWRR'] as const).map(m => (
+                <button
+                  key={m}
+                  onClick={() => setMetric(m)}
+                  className={clsx(
+                    "px-4 py-1.5 rounded-lg text-xs font-bold transition-all",
+                    metric === m ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+                  )}
+                >
+                  {m === 'PERF' ? 'Valore' : m}
+                </button>
+              ))}
+            </div>
+
+            {/* Value/Performance Toggle */}
+            <div className={clsx(
+              "flex ui-panel-subtle p-1",
+              metric !== 'PERF' && "opacity-60 pointer-events-none"
+            )}>
+              {([
+                { key: 'NAV', label: 'Valore (NAV)' },
+                { key: 'PERF_INDEX', label: 'Performance' }
+              ] as const).map(option => (
+                <button
+                  key={option.key}
+                  onClick={() => setValueMode(option.key)}
+                  className={clsx(
+                    "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
+                    valueMode === option.key ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+                  )}
+                  title={option.key === 'PERF_INDEX' ? 'Indice 100 rebased sul range' : 'NAV in valuta base'}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Time Toggle (ORANGE ACCENT) */}
+            <div className="flex ui-panel-subtle p-1 overflow-x-auto no-scrollbar">
+              {(['3M', '6M', '1Y', '5Y', 'YTD', 'MAX'] as const).map(t => (
+                <button
+                  key={t}
+                  onClick={() => setTimeRange(t)}
+                  className={clsx(
+                    "px-3 py-1.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap",
+                    timeRange === t ? "text-white shadow-md bg-[#f97316]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+                  )}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="text-[11px] text-slate-600 lg:ml-auto">
+            {`Chart: ${chartGranularityLabel} (KPI: ${kpiGranularityLabel})`}
+            {kpiGranularity === 'monthly' && (
+              <span className="ml-2 px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">KPI Monthly</span>
+            )}
+            {metric === 'PERF' && valueMode === 'PERF_INDEX' && !hasPerfBase && (
+              <span className="ml-2 text-amber-300 font-bold">Base NAV non disponibile</span>
+            )}
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
@@ -934,14 +1180,22 @@ export const Dashboard: React.FC = () => {
                     dataKey="returnPct"
                     formatter={(val: number) => `${val >= 0 ? '+' : ''}${val.toFixed(1)}%`}
                     position="top"
-                    className="text-[11px] font-bold fill-slate-200"
                     content={(props) => {
                       const { x, y, value } = props as any;
                       if (value === undefined || x === undefined || y === undefined) return null;
                       const val = Number(value);
                       const offset = val >= 0 ? -6 : 14;
+                      const color = val < 0 ? '#b91c1c' : '#0f172a';
                       return (
-                        <text x={x} y={y + offset} textAnchor="middle" fontSize={11} fontWeight={700} fill="#e2e8f0">
+                        <text
+                          x={x}
+                          y={y + offset}
+                          textAnchor="middle"
+                          fontSize={11}
+                          fontWeight={600}
+                          fill={color}
+                          style={{ textShadow: '0 1px 1px rgba(0,0,0,0.12)' }}
+                        >
                           {`${val >= 0 ? '+' : ''}${val.toFixed(1)}%`}
                         </text>
                       );
@@ -1146,7 +1400,7 @@ export const Dashboard: React.FC = () => {
               onOpenChange={setMacroInfoOpen}
               renderContent={() => (
                 <div className="text-sm space-y-1">
-                  <p>Il gauge sintetizza il sentiment macro (CRISI → NEUTRO → EUPHORIA).</p>
+                  <p>Il gauge sintetizza il sentiment macro (CRISI ? NEUTRO ? EUPHORIA).</p>
                   <p>Il punteggio deriva da indicatori configurati (menu Macro) normalizzati 0-100.</p>
                   <p>Zona rossa: rischio alto, zona gialla: neutro/attenzione, zona verde: fase favorevole.</p>
                   <p>Puoi personalizzare gli indicatori dalla sezione Macro, il gauge si aggiorna di conseguenza.</p>
@@ -1180,6 +1434,11 @@ export const Dashboard: React.FC = () => {
               <p className="text-xs text-slate-600 mt-1">Valori in CHF. Definisci le percentuali per ogni strumento in Settings &gt; Listings &amp; FX.</p>
             </div>
             <div className="flex items-center gap-2">
+              {hasRegionPctWarning && (
+                <span className="px-3 py-1 rounded-full text-[11px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+                  Totale {regionPctSum.toFixed(1)}%
+                </span>
+              )}
               {hasIncompleteRegionData && (
                 <span className="px-3 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-200">Dati incompleti</span>
               )}
@@ -1189,7 +1448,7 @@ export const Dashboard: React.FC = () => {
                 renderContent={() => (
                   <div className="text-sm space-y-1">
                     <p>Assegna percentuali regione per regione a ciascuno strumento.</p>
-                    <p>Se mancano dati, la quota appare come “Non definito”.</p>
+                    <p>Se mancano dati, la quota appare come "Non definito".</p>
                     <p>Usa Listings &amp; FX per salvare la distribuzione geografica o normalizzarla al 100%.</p>
                   </div>
                 )}
@@ -1205,10 +1464,10 @@ export const Dashboard: React.FC = () => {
               <div className="ui-panel-dense p-2 h-full">
                 {regionData.length ? (
                   <div className="space-y-1">
-                    {regionData.map((r, idx) => (
+                    {regionData.map((r) => (
                       <div key={r.region} className="flex items-center justify-between rounded-lg px-2 py-1 hover:bg-slate-50 transition-colors">
                         <div className="flex items-center gap-2">
-                          <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: COLORS[idx % COLORS.length] }} />
+                          <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: getRegionColor(r.region as Exclude<RegionKey, 'UNASSIGNED' | 'OTHER'>) }} />
                           <span className="font-medium text-slate-700 text-sm">{r.label}</span>
                         </div>
                         <div className="text-right text-sm leading-tight">
@@ -1255,6 +1514,17 @@ export const Dashboard: React.FC = () => {
     </div>
   );
 };
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -1184,7 +1184,7 @@ export const Data: React.FC = () => {
           {technicalDetails.hasData && (
             <details className="mt-3 text-xs text-slate-600">
               <summary className="cursor-pointer font-semibold text-slate-700">Dettagli tecnici</summary>
-              <div className="mt-2 bg-slate-50 border border-borderSoft rounded-lg p-3 space-y-1">
+              <div className="mt-2 ui-panel-subtle p-3 space-y-1">
                 <div>Issues rebalance: <span className="font-semibold">{technicalDetails.rebalanceCount}</span></div>
                 <div>Issues prezzi: <span className="font-semibold">{technicalDetails.priceIssueTotal}</span></div>
                 <div>Issues FX: <span className="font-semibold">{technicalDetails.fxIssueTotal}</span></div>
@@ -1313,19 +1313,19 @@ export const Data: React.FC = () => {
           {selectedTicker && (
             <>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-700">
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                <div className="ui-panel-subtle p-3 text-slate-800">
                   <div className="text-[10px] uppercase font-bold text-slate-600">Start</div>
                   <div className="font-semibold">{priceAnalysis.stats.startDate || 'N/D'}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                <div className="ui-panel-subtle p-3 text-slate-800">
                   <div className="text-[10px] uppercase font-bold text-slate-600">End</div>
                   <div className="font-semibold">{priceAnalysis.stats.endDate || 'N/D'}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                <div className="ui-panel-subtle p-3 text-slate-800">
                   <div className="text-[10px] uppercase font-bold text-slate-600">Count</div>
                   <div className="font-semibold">{priceAnalysis.stats.count}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3 text-slate-800">
+                <div className="ui-panel-subtle p-3 text-slate-800">
                   <div className="text-[10px] uppercase font-bold text-slate-600">Currency</div>
                   <select
                     value={String(priceAnalysis.stats.currency || '')}
@@ -1416,7 +1416,7 @@ export const Data: React.FC = () => {
               </div>
 
               {importPreview.length > 0 && (
-                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs">
+                <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-3 text-xs">
                   <div className="font-bold text-amber-800">Preview import</div>
                   <div className="text-amber-700">Righe valide: {importPreview.length}</div>
                   {importErrors.length > 0 && (
@@ -1575,19 +1575,19 @@ export const Data: React.FC = () => {
           {selectedFxPair && (
             <>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-600">
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
+                <div className="ui-panel-subtle p-3">
                   <div className="text-[10px] uppercase font-bold text-slate-400">Start</div>
                   <div className="font-semibold">{fxAnalysis.stats.startDate || 'N/D'}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
+                <div className="ui-panel-subtle p-3">
                   <div className="text-[10px] uppercase font-bold text-slate-400">End</div>
                   <div className="font-semibold">{fxAnalysis.stats.endDate || 'N/D'}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
+                <div className="ui-panel-subtle p-3">
                   <div className="text-[10px] uppercase font-bold text-slate-400">Count</div>
                   <div className="font-semibold">{fxAnalysis.stats.count}</div>
                 </div>
-                <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
+                <div className="ui-panel-subtle p-3">
                   <div className="text-[10px] uppercase font-bold text-slate-400">Currency</div>
                   <div className="font-semibold">{String(fxAnalysis.stats.currency || 'N/D')}</div>
                 </div>
@@ -1685,7 +1685,7 @@ export const Data: React.FC = () => {
               </div>
 
               {fxImportPreview.length > 0 && (
-                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs">
+                <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-3 text-xs">
                   <div className="font-bold text-amber-800">Preview import</div>
                   <div className="text-amber-700">Righe valide: {fxImportPreview.length}</div>
                   {fxImportErrors.length > 0 && (
@@ -1751,15 +1751,15 @@ export const Data: React.FC = () => {
             </button>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-slate-600">
-            <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
+            <div className="ui-panel-subtle p-3">
               <div className="text-[10px] uppercase font-bold text-slate-400">Tickers</div>
               <div className="font-semibold">{tickers.length}</div>
             </div>
-            <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
+            <div className="ui-panel-subtle p-3">
               <div className="text-[10px] uppercase font-bold text-slate-400">FX Pairs</div>
               <div className="font-semibold">{fxPairs.length}</div>
             </div>
-            <div className="bg-slate-50 border border-borderSoft rounded-lg p-3">
+            <div className="ui-panel-subtle p-3">
               <div className="text-[10px] uppercase font-bold text-slate-400">Missing Price Days</div>
               <div className="font-semibold">{navChecks?.missingPriceDays ?? 0}</div>
             </div>
@@ -1796,7 +1796,7 @@ export const Data: React.FC = () => {
           )}
 
           {navChecks && navChecks.backfillTotal > 0 ? (
-            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-900">
+            <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
               <div className="font-bold text-amber-800 uppercase mb-2">Backfill prezzi</div>
               <div className="text-amber-800">
                 Weekend/festivi (normali): <span className="font-semibold">{navChecks.weekendTotal}</span>
@@ -1846,7 +1846,7 @@ export const Data: React.FC = () => {
           {rebalanceQuality && (
             <div className="ui-panel-dense p-3 text-xs text-slate-600">
               <div className="font-bold text-slate-500 uppercase mb-2">Rebalance FX/Price checks</div>
-              <div className="mb-2">Valuation date: <span className="font-semibold">{rebalanceQuality.valuationDate}</span></div>
+              <div className="mb-2">Snapshot (comune): <span className="font-semibold">{rebalanceQuality.valuationDate}</span></div>
               {rebalanceQuality.summary.issues.length === 0 ? (
                 <div className="text-xs text-slate-500">Nessun problema rilevato.</div>
               ) : (
@@ -1942,4 +1942,5 @@ export const Data: React.FC = () => {
     </div>
   );
 };
+
 
