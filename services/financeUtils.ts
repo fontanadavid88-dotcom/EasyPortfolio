@@ -2,6 +2,7 @@ import { Transaction, TransactionType, Instrument, PricePoint, PortfolioState, P
 import { format, startOfMonth, endOfMonth, eachMonthOfInterval, isValid, getYear, eachDayOfInterval } from 'date-fns';
 import { fillMissingPrices, PriceFillMeta } from './priceBackfill';
 import { diffDaysYmd, isYmd, parseYmdLocal } from './dateUtils';
+import { convertAmountFromSeries, FxRateRow } from './fxService';
 
 // Helper sicuro per gestire date che potrebbero essere stringhe o oggetti Date
 const toDateSafe = (dateInput: string | Date | number): Date => {
@@ -54,6 +55,145 @@ const REGION_LABELS: Record<RegionKey, string> = {
   OTHER: 'Altri'
 };
 export const getRegionLabel = (rk: RegionKey) => REGION_LABELS[rk] || rk;
+
+// --- Benchmark Comparison Helpers ---
+
+export type BenchmarkPoint = {
+  date: string;
+  benchmarkIndex?: number;
+  benchmarkPct?: number;
+  benchmarkPriceBase?: number;
+  benchmarkPriceDate?: string;
+  benchmarkFxDate?: string;
+  benchmarkSynthetic?: boolean;
+};
+
+export type BenchmarkSeriesResult = {
+  byDate: Map<string, BenchmarkPoint>;
+  startDate?: string;
+  endDate?: string;
+  warning?: string;
+};
+
+const resolveInstrumentForTicker = (instruments: Instrument[], ticker: string): Instrument | undefined => {
+  return instruments.find(i => getCanonicalTicker(i) === ticker)
+    || instruments.find(i => i.symbol === ticker)
+    || instruments.find(i => i.ticker === ticker)
+    || instruments.find(i => i.preferredListing?.symbol === ticker)
+    || instruments.find(i => i.listings?.some(l => l.symbol === ticker));
+};
+
+export const buildBenchmarkComparisonSeries = ({
+  chartHistory,
+  prices,
+  fxRates,
+  instruments,
+  benchmarkTicker,
+  baseCurrency
+}: {
+  chartHistory: { date: string }[];
+  prices: PricePoint[];
+  fxRates: FxRateRow[];
+  instruments: Instrument[];
+  benchmarkTicker: string;
+  baseCurrency: Currency;
+}): BenchmarkSeriesResult => {
+  const byDate = new Map<string, BenchmarkPoint>();
+  if (!benchmarkTicker || !chartHistory.length) return { byDate };
+
+  const dateIndex = chartHistory.map(p => p.date);
+  const priceRows = prices.filter(p => p.ticker === benchmarkTicker);
+  if (!priceRows.length) {
+    return { byDate, warning: 'Benchmark non disponibile nel range' };
+  }
+
+  const instrument = resolveInstrumentForTicker(instruments, benchmarkTicker);
+  const currencyFromPrices = priceRows.find(p => p.currency)?.currency;
+  const benchmarkCurrency = currencyFromPrices || instrument?.preferredListing?.currency || instrument?.currency || baseCurrency;
+
+  const minActualDate = priceRows.reduce((min, p) => (!min || p.date < min ? p.date : min), '');
+  const maxActualDate = priceRows.reduce((max, p) => (!max || p.date > max ? p.date : max), '');
+  const { filledByTicker } = fillMissingPrices(priceRows, dateIndex, { tickers: [benchmarkTicker] });
+  const filledMap = filledByTicker.get(benchmarkTicker) || new Map();
+
+  const needsFx = benchmarkCurrency !== baseCurrency;
+  const fxSeries = needsFx
+    ? fxRates.filter(row =>
+      (row.baseCurrency === benchmarkCurrency && row.quoteCurrency === baseCurrency)
+        || (row.baseCurrency === baseCurrency && row.quoteCurrency === benchmarkCurrency)
+    )
+    : fxRates;
+
+  let basePrice = 0;
+  let baseDate = '';
+  let lastAvailableDate = '';
+  let hasAny = false;
+  let hasFxConversion = !needsFx;
+  let missingFx = false;
+  let missingPrice = false;
+  let partialHistory = false;
+
+  dateIndex.forEach(dateStr => {
+    if (minActualDate && (dateStr < minActualDate || dateStr > maxActualDate)) {
+      partialHistory = true;
+      return;
+    }
+    const filled = filledMap.get(dateStr);
+    if (!filled || !Number.isFinite(filled.close) || filled.close <= 0) {
+      missingPrice = true;
+      return;
+    }
+
+    let priceBase = filled.close;
+    let fxDate: string | undefined;
+    if (needsFx) {
+      const converted = convertAmountFromSeries(filled.close, benchmarkCurrency, baseCurrency, dateStr, fxSeries);
+      if (!converted) {
+        missingFx = true;
+        return;
+      }
+      priceBase = converted.value;
+      fxDate = converted.lookup.date;
+      hasFxConversion = true;
+    }
+
+    if (!basePrice) {
+      basePrice = priceBase;
+      baseDate = dateStr;
+    }
+    if (!basePrice) return;
+
+    const index = basePrice > 0 ? (100 * priceBase / basePrice) : undefined;
+    const pct = index !== undefined ? index - 100 : undefined;
+    const priceDate = (filled as any).sourceDate || filled.date;
+
+    byDate.set(dateStr, {
+      date: dateStr,
+      benchmarkIndex: index,
+      benchmarkPct: pct,
+      benchmarkPriceBase: priceBase,
+      benchmarkPriceDate: priceDate,
+      benchmarkFxDate: fxDate,
+      benchmarkSynthetic: Boolean((filled as any).synthetic)
+    });
+    hasAny = true;
+    lastAvailableDate = dateStr;
+  });
+
+  if (!hasAny || !baseDate) {
+    return { byDate: new Map(), warning: needsFx ? 'FX benchmark mancante' : 'Benchmark non disponibile nel range' };
+  }
+
+  if (needsFx && !hasFxConversion) {
+    return { byDate: new Map(), warning: 'FX benchmark mancante' };
+  }
+
+  let warning: string | undefined;
+  if (missingFx) warning = 'FX benchmark mancante';
+  else if (missingPrice || partialHistory) warning = 'Storico benchmark parziale';
+
+  return { byDate, startDate: baseDate, endDate: lastAvailableDate, warning };
+};
 
 const containsAny = (source: string, keywords: string[]) =>
   keywords.some(k => source.toLowerCase().includes(k.toLowerCase()));
