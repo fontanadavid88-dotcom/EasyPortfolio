@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { calculateHoldings, calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly, getCanonicalTicker } from '../services/financeUtils';
+import { calculateHoldings, calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly, getCanonicalTicker, buildBenchmarkComparisonSeries } from '../services/financeUtils';
 import { DEFAULT_INDICATORS, computeMacroIndex, mapIndexToPhase, MacroIndicatorConfig } from '../services/macroService';
 import { queryFxForPairsRange, queryLatestFxForPairs, queryLatestPricesForTickers, queryPriceBoundsForTickers, queryPricesForTickersRange } from '../services/dbQueries';
 import { runGapFill, runLatestSync } from '../services/syncActionsService';
@@ -20,7 +20,7 @@ import { MACRO_ZONES } from '../constants';
 import { MacroGauge } from '../components/MacroGauge';
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid,
-  AreaChart, Area, BarChart, Bar, ReferenceLine, LabelList, ReferenceDot
+  AreaChart, Area, BarChart, Bar, ReferenceLine, LabelList, ReferenceDot, ComposedChart, Line
 } from 'recharts';
 import { format, subMonths } from 'date-fns';
 import clsx from 'clsx';
@@ -356,6 +356,12 @@ export const Dashboard: React.FC = () => {
     []
   );
 
+  const fxRates = useLiveQuery(
+    () => db.fxRates.toArray(),
+    [],
+    []
+  );
+
   const syncStatus = useMemo(() => {
     return computeSyncStatus({
       baseCurrency,
@@ -376,6 +382,8 @@ export const Dashboard: React.FC = () => {
   const [timeRange, setTimeRange] = useState<'3M' | '6M' | '1Y' | '5Y' | '10Y' | 'YTD' | 'MAX'>('MAX');
   const [metric, setMetric] = useState<'PERF' | 'TWRR' | 'MWRR'>('PERF');
   const [valueMode, setValueMode] = useState<'NAV' | 'PERF_INDEX'>('NAV');
+  const [benchmarkEnabled, setBenchmarkEnabled] = useState(false);
+  const [benchmarkTicker, setBenchmarkTicker] = useState('');
 
   // --- Macro State ---
   const [macroConfig] = useState<MacroIndicatorConfig[]>(() => {
@@ -535,11 +543,78 @@ export const Dashboard: React.FC = () => {
     const base = rangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
     return base?.cumulativeTWRRIndex || 1;
   }, [rangeHistory]);
+  const twrrBaseDate = useMemo(() => {
+    const base = rangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
+    return base?.date;
+  }, [rangeHistory]);
 
   const mwrrSeries = useMemo(() => {
     if (metric !== 'MWRR' || !rangeHistory.length) return [];
     return computeMwrrSeries(rangeHistory, transactions || []);
   }, [metric, rangeHistory, transactions]);
+
+  const benchmarkModeAvailable = metric === 'PERF' && valueMode === 'PERF_INDEX';
+
+  const benchmarkOptions = useMemo(() => {
+    const options = new Map<string, { value: string; label: string }>();
+    (instruments || []).forEach(instr => {
+      const canonical = getCanonicalTicker(instr);
+      if (!canonical) return;
+      const name = instr.name?.trim() || '';
+      const baseLabel = name ? `${canonical} - ${name}` : canonical;
+      const label = `${baseLabel} \u2022 attivo`;
+      const existing = options.get(canonical);
+      if (!existing || (name && !existing.label.includes(' - '))) {
+        options.set(canonical, { value: canonical, label });
+      }
+    });
+    return Array.from(options.values()).sort((a, b) => a.label.localeCompare(b.label));
+  }, [instruments]);
+
+  const benchmarkOptionsByValue = useMemo(() => {
+    return new Map(benchmarkOptions.map(opt => [opt.value, opt]));
+  }, [benchmarkOptions]);
+
+  useEffect(() => {
+    if (!benchmarkTicker) return;
+    if (!benchmarkOptionsByValue.has(benchmarkTicker)) {
+      setBenchmarkTicker('');
+      setBenchmarkEnabled(false);
+    }
+  }, [benchmarkTicker, benchmarkOptionsByValue]);
+
+  const benchmarkActive = benchmarkEnabled && benchmarkModeAvailable && !!benchmarkTicker;
+
+  const benchmarkSeries = useMemo(() => {
+    if (!benchmarkActive) {
+      return {
+        byDate: new Map<string, any>(),
+        warning: undefined as string | undefined,
+        startDate: undefined as string | undefined,
+        endDate: undefined as string | undefined
+      };
+    }
+    return buildBenchmarkComparisonSeries({
+      chartHistory,
+      prices: prices || [],
+      fxRates: fxRates || [],
+      instruments: instruments || [],
+      benchmarkTicker,
+      baseCurrency
+    });
+  }, [benchmarkActive, chartHistory, prices, fxRates, instruments, benchmarkTicker, baseCurrency]);
+
+  const benchmarkWarning = benchmarkSeries.warning;
+
+  const handleBenchmarkToggle = () => {
+    setBenchmarkEnabled(prev => {
+      const next = !prev;
+      if (next && !benchmarkTicker && benchmarkOptions.length) {
+        setBenchmarkTicker(benchmarkOptions[0].value);
+      }
+      return next;
+    });
+  };
 
   // 1. Performance Chart Data (downsampled for rendering only)
   const chartData = useMemo(() => {
@@ -558,24 +633,90 @@ export const Dashboard: React.FC = () => {
       const twrrRangePct = twrrBaseIndex > 0
         ? (((point.cumulativeTWRRIndex ?? 1) / twrrBaseIndex) - 1) * 100
         : 0;
+      const portfolioComparisonIndex = twrrBaseIndex > 0
+        ? (100 * (point.cumulativeTWRRIndex ?? 1) / twrrBaseIndex)
+        : 100;
+      const portfolioComparisonPct = portfolioComparisonIndex - 100;
       const metricValue = metric === 'PERF'
         ? (valueMode === 'PERF_INDEX' ? perfIndex : point.value)
         : (metric === 'TWRR' ? twrrRangePct : lastMwrr);
+      const benchmarkPoint = benchmarkActive ? benchmarkSeries.byDate.get(point.date) : undefined;
+      const benchmarkIndex = benchmarkPoint?.benchmarkIndex;
+      const benchmarkPct = benchmarkPoint?.benchmarkPct;
+      const benchmarkAvailable = Number.isFinite(benchmarkIndex);
+      const deltaVsBenchmark = benchmarkAvailable ? portfolioComparisonIndex - (benchmarkIndex as number) : undefined;
       return {
         ...point,
         displayDate: format(new Date(point.date), 'MMM yy'),
         perfIndex,
         perfPct,
         twrrRangePct,
-        metricValue
+        portfolioComparisonIndex,
+        portfolioComparisonPct,
+        metricValue: benchmarkActive ? portfolioComparisonIndex : metricValue,
+        benchmarkIndex,
+        benchmarkPct,
+        benchmarkAvailable,
+        benchmarkWarning: benchmarkSeries.warning,
+        deltaVsBenchmark
       };
     });
-  }, [chartHistoryDownsampled, mwrrSeries, metric, valueMode, hasPerfBase, perfBaseNav, twrrBaseIndex]);
+  }, [chartHistoryDownsampled, mwrrSeries, metric, valueMode, hasPerfBase, perfBaseNav, twrrBaseIndex, benchmarkActive, benchmarkSeries]);
 
   const lastChartPoint = useMemo(() => {
     if (!chartData.length) return null;
     return chartData[chartData.length - 1];
   }, [chartData]);
+
+  const hasBenchmarkSeries = useMemo(() => {
+    if (!benchmarkActive) return false;
+    return chartData.some(p => Number.isFinite(p.benchmarkIndex));
+  }, [benchmarkActive, chartData]);
+
+  const portfolioComparisonStats = useMemo(() => {
+    if (!benchmarkActive) return null;
+    const series = chartHistory
+      .map(point => ({
+        date: point.date,
+        index: twrrBaseIndex > 0
+          ? (100 * (point.cumulativeTWRRIndex ?? 1) / twrrBaseIndex)
+          : 100
+      }))
+      .filter(p => Number.isFinite(p.index));
+    if (!series.length) return null;
+    const values = series.map(p => Number(p.index));
+    return {
+      baseDate: twrrBaseDate,
+      firstDate: series[0].date,
+      lastDate: series[series.length - 1].date,
+      firstIndex: values[0],
+      lastIndex: values[values.length - 1],
+      min: Math.min(...values),
+      max: Math.max(...values)
+    };
+  }, [benchmarkActive, chartHistory, twrrBaseIndex, twrrBaseDate]);
+
+  const benchmarkStats = useMemo(() => {
+    if (!benchmarkActive) return null;
+    const series = Array.from(benchmarkSeries.byDate.values()).filter(p => Number.isFinite(p.benchmarkIndex));
+    if (!series.length) return null;
+    const values = series.map(p => Number(p.benchmarkIndex));
+    return {
+      baseDate: benchmarkSeries.startDate,
+      firstDate: series[0].date,
+      lastDate: series[series.length - 1].date,
+      firstIndex: values[0],
+      lastIndex: values[values.length - 1],
+      min: Math.min(...values),
+      max: Math.max(...values)
+    };
+  }, [benchmarkActive, benchmarkSeries.byDate, benchmarkSeries.startDate]);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || !benchmarkActive) return;
+    console.log('[BENCH][Dashboard] portfolio comparison stats', portfolioComparisonStats);
+    console.log('[BENCH][Dashboard] benchmark stats', benchmarkStats);
+  }, [benchmarkActive, portfolioComparisonStats, benchmarkStats]);
 
   const investedAtEnd = useMemo(() => {
     if (!rangeHistory.length) return 0;
@@ -590,19 +731,48 @@ export const Dashboard: React.FC = () => {
     if (metric === 'PERF' && valueMode === 'PERF_INDEX') {
       const perfIndex = typeof point.perfIndex === 'number' ? point.perfIndex : 100;
       const perfPct = typeof point.perfPct === 'number' ? point.perfPct : 0;
+      const comparisonIndex = typeof point.portfolioComparisonIndex === 'number' ? point.portfolioComparisonIndex : null;
+      const comparisonPct = typeof point.portfolioComparisonPct === 'number' ? point.portfolioComparisonPct : null;
+      const benchmarkIndex = typeof point.benchmarkIndex === 'number' ? point.benchmarkIndex : null;
+      const benchmarkPct = typeof point.benchmarkPct === 'number' ? point.benchmarkPct : null;
+      const delta = typeof point.deltaVsBenchmark === 'number' ? point.deltaVsBenchmark : null;
       return (
         <div className="ui-panel-dense px-4 py-3 min-w-[220px]">
           <div className="text-xs text-slate-600 mb-1">{point.displayDate || label}</div>
           <div className="flex items-center justify-between text-sm font-bold text-slate-900">
-            <span>Indice 100</span>
-            <span>{perfIndex.toFixed(2)}</span>
+            <span>{benchmarkActive ? 'Portafoglio confronto' : 'Portafoglio'}</span>
+            <span>{(benchmarkActive ? comparisonIndex : perfIndex)?.toFixed(2) ?? 'N/D'}</span>
           </div>
           <div className="flex items-center justify-between text-xs mt-1">
             <span className="text-slate-600">Rendimento</span>
-            <span className={clsx("font-bold", perfPct >= 0 ? "text-green-600" : "text-red-600")}>
-              {`${perfPct.toFixed(2)}%`}
+            <span className={clsx("font-bold", (benchmarkActive ? (comparisonPct ?? 0) : perfPct) >= 0 ? "text-green-600" : "text-red-600")}>
+              {benchmarkActive
+                ? (comparisonPct !== null ? `${comparisonPct.toFixed(2)}%` : 'N/D')
+                : `${perfPct.toFixed(2)}%`}
             </span>
           </div>
+          {benchmarkActive && (
+            <>
+              <div className="flex items-center justify-between text-xs mt-2">
+                <span className="text-slate-600">Benchmark</span>
+                <span className="font-bold text-slate-800">
+                  {benchmarkIndex !== null ? benchmarkIndex.toFixed(2) : 'N/D'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs mt-1">
+                <span className="text-slate-600">Rendimento</span>
+                <span className={clsx("font-bold", (benchmarkPct ?? 0) >= 0 ? "text-green-600" : "text-red-600")}>
+                  {benchmarkPct !== null ? `${benchmarkPct.toFixed(2)}%` : 'N/D'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-xs mt-2">
+                <span className="text-slate-600">Delta vs benchmark</span>
+                <span className={clsx("font-bold", (delta ?? 0) >= 0 ? "text-green-600" : "text-red-600")}>
+                  {delta !== null ? `${delta.toFixed(2)} pt` : 'N/D'}
+                </span>
+              </div>
+            </>
+          )}
         </div>
       );
     }
@@ -950,24 +1120,60 @@ export const Dashboard: React.FC = () => {
 
       {/* ROW 2: Performance Chart */}
       <div className="ui-panel p-6 relative">
-        <div className="flex items-start justify-between mb-4">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-4">
           <div>
             <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider flex items-center gap-2">
               <span className="w-1 h-4 rounded-full bg-[#0052a3] shadow-[0_0_10px_rgba(0,82,163,0.5)]"></span> Andamento Portafoglio
             </h3>
           </div>
-          <InfoPopover
-            ariaLabel="Info grafico rendimento"
-            title="Valore vs TWRR vs MWRR"
-            renderContent={() => (
-              <div className="text-sm space-y-1">
-                <p><strong>Valore:</strong> profitto vs investito (CHF).</p>
-                <p><strong>Performance:</strong> indice 100 rebased sul range.</p>
-                <p><strong>TWRR:</strong> rendimento ponderato nel tempo (indipendente dai flussi).</p>
-                <p><strong>MWRR:</strong> rendimento ponderato per il denaro (sensibile a depositi/prelievi).</p>
-              </div>
-            )}
-          />
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <div
+              className={clsx(
+                "flex items-center gap-2 ui-panel-subtle px-2 py-1.5 max-w-full",
+                (!benchmarkModeAvailable || benchmarkOptions.length === 0) && "opacity-60 pointer-events-none"
+              )}
+            >
+              <label className="text-[11px] font-semibold text-slate-700 uppercase tracking-wide whitespace-nowrap">
+                Confronta benchmark
+              </label>
+              <input
+                type="checkbox"
+                checked={benchmarkEnabled}
+                onChange={handleBenchmarkToggle}
+                className="accent-[#0052a3]"
+                aria-label="Confronta benchmark"
+              />
+              {benchmarkModeAvailable && benchmarkEnabled && (
+                <select
+                  className="ml-1 px-2 py-1 text-[11px] rounded border border-slate-200 bg-white text-slate-700 max-w-[260px] w-full sm:w-auto"
+                  value={benchmarkTicker}
+                  onChange={(e) => setBenchmarkTicker(e.target.value)}
+                >
+                  <option value="">Scegli benchmark</option>
+                  {benchmarkOptions.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              )}
+              {benchmarkActive && benchmarkWarning && (
+                <span className="ml-1 px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold whitespace-nowrap">
+                  {benchmarkWarning}
+                </span>
+              )}
+            </div>
+            <InfoPopover
+              ariaLabel="Info grafico rendimento"
+              title="Valore vs TWRR vs MWRR"
+              renderContent={() => (
+                <div className="text-sm space-y-1">
+                  <p><strong>Valore:</strong> profitto vs investito (CHF).</p>
+                  <p><strong>Performance:</strong> indice 100 rebased sul range.</p>
+                  <p><strong>TWRR:</strong> rendimento ponderato nel tempo (indipendente dai flussi).</p>
+                  <p><strong>MWRR:</strong> rendimento ponderato per il denaro (sensibile a depositi/prelievi).</p>
+                </div>
+              )}
+            />
+          </div>
         </div>
 
         <div className="ui-panel-subtle p-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-4">
@@ -1029,6 +1235,7 @@ export const Dashboard: React.FC = () => {
                 </button>
               ))}
             </div>
+
           </div>
           <div className="text-[11px] text-slate-600 lg:ml-auto">
             {`Chart: ${chartGranularityLabel} (KPI: ${kpiGranularityLabel})`}
@@ -1041,49 +1248,84 @@ export const Dashboard: React.FC = () => {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
-          <div className="ui-panel-dense p-3">
-            <div className="text-[11px] uppercase font-bold text-slate-600">Saldo</div>
-            <div className="text-xl font-bold text-slate-900">
-              {lastChartPoint ? `CHF ${lastChartPoint.value?.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : 'N/D'}
+        {benchmarkActive ? (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+            <div className="ui-panel-dense p-3">
+              <div className="text-[11px] uppercase font-bold text-slate-600">Portafoglio</div>
+              <div className="text-xl font-bold text-slate-900">
+                {lastChartPoint?.portfolioComparisonIndex !== undefined
+                  ? `Indice ${lastChartPoint.portfolioComparisonIndex.toFixed(1)}`
+                  : 'N/D'}
+              </div>
+              <div className={clsx("text-xs font-bold mt-1", (lastChartPoint?.portfolioComparisonPct ?? 0) >= 0 ? "text-green-600" : "text-red-600")}>
+                {lastChartPoint?.portfolioComparisonPct !== undefined
+                  ? `${lastChartPoint.portfolioComparisonPct.toFixed(2)}%`
+                  : 'N/D'}
+              </div>
+            </div>
+            <div className="ui-panel-dense p-3">
+              <div className="text-[11px] uppercase font-bold text-slate-600">Benchmark</div>
+              <div className="text-xl font-bold text-slate-900">
+                {lastChartPoint?.benchmarkAvailable ? `Indice ${lastChartPoint.benchmarkIndex?.toFixed(1)}` : 'N/D'}
+              </div>
+              <div className={clsx("text-xs font-bold mt-1", (lastChartPoint?.benchmarkPct ?? 0) >= 0 ? "text-green-600" : "text-red-600")}>
+                {lastChartPoint?.benchmarkAvailable && lastChartPoint.benchmarkPct !== undefined
+                  ? `${lastChartPoint.benchmarkPct.toFixed(2)}%`
+                  : 'N/D'}
+              </div>
+            </div>
+            <div className="ui-panel-dense p-3">
+              <div className="text-[11px] uppercase font-bold text-slate-600">Delta vs benchmark</div>
+              <div className={clsx("text-xl font-bold", (lastChartPoint?.deltaVsBenchmark ?? 0) >= 0 ? "text-green-600" : "text-red-600")}>
+                {lastChartPoint?.deltaVsBenchmark !== undefined ? `${lastChartPoint.deltaVsBenchmark.toFixed(2)} pt` : 'N/D'}
+              </div>
             </div>
           </div>
-          <div className="ui-panel-dense p-3">
-            <div className="flex items-center justify-between">
-              <div className="text-[11px] uppercase font-bold text-slate-600">Rendimento</div>
-              {metric !== 'PERF' && (
-                <span className="text-[11px] text-slate-600">Ultimo</span>
-              )}
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+            <div className="ui-panel-dense p-3">
+              <div className="text-[11px] uppercase font-bold text-slate-600">Saldo</div>
+              <div className="text-xl font-bold text-slate-900">
+                {lastChartPoint ? `CHF ${lastChartPoint.value?.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : 'N/D'}
+              </div>
             </div>
-            <div className="text-xl font-bold text-slate-900 flex items-center gap-2">
-              {metric === 'PERF' && valueMode === 'PERF_INDEX' && lastChartPoint ? (
-                <>
-                  <span>{`Indice ${lastChartPoint.perfIndex.toFixed(1)}`}</span>
-                  <span className={clsx("text-sm font-bold", lastChartPoint.perfPct >= 0 ? "text-green-600" : "text-red-600")}>
-                    {`${lastChartPoint.perfPct.toFixed(2)}%`}
+            <div className="ui-panel-dense p-3">
+              <div className="flex items-center justify-between">
+                <div className="text-[11px] uppercase font-bold text-slate-600">Rendimento</div>
+                {metric !== 'PERF' && (
+                  <span className="text-[11px] text-slate-600">Ultimo</span>
+                )}
+              </div>
+              <div className="text-xl font-bold text-slate-900 flex items-center gap-2">
+                {metric === 'PERF' && valueMode === 'PERF_INDEX' && lastChartPoint ? (
+                  <>
+                    <span>{`Indice ${lastChartPoint.perfIndex.toFixed(1)}`}</span>
+                    <span className={clsx("text-sm font-bold", lastChartPoint.perfPct >= 0 ? "text-green-600" : "text-red-600")}>
+                      {`${lastChartPoint.perfPct.toFixed(2)}%`}
+                    </span>
+                  </>
+                ) : metric === 'PERF' && lastChartPoint && investedAtEnd > 0 ? (
+                  <>
+                    <span>{`CHF ${(lastChartPoint.value - investedAtEnd).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}</span>
+                    <span className={clsx("text-sm font-bold", (lastChartPoint.value - investedAtEnd) >= 0 ? "text-green-600" : "text-red-600")}>
+                      {`${(((lastChartPoint.value - investedAtEnd) / investedAtEnd) * 100).toFixed(2)}%`}
+                    </span>
+                  </>
+                ) : metric !== 'PERF' && lastChartPoint ? (
+                  <span className={clsx("text-xl font-bold", lastChartPoint.metricValue >= 0 ? "text-green-600" : "text-red-600")}>
+                    {`${lastChartPoint.metricValue.toFixed(2)}%`}
                   </span>
-                </>
-              ) : metric === 'PERF' && lastChartPoint && investedAtEnd > 0 ? (
-                <>
-                  <span>{`CHF ${(lastChartPoint.value - investedAtEnd).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}</span>
-                  <span className={clsx("text-sm font-bold", (lastChartPoint.value - investedAtEnd) >= 0 ? "text-green-600" : "text-red-600")}>
-                    {`${(((lastChartPoint.value - investedAtEnd) / investedAtEnd) * 100).toFixed(2)}%`}
-                  </span>
-                </>
-              ) : metric !== 'PERF' && lastChartPoint ? (
-                <span className={clsx("text-xl font-bold", lastChartPoint.metricValue >= 0 ? "text-green-600" : "text-red-600")}>
-                  {`${lastChartPoint.metricValue.toFixed(2)}%`}
-                </span>
-              ) : (
-                'N/D'
-              )}
+                ) : (
+                  'N/D'
+                )}
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         <div className="h-[380px] w-full">
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={chartData} margin={{ top: 5, right: 0, left: 0, bottom: 0 }}>
+            <ComposedChart data={chartData} margin={{ top: 5, right: 0, left: 0, bottom: 0 }}>
               <defs>
                 <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor={PRIMARY_BLUE} stopOpacity={0.3} />
@@ -1117,6 +1359,18 @@ export const Dashboard: React.FC = () => {
                 strokeWidth={3}
                 animationDuration={1000}
               />
+              {hasBenchmarkSeries && (
+                <Line
+                  type="monotone"
+                  dataKey="benchmarkIndex"
+                  stroke="#0f172a"
+                  strokeWidth={2}
+                  strokeDasharray="4 4"
+                  dot={false}
+                  connectNulls={false}
+                  animationDuration={900}
+                />
+              )}
               {lastChartPoint && (
                 <ReferenceDot
                   x={lastChartPoint.displayDate}
@@ -1129,7 +1383,11 @@ export const Dashboard: React.FC = () => {
                   label={{
                     position: 'top',
                     value: metric === 'PERF'
-                      ? (valueMode === 'PERF_INDEX' ? lastChartPoint.perfIndex.toFixed(1) : '')
+                      ? (valueMode === 'PERF_INDEX'
+                        ? (benchmarkActive && lastChartPoint.portfolioComparisonIndex !== undefined
+                          ? lastChartPoint.portfolioComparisonIndex.toFixed(1)
+                          : lastChartPoint.perfIndex.toFixed(1))
+                        : '')
                       : `${lastChartPoint.metricValue.toFixed(2)}%`,
                     fill: '#e2e8f0',
                     fontSize: 11,
@@ -1137,7 +1395,7 @@ export const Dashboard: React.FC = () => {
                   }}
                 />
               )}
-            </AreaChart>
+            </ComposedChart>
           </ResponsiveContainer>
         </div>
       </div>
