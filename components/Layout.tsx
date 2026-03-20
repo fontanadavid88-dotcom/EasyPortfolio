@@ -121,6 +121,7 @@ export const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) =>
           <NavItem to="/" icon="dashboard" label="Dashboard" collapsed={!isSidebarOpen} />
           <NavItem to="/transactions" icon="receipt_long" label="Transazioni" collapsed={!isSidebarOpen} />
           <NavItem to="/rebalance" icon="balance" label="Ribilanciamento" collapsed={!isSidebarOpen} />
+          <NavItem to="/backtest" icon="query_stats" label="Backtest" collapsed={!isSidebarOpen} />
           <NavItem to="/macro" icon="speed" label="Macro Indicator" collapsed={!isSidebarOpen} />
           <div className="my-4 border-t border-borderSoft mx-6"></div>
           <NavItem to="/settings" icon="settings" label="Impostazioni" collapsed={!isSidebarOpen} />

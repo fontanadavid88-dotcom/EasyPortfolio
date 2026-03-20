@@ -10,6 +10,7 @@ const InitErrorContext = React.createContext<string | null>(null);
 const Dashboard = React.lazy(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })));
 const Transactions = React.lazy(() => import('./pages/Transactions').then(m => ({ default: m.Transactions })));
 const Rebalance = React.lazy(() => import('./pages/Rebalance').then(m => ({ default: m.Rebalance })));
+const Backtest = React.lazy(() => import('./pages/Backtest').then(m => ({ default: m.Backtest })));
 const Macro = React.lazy(() => import('./pages/Macro').then(m => ({ default: m.Macro })));
 const Settings = React.lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })));
 const Data = React.lazy(() => import('./pages/Data').then(m => ({ default: m.Data })));
@@ -101,6 +102,7 @@ const router = createHashRouter(
         { path: '/', element: withSuspense(<Dashboard />) },
         { path: '/transactions', element: withSuspense(<Transactions />) },
         { path: '/rebalance', element: withSuspense(<Rebalance />) },
+        { path: '/backtest', element: withSuspense(<Backtest />) },
         { path: '/macro', element: withSuspense(<Macro />) },
         { path: '/settings', element: withSuspense(<Settings />) },
         { path: '/data', element: withSuspense(<Data />) },
