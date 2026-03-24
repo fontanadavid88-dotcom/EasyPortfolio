@@ -1,15 +1,16 @@
-import { Currency } from '../types';
+import { Currency, BacktestAssetClass } from '../types';
 
-export type BacktestAssetClass = 'Equity' | 'Bond' | 'Gold' | 'Crypto' | 'Cash' | 'Other';
+export type BacktestAssetSource = 'APP_DB' | 'CSV_IMPORT';
 
 export type BacktestAssetInput = {
+  id: string;
+  source: BacktestAssetSource;
   ticker: string;
   name: string;
   allocationPct: number;
   assetClass: BacktestAssetClass;
-  currency?: Currency;
-  source: 'DB';
-  priceSource?: 'DB' | 'CSV';
+  currency: string;
+  importId?: number;
 };
 
 export type BacktestScenarioInput = {
@@ -47,7 +48,9 @@ export type BacktestResult = {
 export type BacktestAssetQualityStatus = 'OK' | 'PARTIAL' | 'MISSING' | 'FX_MISSING';
 
 export type BacktestAssetQuality = {
+  assetId: string;
   ticker: string;
+  source: BacktestAssetSource;
   status: BacktestAssetQualityStatus;
   priceStart?: string;
   priceEnd?: string;
@@ -64,7 +67,7 @@ export type BacktestDataQualitySummary = {
   fxMissing: number;
   messages: string[];
   blockingIssues: string[];
-  byTicker: Record<string, BacktestAssetQuality>;
+  byAssetId: Record<string, BacktestAssetQuality>;
   requestedStartDate?: string;
   requestedEndDate?: string;
   availableStartDate?: string;
@@ -77,9 +80,19 @@ export type BacktestDataQualitySummary = {
   status?: 'full' | 'partial-runnable' | 'partial-blocking' | 'missing';
 };
 
+export type BacktestSourceSeriesPoint = {
+  assetId: string;
+  date: string;
+  close: number;
+  currency: Currency;
+  source: BacktestAssetSource;
+  ticker: string;
+  importId?: number;
+};
+
 export type BacktestScenarioData = {
   key: string;
-  prices: Array<{ ticker: string; date: string; close: number; currency: Currency; portfolioId?: string }>;
+  series: BacktestSourceSeriesPoint[];
   fxRates: Array<{ baseCurrency: Currency; quoteCurrency: Currency; date: string; rate: number; source?: string }>;
   quality: BacktestDataQualitySummary;
 };

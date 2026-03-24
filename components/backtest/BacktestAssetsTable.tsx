@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import clsx from 'clsx';
-import { Instrument, AssetClass, AssetType, Currency } from '../../types';
-import { BacktestAssetInput, BacktestAssetClass, BacktestAssetQuality } from '../../services/backtestTypes';
+import { Instrument, AssetClass, AssetType, Currency, BacktestImport, BacktestAssetClass } from '../../types';
+import { BacktestAssetInput, BacktestAssetQuality } from '../../services/backtestTypes';
 import { getCanonicalTicker } from '../../services/financeUtils';
 
 const ASSET_CLASS_OPTIONS: BacktestAssetClass[] = ['Equity', 'Bond', 'Gold', 'Crypto', 'Cash', 'Other'];
@@ -19,15 +19,18 @@ const mapInstrumentToAssetClass = (instrument: Instrument): BacktestAssetClass =
   return 'Other';
 };
 
-const buildAssetFromInstrument = (instrument: Instrument): BacktestAssetInput => ({
-  ticker: getCanonicalTicker(instrument),
-  name: instrument.name,
-  allocationPct: 0,
-  assetClass: mapInstrumentToAssetClass(instrument),
-  currency: (instrument.preferredListing?.currency || instrument.currency || Currency.CHF) as Currency,
-  source: 'DB',
-  priceSource: 'DB'
-});
+const buildAssetFromInstrument = (instrument: Instrument): BacktestAssetInput => {
+  const ticker = getCanonicalTicker(instrument);
+  return {
+    id: `app-${ticker}`,
+    source: 'APP_DB',
+    ticker,
+    name: instrument.name,
+    allocationPct: 0,
+    assetClass: mapInstrumentToAssetClass(instrument),
+    currency: String(instrument.preferredListing?.currency || instrument.currency || Currency.CHF)
+  };
+};
 
 const qualityLabel = (quality?: BacktestAssetQuality) => {
   if (!quality) return { text: '—', className: 'bg-slate-100 text-slate-500 border-slate-200' };
@@ -41,10 +44,14 @@ export const BacktestAssetsTable: React.FC<{
   assets: BacktestAssetInput[];
   instruments: Instrument[];
   onChange: (assets: BacktestAssetInput[]) => void;
-  qualityByTicker?: Record<string, BacktestAssetQuality>;
-}> = ({ assets, instruments, onChange, qualityByTicker }) => {
+  qualityByAssetId?: Record<string, BacktestAssetQuality>;
+  csvImports?: BacktestImport[];
+}> = ({ assets, instruments, onChange, qualityByAssetId, csvImports }) => {
   const [selectedTicker, setSelectedTicker] = useState('');
   const [addError, setAddError] = useState<string | null>(null);
+  const csvImportMap = useMemo(() => {
+    return new Map((csvImports || []).filter(i => i.id !== undefined).map(i => [i.id as number, i]));
+  }, [csvImports]);
 
   const options = useMemo(() => {
     return instruments
@@ -63,7 +70,7 @@ export const BacktestAssetsTable: React.FC<{
   const handleAdd = () => {
     const trimmed = selectedTicker.trim();
     if (!trimmed) return;
-    const exists = assets.some(a => a.ticker === trimmed);
+    const exists = assets.some(a => a.ticker === trimmed && a.source === 'APP_DB');
     if (exists) {
       setAddError('Ticker già presente nel backtest.');
       return;
@@ -79,24 +86,24 @@ export const BacktestAssetsTable: React.FC<{
     setAddError(null);
   };
 
-  const handleRemove = (ticker: string) => {
-    onChange(assets.filter(a => a.ticker !== ticker));
+  const handleRemove = (id: string) => {
+    onChange(assets.filter(a => a.id !== id));
   };
 
-  const handleAllocationChange = (ticker: string, value: string) => {
+  const handleAllocationChange = (id: string, value: string) => {
     const nextVal = Number(value);
-    onChange(assets.map(asset => asset.ticker === ticker ? { ...asset, allocationPct: Number.isFinite(nextVal) ? nextVal : 0 } : asset));
+    onChange(assets.map(asset => asset.id === id ? { ...asset, allocationPct: Number.isFinite(nextVal) ? nextVal : 0 } : asset));
   };
 
-  const handleAssetClassChange = (ticker: string, value: BacktestAssetClass) => {
-    onChange(assets.map(asset => asset.ticker === ticker ? { ...asset, assetClass: value } : asset));
+  const handleAssetClassChange = (id: string, value: BacktestAssetClass) => {
+    onChange(assets.map(asset => asset.id === id ? { ...asset, assetClass: value } : asset));
   };
 
   return (
     <div className="ui-panel-dense p-4 space-y-4">
       <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
         <div className="flex-1">
-          <label className="text-sm font-semibold text-slate-700">Aggiungi strumento</label>
+          <label className="text-sm font-semibold text-slate-700">Aggiungi strumento (App)</label>
           <div className="flex flex-col md:flex-row gap-2 mt-2">
             <input
               className="ui-input"
@@ -126,6 +133,7 @@ export const BacktestAssetsTable: React.FC<{
             <tr>
               <th className="px-3 py-2">Ticker</th>
               <th className="px-3 py-2">Nome</th>
+              <th className="px-3 py-2">Fonte</th>
               <th className="px-3 py-2">Asset Class</th>
               <th className="px-3 py-2">Valuta</th>
               <th className="px-3 py-2 text-right">Allocazione %</th>
@@ -135,17 +143,30 @@ export const BacktestAssetsTable: React.FC<{
           </thead>
           <tbody>
             {assets.map(asset => {
-              const quality = qualityByTicker?.[asset.ticker];
+              const quality = qualityByAssetId?.[asset.id];
               const badge = qualityLabel(quality);
+              const csvImport = asset.importId ? csvImportMap.get(asset.importId) : undefined;
               return (
-                <tr key={asset.ticker} className="border-t border-slate-200 hover:bg-slate-50">
+                <tr key={asset.id} className="border-t border-slate-200 hover:bg-slate-50">
                   <td className="px-3 py-3 font-semibold text-slate-700">{asset.ticker}</td>
                   <td className="px-3 py-3 text-slate-600">{asset.name}</td>
+                  <td className="px-3 py-3">
+                    <span
+                      className={clsx(
+                        'text-[10px] uppercase tracking-wide font-semibold px-2 py-1 rounded-full border',
+                        asset.source === 'CSV_IMPORT'
+                          ? 'bg-amber-50 text-amber-700 border-amber-200'
+                          : 'bg-slate-100 text-slate-600 border-slate-200'
+                      )}
+                    >
+                      {asset.source === 'CSV_IMPORT' ? 'CSV' : 'App'}
+                    </span>
+                  </td>
                   <td className="px-3 py-3">
                     <select
                       className="ui-input-sm"
                       value={asset.assetClass}
-                      onChange={e => handleAssetClassChange(asset.ticker, e.target.value as BacktestAssetClass)}
+                      onChange={e => handleAssetClassChange(asset.id, e.target.value as BacktestAssetClass)}
                     >
                       {ASSET_CLASS_OPTIONS.map(opt => (
                         <option key={opt} value={opt}>{opt}</option>
@@ -160,22 +181,29 @@ export const BacktestAssetsTable: React.FC<{
                       min="0"
                       className="ui-input-sm text-right font-mono"
                       value={Number.isFinite(asset.allocationPct) ? asset.allocationPct : 0}
-                      onChange={e => handleAllocationChange(asset.ticker, e.target.value)}
+                      onChange={e => handleAllocationChange(asset.id, e.target.value)}
                     />
                   </td>
                   <td className="px-3 py-3">
-                    <span className={clsx('text-[11px] uppercase tracking-wide font-semibold px-2 py-1 rounded-full border', badge.className)}>
-                      {badge.text}
-                    </span>
-                    {quality?.message && (
-                      <div className="text-[11px] text-slate-500 mt-1">{quality.message}</div>
-                    )}
+                    <>
+                      <span className={clsx('text-[11px] uppercase tracking-wide font-semibold px-2 py-1 rounded-full border', badge.className)}>
+                        {badge.text}
+                      </span>
+                      {quality?.message && (
+                        <div className="text-[11px] text-slate-500 mt-1">{quality.message}</div>
+                      )}
+                      {!quality?.message && asset.source === 'CSV_IMPORT' && csvImport?.firstDate && csvImport?.lastDate && (
+                        <div className="text-[11px] text-slate-500 mt-1">
+                          Storico disponibile: {csvImport.firstDate} {'->'} {csvImport.lastDate}
+                        </div>
+                      )}
+                    </>
                   </td>
                   <td className="px-3 py-3 text-right">
                     <button
                       type="button"
                       className="ui-btn-ghost px-2 py-1 text-xs"
-                      onClick={() => handleRemove(asset.ticker)}
+                      onClick={() => handleRemove(asset.id)}
                     >
                       Rimuovi
                     </button>
@@ -185,7 +213,7 @@ export const BacktestAssetsTable: React.FC<{
             })}
             {assets.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-3 py-8 text-center text-slate-400">
+                <td colSpan={8} className="px-3 py-8 text-center text-slate-400">
                   Nessuno strumento selezionato.
                 </td>
               </tr>

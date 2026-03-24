@@ -21,7 +21,8 @@ export const queryPricesForTickersRange = async (params: {
   const { portfolioId, tickers, startDate, endDate, lookbackDays = 0, cacheTtlMs = 5000 } = params;
   if (!tickers.length || !startDate || !endDate) return [];
   const startWithLookback = lookbackDays > 0 ? subDaysYmd(startDate, lookbackDays) : startDate;
-  const key = `${portfolioId}|${startWithLookback}|${endDate}|${tickers.join(',')}`;
+  const endBound = `${endDate}\uffff`;
+  const key = `${portfolioId}|${startWithLookback}|${endBound}|${tickers.join(',')}`;
   const cached = priceRangeCache.get(key);
   if (cached && nowMs() - cached.ts < cacheTtlMs) return cached.data;
 
@@ -29,7 +30,7 @@ export const queryPricesForTickersRange = async (params: {
   await Promise.all(tickers.map(async (ticker) => {
     const rows = await db.prices
       .where('[ticker+date]')
-      .between([ticker, startWithLookback], [ticker, endDate])
+      .between([ticker, startWithLookback], [ticker, endBound])
       .and(p => p.portfolioId === portfolioId)
       .toArray();
     if (rows.length) result.push(...rows);
@@ -49,7 +50,8 @@ export const queryFxForPairsRange = async (params: {
   const { pairs, startDate, endDate, lookbackDays = 0, cacheTtlMs = 5000 } = params;
   if (!pairs.length || !startDate || !endDate) return [];
   const startWithLookback = lookbackDays > 0 ? subDaysYmd(startDate, lookbackDays) : startDate;
-  const key = `${startWithLookback}|${endDate}|${pairs.join(',')}`;
+  const endBound = `${endDate}\uffff`;
+  const key = `${startWithLookback}|${endBound}|${pairs.join(',')}`;
   const cached = fxRangeCache.get(key);
   if (cached && nowMs() - cached.ts < cacheTtlMs) return cached.data;
 
@@ -59,7 +61,7 @@ export const queryFxForPairsRange = async (params: {
     if (!base || !quote) return;
     const rows = await db.fxRates
       .where('[baseCurrency+quoteCurrency+date]')
-      .between([base, quote, startWithLookback], [base, quote, endDate])
+      .between([base, quote, startWithLookback], [base, quote, endBound])
       .toArray();
     if (rows.length) result.push(...rows as FxRate[]);
   }));

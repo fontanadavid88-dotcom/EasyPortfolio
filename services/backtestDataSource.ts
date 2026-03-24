@@ -1,6 +1,7 @@
-import { BacktestScenarioInput, BacktestScenarioData, BacktestDataQualitySummary, BacktestAssetQualityStatus } from './backtestTypes';
-import { Currency, PricePoint } from '../types';
+﻿import { BacktestScenarioInput, BacktestScenarioData, BacktestDataQualitySummary, BacktestAssetQualityStatus, BacktestSourceSeriesPoint, BacktestAssetInput, BacktestAssetQuality } from './backtestTypes';
+import { Currency } from '../types';
 import { queryPricesForTickersRange, queryFxForPairsRange } from './dbQueries';
+import { getBacktestImportPricesByImportIds } from './backtestImportRepository';
 
 const buildEmptyQuality = (assetsCount = 0): BacktestDataQualitySummary => ({
   total: assetsCount,
@@ -10,18 +11,65 @@ const buildEmptyQuality = (assetsCount = 0): BacktestDataQualitySummary => ({
   fxMissing: 0,
   messages: [],
   blockingIssues: [],
-  byTicker: {},
+  byAssetId: {},
   canRun: false
 });
 
 export const buildBacktestScenarioDataKey = (scenario: BacktestScenarioInput): string => {
-  const tickers = scenario.assets.map(a => a.ticker).sort().join(',');
-  return `${scenario.startDate}|${scenario.endDate}|${scenario.baseCurrency}|${tickers}`;
+  const assetKey = scenario.assets
+    .map(a => `${a.source}:${a.ticker}:${a.importId ?? ''}`)
+    .sort()
+    .join(',');
+  return `${scenario.startDate}|${scenario.endDate}|${scenario.baseCurrency}|${assetKey}`;
 };
 
 const toDateString = (value?: string): string => (value || '').slice(0, 10);
 
 const getFxPairKey = (from: Currency, to: Currency) => `${from}/${to}`;
+
+const normalizeAssetSeries = (rows: Array<{ date: string; close: number; currency?: Currency }>, asset: BacktestAssetInput): BacktestSourceSeriesPoint[] => {
+  const map = new Map<string, BacktestSourceSeriesPoint>();
+  rows.forEach(row => {
+    const date = toDateString(row.date);
+    const close = Number(row.close);
+    if (!date || !Number.isFinite(close) || close <= 0) return;
+    map.set(date, {
+      assetId: asset.id,
+      date,
+      close,
+      currency: (row.currency || asset.currency) as Currency,
+      source: asset.source,
+      ticker: asset.ticker,
+      importId: asset.importId
+    });
+  });
+  return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
+};
+
+const getSeriesBounds = (rows: BacktestSourceSeriesPoint[]) => {
+  let minDate = '';
+  let maxDate = '';
+  rows.forEach(row => {
+    if (!minDate || row.date < minDate) minDate = row.date;
+    if (!maxDate || row.date > maxDate) maxDate = row.date;
+  });
+  return { minDate, maxDate, count: rows.length };
+};
+
+const getFxBounds = (from: Currency, to: Currency, fxRates: Array<{ baseCurrency: Currency; quoteCurrency: Currency; date: string }>) => {
+  let minDate = '';
+  let maxDate = '';
+  fxRates.forEach(row => {
+    if (!row?.date) return;
+    const date = toDateString(row.date);
+    const matches = (row.baseCurrency === from && row.quoteCurrency === to)
+      || (row.baseCurrency === to && row.quoteCurrency === from);
+    if (!matches || !date) return;
+    if (!minDate || date < minDate) minDate = date;
+    if (!maxDate || date > maxDate) maxDate = date;
+  });
+  return { minDate, maxDate };
+};
 
 export const loadBacktestScenarioData = async (
   scenario: BacktestScenarioInput,
@@ -31,117 +79,166 @@ export const loadBacktestScenarioData = async (
   const startDate = toDateString(scenario.startDate);
   const endDate = toDateString(scenario.endDate);
   const baseCurrency = scenario.baseCurrency;
-  const tickers = Array.from(new Set(scenario.assets.map(a => a.ticker).filter(Boolean)));
 
-  if (!tickers.length || !startDate || !endDate) {
-    return { key, prices: [], fxRates: [], quality: buildEmptyQuality(tickers.length) };
+  if (!scenario.assets.length || !startDate || !endDate) {
+    return { key, series: [], fxRates: [], quality: buildEmptyQuality(scenario.assets.length) };
   }
 
-  const prices = await queryPricesForTickersRange({
-    portfolioId,
-    tickers,
-    startDate,
-    endDate,
-    lookbackDays: 365
+  const appAssets = scenario.assets.filter(a => a.source === 'APP_DB');
+  const csvAssets = scenario.assets.filter(a => a.source === 'CSV_IMPORT');
+
+  const tickers = Array.from(new Set(appAssets.map(a => a.ticker).filter(Boolean)));
+  const importIds = Array.from(new Set(csvAssets.map(a => a.importId).filter((id): id is number => Boolean(id))));
+
+  const [prices, csvPrices] = await Promise.all([
+    tickers.length
+      ? queryPricesForTickersRange({
+        portfolioId,
+        tickers,
+        startDate,
+        endDate,
+        lookbackDays: 365
+      })
+      : Promise.resolve([]),
+    importIds.length
+      ? getBacktestImportPricesByImportIds({
+        importIds,
+        startDate,
+        endDate,
+        lookbackDays: 365
+      })
+      : Promise.resolve([])
+  ]);
+
+  const fxPairs = new Set<string>();
+  scenario.assets.forEach(asset => {
+    const curr = asset.currency as Currency | undefined;
+    if (!curr || curr === baseCurrency) return;
+    fxPairs.add(getFxPairKey(curr, baseCurrency));
+    fxPairs.add(getFxPairKey(baseCurrency, curr));
   });
 
-  const fxPairs = Array.from(
-    new Set(
-      scenario.assets
-        .map(asset => asset.currency)
-        .filter((curr): curr is Currency => Boolean(curr))
-        .filter(curr => curr !== baseCurrency)
-        .map(curr => getFxPairKey(curr, baseCurrency))
-    )
-  );
-
-  const fxRates = fxPairs.length
-    ? await queryFxForPairsRange({
-      pairs: fxPairs,
+  const fxRates = fxPairs.size
+    ? (await queryFxForPairsRange({
+      pairs: Array.from(fxPairs),
       startDate,
       endDate,
       lookbackDays: 365
-    })
+    })).map(row => ({ ...row, date: toDateString(row.date) })).filter(r => r.date)
     : [];
 
-  const quality: BacktestDataQualitySummary = buildEmptyQuality(tickers.length);
-  const byTicker: Record<string, { ticker: string; status: BacktestAssetQualityStatus; message?: string; priceStart?: string; priceEnd?: string; priceCount?: number; currency?: Currency }> = {};
+  const seriesByAssetId = new Map<string, BacktestSourceSeriesPoint[]>();
 
-  let partialCount = 0;
-  let missingCount = 0;
-  let okCount = 0;
-  let fxMissingCount = 0;
+  appAssets.forEach(asset => {
+    const rows = prices.filter(p => p.ticker === asset.ticker)
+      .map(row => ({ date: row.date, close: row.close, currency: row.currency }));
+    const normalized = normalizeAssetSeries(rows, asset);
+    seriesByAssetId.set(asset.id, normalized);
+  });
+
+  csvAssets.forEach(asset => {
+    const rows = csvPrices.filter(p => p.importId === asset.importId)
+      .map(row => ({ date: row.date, close: row.close, currency: asset.currency as Currency }));
+    const normalized = normalizeAssetSeries(rows, asset);
+    seriesByAssetId.set(asset.id, normalized);
+  });
+
+  const quality: BacktestDataQualitySummary = buildEmptyQuality(scenario.assets.length);
+  const byAssetId: Record<string, BacktestAssetQuality> = {};
+
   let commonAvailableStart: string | undefined;
   let commonAvailableEnd: string | undefined;
 
-  tickers.forEach(ticker => {
-    const asset = scenario.assets.find(a => a.ticker === ticker);
-    const rows = prices.filter(p => p.ticker === ticker);
-    const count = rows.length;
-    const minDate = rows.reduce((min, p) => (!min || p.date < min ? p.date : min), '');
-    const maxDate = rows.reduce((max, p) => (!max || p.date > max ? p.date : max), '');
+  scenario.assets.forEach(asset => {
+    const series = seriesByAssetId.get(asset.id) || [];
+    const { minDate, maxDate, count } = getSeriesBounds(series);
+    const assetCurrency = asset.currency as Currency | undefined;
+    const needsFx = assetCurrency && assetCurrency !== baseCurrency;
+
+    const priceMissing = count === 0 || !minDate || !maxDate || maxDate < startDate || minDate > endDate;
+    const pricePartial = !priceMissing && (minDate > startDate || maxDate < endDate);
+
+    let fxMissing = false;
+    let fxPartial = false;
+    let fxMessage: string | undefined;
+    let fxMin: string | undefined;
+    let fxMax: string | undefined;
+
+    if (needsFx) {
+      const bounds = getFxBounds(assetCurrency as Currency, baseCurrency, fxRates);
+      fxMin = bounds.minDate || undefined;
+      fxMax = bounds.maxDate || undefined;
+      if (!fxMin || !fxMax) {
+        fxMissing = true;
+        fxMessage = `FX mancante ${assetCurrency} -> ${baseCurrency}`;
+      } else if (fxMin > startDate) {
+        fxMissing = true;
+        fxMessage = `FX disponibile solo dal ${fxMin}`;
+      } else if (fxMax < endDate) {
+        fxPartial = true;
+      }
+    }
 
     let status: BacktestAssetQualityStatus = 'OK';
     let message: string | undefined;
 
-    if (count === 0 || !minDate || !maxDate || maxDate < startDate || minDate > endDate) {
+    if (priceMissing) {
       status = 'MISSING';
       message = 'Storico assente';
-      missingCount += 1;
-    } else {
-      const assetAvailableStart = minDate <= startDate ? startDate : minDate;
-      const assetAvailableEnd = maxDate >= endDate ? endDate : maxDate;
-      commonAvailableStart = !commonAvailableStart || assetAvailableStart > commonAvailableStart ? assetAvailableStart : commonAvailableStart;
-      commonAvailableEnd = !commonAvailableEnd || assetAvailableEnd < commonAvailableEnd ? assetAvailableEnd : commonAvailableEnd;
-
-      if (minDate > startDate || maxDate < endDate) {
-        status = 'PARTIAL';
-        message = `Storico parziale (${minDate || 'N/D'} → ${maxDate || 'N/D'})`;
-        partialCount += 1;
-      } else {
-        okCount += 1;
+    } else if (fxMissing) {
+      status = 'FX_MISSING';
+      message = fxMessage;
+    } else if (pricePartial || fxPartial) {
+      status = 'PARTIAL';
+      const parts: string[] = [];
+      if (pricePartial) {
+        parts.push(`Storico parziale (${minDate || 'N/D'} -> ${maxDate || 'N/D'})`);
       }
+      if (fxPartial && fxMax) {
+        parts.push(`FX disponibile fino al ${fxMax}`);
+      }
+      message = parts.join(' · ');
     }
 
-    const assetCurrency = asset?.currency;
-    if (assetCurrency && assetCurrency !== baseCurrency) {
-      const directPair = fxRates.filter(row =>
-        (row.baseCurrency === assetCurrency && row.quoteCurrency === baseCurrency)
-        || (row.baseCurrency === baseCurrency && row.quoteCurrency === assetCurrency)
-      );
-      const minFxDate = directPair.reduce((min, r) => (!min || r.date < min ? r.date : min), '');
-      if (!directPair.length || !minFxDate) {
-        status = 'FX_MISSING';
-        message = `FX mancante ${assetCurrency}→${baseCurrency}`;
-        fxMissingCount += 1;
-      } else {
-        const fxAvailableStart = minFxDate <= startDate ? startDate : minFxDate;
-        if (minFxDate > startDate) {
-          status = 'FX_MISSING';
-          message = `FX disponibile solo dal ${minFxDate}`;
-          fxMissingCount += 1;
-        }
-        commonAvailableStart = !commonAvailableStart || fxAvailableStart > commonAvailableStart ? fxAvailableStart : commonAvailableStart;
-      }
+    if (status === 'OK') quality.ok += 1;
+    if (status === 'PARTIAL') quality.partial += 1;
+    if (status === 'MISSING') quality.missing += 1;
+    if (status === 'FX_MISSING') quality.fxMissing += 1;
+
+    let assetAvailableStart = minDate || undefined;
+    let assetAvailableEnd = maxDate || undefined;
+
+    if (needsFx && fxMin) {
+      assetAvailableStart = assetAvailableStart && assetAvailableStart > fxMin ? assetAvailableStart : fxMin;
+    }
+    if (needsFx && fxMax) {
+      assetAvailableEnd = assetAvailableEnd && assetAvailableEnd < fxMax ? assetAvailableEnd : fxMax;
     }
 
-    byTicker[ticker] = {
-      ticker,
+    if (assetAvailableStart && assetAvailableEnd) {
+      commonAvailableStart = !commonAvailableStart || assetAvailableStart > commonAvailableStart
+        ? assetAvailableStart
+        : commonAvailableStart;
+      commonAvailableEnd = !commonAvailableEnd || assetAvailableEnd < commonAvailableEnd
+        ? assetAvailableEnd
+        : commonAvailableEnd;
+    }
+
+    byAssetId[asset.id] = {
+      assetId: asset.id,
+      ticker: asset.ticker,
+      source: asset.source,
       status,
       message,
       priceStart: minDate || undefined,
       priceEnd: maxDate || undefined,
       priceCount: count,
-      currency: asset?.currency
+      currency: assetCurrency
     };
   });
 
-  quality.total = tickers.length;
-  quality.ok = okCount;
-  quality.partial = partialCount;
-  quality.missing = missingCount;
-  quality.fxMissing = fxMissingCount;
-  quality.byTicker = byTicker;
+  quality.total = scenario.assets.length;
+  quality.byAssetId = byAssetId;
   quality.requestedStartDate = startDate;
   quality.requestedEndDate = endDate;
   quality.availableStartDate = commonAvailableStart;
@@ -156,18 +253,18 @@ export const loadBacktestScenarioData = async (
   if (quality.total > 0) {
     quality.messages.push(`${quality.ok}/${quality.total} strumenti con storico valido`);
   }
-  if (partialCount > 0) {
-    quality.messages.push(`${partialCount} strumento${partialCount > 1 ? 'i' : ''} con storico parziale`);
+  if (quality.partial > 0) {
+    quality.messages.push(`${quality.partial} strumento${quality.partial > 1 ? 'i' : ''} con storico parziale`);
   }
-  if (missingCount > 0) {
-    quality.messages.push(`${missingCount} strumento${missingCount > 1 ? 'i' : ''} senza storico nel range`);
+  if (quality.missing > 0) {
+    quality.messages.push(`${quality.missing} strumento${quality.missing > 1 ? 'i' : ''} senza storico nel range`);
   }
-  if (fxMissingCount > 0) {
-    quality.messages.push(`FX mancante per ${fxMissingCount} strumento${fxMissingCount > 1 ? 'i' : ''}`);
+  if (quality.fxMissing > 0) {
+    quality.messages.push(`FX mancante per ${quality.fxMissing} strumento${quality.fxMissing > 1 ? 'i' : ''}`);
   }
 
-  if (missingCount > 0) quality.blockingIssues.push('Storico prezzi mancante per alcuni strumenti.');
-  if (fxMissingCount > 0) quality.blockingIssues.push('FX mancante per alcuni strumenti.');
+  if (quality.missing > 0) quality.blockingIssues.push('Storico prezzi mancante per alcuni strumenti.');
+  if (quality.fxMissing > 0) quality.blockingIssues.push('FX mancante per alcuni strumenti.');
   if (!commonAvailableStart || !commonAvailableEnd || commonAvailableStart > commonAvailableEnd) {
     quality.blockingIssues.push('Nessuna finestra utile comune tra gli strumenti.');
   }
@@ -185,7 +282,7 @@ export const loadBacktestScenarioData = async (
     && hasStartCoverage;
 
   if (!quality.canRun) {
-    quality.status = missingCount > 0 ? 'missing' : 'partial-blocking';
+    quality.status = quality.missing > 0 ? 'missing' : 'partial-blocking';
   } else if (effectiveEndDate < endDate) {
     quality.status = 'partial-runnable';
   } else {
@@ -209,9 +306,14 @@ export const loadBacktestScenarioData = async (
     });
   }
 
+  const series: BacktestSourceSeriesPoint[] = [];
+  seriesByAssetId.forEach(rows => {
+    series.push(...rows);
+  });
+
   return {
     key,
-    prices: prices as PricePoint[],
+    series,
     fxRates,
     quality
   };

@@ -1,4 +1,4 @@
-import { eachDayOfInterval, format } from 'date-fns';
+﻿import { eachMonthOfInterval, endOfMonth, format } from 'date-fns';
 import { BacktestScenarioInput, BacktestResult, BacktestScenarioData } from './backtestTypes';
 import { Currency, PricePoint } from '../types';
 import { fillMissingPrices } from './priceBackfill';
@@ -10,11 +10,30 @@ type FxRateByDate = Map<string, number | null>;
 
 const toDateSafe = (value: string): Date => (isYmd(value) ? parseYmdLocal(value) : new Date(value));
 
-const buildDateIndex = (startDate: string, endDate: string) => {
+const buildMonthlyDateIndex = (startDate: string, endDate: string) => {
   const start = toDateSafe(startDate);
   const end = toDateSafe(endDate);
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) return [];
-  return eachDayOfInterval({ start, end }).map(d => format(d, 'yyyy-MM-dd'));
+
+  const months = eachMonthOfInterval({ start, end });
+  const result: string[] = [];
+
+  const pushUnique = (value: string) => {
+    if (!result.includes(value)) result.push(value);
+  };
+
+  pushUnique(startDate);
+
+  months.forEach(month => {
+    const monthEnd = format(endOfMonth(month), 'yyyy-MM-dd');
+    if (monthEnd > startDate && monthEnd < endDate) {
+      pushUnique(monthEnd);
+    }
+  });
+
+  pushUnique(endDate);
+
+  return result;
 };
 
 const buildFxRateSeries = (
@@ -58,13 +77,13 @@ const buildFxRateSeries = (
   return map;
 };
 
-const buildPriceSeriesByDate = (
+const buildPriceSeriesByAsset = (
   dateIndex: string[],
   prices: PricePoint[],
-  ticker: string
+  assetIds: string[]
 ) => {
-  const fillResult = fillMissingPrices(prices, dateIndex, { tickers: [ticker] });
-  return fillResult.filledByTicker.get(ticker) || new Map();
+  const fillResult = fillMissingPrices(prices, dateIndex, { tickers: assetIds });
+  return fillResult.filledByTicker;
 };
 
 export const runBacktest = (
@@ -75,7 +94,7 @@ export const runBacktest = (
   const errors: string[] = [];
   const effectiveStart = data.quality.effectiveStartDate || scenario.startDate;
   const effectiveEnd = data.quality.effectiveEndDate || scenario.endDate;
-  const dateIndex = buildDateIndex(effectiveStart, effectiveEnd);
+  const dateIndex = buildMonthlyDateIndex(effectiveStart, effectiveEnd);
 
   if (effectiveEnd < scenario.endDate) {
     warnings.push(`Backtest eseguito fino al ${effectiveEnd} (ultima data disponibile).`);
@@ -133,13 +152,30 @@ export const runBacktest = (
   }
 
   const baseCurrency = scenario.baseCurrency;
-  const priceSeriesByTicker = new Map<string, Map<string, PricePoint>>();
-  const fxSeriesCache = new Map<string, FxRateByDate>();
-
+  const seriesByAssetId = new Map<string, PricePoint[]>();
   scenario.assets.forEach(asset => {
-    const series = buildPriceSeriesByDate(dateIndex, data.prices, asset.ticker);
-    priceSeriesByTicker.set(asset.ticker, series as Map<string, PricePoint>);
+    seriesByAssetId.set(asset.id, []);
   });
+
+  data.series.forEach(point => {
+    const arr = seriesByAssetId.get(point.assetId) || [];
+    arr.push({
+      ticker: point.assetId,
+      date: point.date,
+      close: point.close,
+      currency: point.currency as Currency
+    });
+    seriesByAssetId.set(point.assetId, arr);
+  });
+
+  const pricePoints: PricePoint[] = [];
+  seriesByAssetId.forEach((rows) => {
+    rows.forEach(row => pricePoints.push(row));
+  });
+
+  const assetIds = scenario.assets.map(asset => asset.id);
+  const priceSeriesByAsset = buildPriceSeriesByAsset(dateIndex, pricePoints, assetIds);
+  const fxSeriesCache = new Map<string, FxRateByDate>();
 
   const getFxSeries = (from: Currency) => {
     const key = `${from}/${baseCurrency}`;
@@ -149,12 +185,12 @@ export const runBacktest = (
     return map;
   };
 
-  const priceBaseByTicker = new Map<string, Map<string, number>>();
+  const priceBaseByAsset = new Map<string, Map<string, number>>();
   const missingPriceAssets = new Set<string>();
   const missingFxAssets = new Set<string>();
 
   scenario.assets.forEach(asset => {
-    const series = priceSeriesByTicker.get(asset.ticker);
+    const series = priceSeriesByAsset.get(asset.id);
     const priceByDate = new Map<string, number>();
 
     dateIndex.forEach(date => {
@@ -180,7 +216,7 @@ export const runBacktest = (
       priceByDate.set(date, price * fxRate);
     });
 
-    priceBaseByTicker.set(asset.ticker, priceByDate);
+    priceBaseByAsset.set(asset.id, priceByDate);
   });
 
   if (missingPriceAssets.size > 0) {
@@ -207,6 +243,7 @@ export const runBacktest = (
   }
 
   const weights = scenario.assets.map(asset => ({
+    assetId: asset.id,
     ticker: asset.ticker,
     weight: Math.max(0, asset.allocationPct) / 100
   }));
@@ -217,53 +254,58 @@ export const runBacktest = (
 
   const startDate = dateIndex[0];
   weights.forEach(asset => {
-    const price = priceBaseByTicker.get(asset.ticker)?.get(startDate) || 0;
+    const price = priceBaseByAsset.get(asset.assetId)?.get(startDate) || 0;
     if (!price || price <= 0) return;
     const units = (scenario.initialCapital * asset.weight) / price;
-    holdings.set(asset.ticker, units);
+    holdings.set(asset.assetId, units);
   });
   if (scenario.initialCapital > 0) {
     externalFlows.push({ date: startDate, amount: scenario.initialCapital });
   }
 
-  const startMonthDay = startDate.slice(5);
+  const startMonth = startDate.slice(5, 7);
   const startYear = Number(startDate.slice(0, 4));
+  let lastContributionYear = startYear;
+  let lastRebalanceYear = startYear;
 
   const navSeries = dateIndex.map(date => {
     const currentYear = Number(date.slice(0, 4));
-    const isAnniversary = date.slice(5) === startMonthDay && currentYear > startYear;
+    const currentMonth = date.slice(5, 7);
+    const isAnniversaryMonth = currentYear > startYear && currentMonth === startMonth;
 
-    if (isAnniversary && scenario.annualContribution > 0) {
+    if (isAnniversaryMonth && scenario.annualContribution > 0 && currentYear !== lastContributionYear) {
       weights.forEach(asset => {
-        const price = priceBaseByTicker.get(asset.ticker)?.get(date) || 0;
+        const price = priceBaseByAsset.get(asset.assetId)?.get(date) || 0;
         if (!price || price <= 0) return;
         const addUnits = (scenario.annualContribution * asset.weight) / price;
-        holdings.set(asset.ticker, (holdings.get(asset.ticker) || 0) + addUnits);
+        holdings.set(asset.assetId, (holdings.get(asset.assetId) || 0) + addUnits);
       });
       contributionCumulative += scenario.annualContribution;
       externalFlows.push({ date, amount: scenario.annualContribution });
+      lastContributionYear = currentYear;
     }
 
-    if (isAnniversary && scenario.rebalanceFrequency === 'annual') {
+    if (isAnniversaryMonth && scenario.rebalanceFrequency === 'annual' && currentYear !== lastRebalanceYear) {
       let totalValue = 0;
       weights.forEach(asset => {
-        const price = priceBaseByTicker.get(asset.ticker)?.get(date) || 0;
-        totalValue += (holdings.get(asset.ticker) || 0) * price;
+        const price = priceBaseByAsset.get(asset.assetId)?.get(date) || 0;
+        totalValue += (holdings.get(asset.assetId) || 0) * price;
       });
       if (totalValue > 0) {
         weights.forEach(asset => {
-          const price = priceBaseByTicker.get(asset.ticker)?.get(date) || 0;
+          const price = priceBaseByAsset.get(asset.assetId)?.get(date) || 0;
           if (!price || price <= 0) return;
           const targetUnits = (totalValue * asset.weight) / price;
-          holdings.set(asset.ticker, targetUnits);
+          holdings.set(asset.assetId, targetUnits);
         });
       }
+      lastRebalanceYear = currentYear;
     }
 
     let nav = 0;
     weights.forEach(asset => {
-      const price = priceBaseByTicker.get(asset.ticker)?.get(date) || 0;
-      nav += (holdings.get(asset.ticker) || 0) * price;
+      const price = priceBaseByAsset.get(asset.assetId)?.get(date) || 0;
+      nav += (holdings.get(asset.assetId) || 0) * price;
     });
 
     return {
@@ -282,7 +324,7 @@ export const runBacktest = (
   }));
 
   const twrrHistory = computeTWRRFromNav(perfHistory, externalFlows);
-  const analytics = calculateAnalytics(twrrHistory, 'daily');
+  const analytics = calculateAnalytics(twrrHistory, 'monthly');
 
   const drawdownByDate = new Map(analytics.drawdownSeries.map(d => [d.date, d.depth]));
   const navSeriesWithDd = navSeries.map(point => ({
