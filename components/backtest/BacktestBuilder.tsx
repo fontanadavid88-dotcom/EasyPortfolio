@@ -1,9 +1,12 @@
-import React, { useMemo } from 'react';
+﻿import React, { useMemo, useState } from 'react';
 import clsx from 'clsx';
-import { Instrument } from '../../types';
-import { BacktestScenarioInput, BacktestDataQualitySummary } from '../../services/backtestTypes';
+import { Instrument, BacktestImport } from '../../types';
+import { BacktestScenarioInput, BacktestDataQualitySummary, BacktestAssetInput } from '../../services/backtestTypes';
 import { BacktestAssetsTable } from './BacktestAssetsTable';
 import { AllocationStatus } from './AllocationStatus';
+import { BacktestCsvImportPanel } from './BacktestCsvImportPanel';
+import { BacktestImportList } from './BacktestImportList';
+import { deleteBacktestImport } from '../../services/backtestImportRepository';
 
 const normalizeAllocations = (assets: BacktestScenarioInput['assets']) => {
   const total = assets.reduce((sum, a) => sum + (Number.isFinite(a.allocationPct) ? a.allocationPct : 0), 0);
@@ -27,16 +30,54 @@ const normalizeAllocations = (assets: BacktestScenarioInput['assets']) => {
 export const BacktestBuilder: React.FC<{
   scenario: BacktestScenarioInput;
   instruments: Instrument[];
+  imports: BacktestImport[];
+  portfolioId: string;
   quality: BacktestDataQualitySummary | null;
   qualityLoading?: boolean;
+  currentScenarioId?: number | null;
+  scenarioStateLabel?: string;
+  isDirty?: boolean;
+  saveNotice?: string | null;
+  missingCsvImports?: string[];
   onScenarioChange: (next: BacktestScenarioInput) => void;
   onRun: () => void;
   isRunning?: boolean;
-}> = ({ scenario, instruments, quality, qualityLoading, onScenarioChange, onRun, isRunning }) => {
+  onSaveScenario: () => void;
+  onDuplicateScenario: () => void;
+  onNewScenario: () => void;
+  onDeleteScenario: () => void;
+}> = ({
+  scenario,
+  instruments,
+  imports,
+  portfolioId,
+  quality,
+  qualityLoading,
+  currentScenarioId,
+  scenarioStateLabel,
+  isDirty,
+  saveNotice,
+  missingCsvImports,
+  onScenarioChange,
+  onRun,
+  isRunning,
+  onSaveScenario,
+  onDuplicateScenario,
+  onNewScenario,
+  onDeleteScenario
+}) => {
   const allocationSum = useMemo(
     () => scenario.assets.reduce((sum, a) => sum + (Number.isFinite(a.allocationPct) ? a.allocationPct : 0), 0),
     [scenario.assets]
   );
+  const [showImportPanel, setShowImportPanel] = useState(false);
+  const selectedImportIds = useMemo(() => {
+    const ids = new Set<number>();
+    scenario.assets.forEach(asset => {
+      if (asset.importId) ids.add(asset.importId);
+    });
+    return ids;
+  }, [scenario.assets]);
 
   const qualityStatusLabel = useMemo(() => {
     if (!quality?.status) return null;
@@ -50,9 +91,9 @@ export const BacktestBuilder: React.FC<{
     const errors: string[] = [];
     if (!scenario.title.trim()) errors.push('Inserisci un titolo per il backtest.');
     if (!scenario.startDate || !scenario.endDate) errors.push('Date non valide.');
-    if (scenario.startDate && scenario.endDate && scenario.startDate > scenario.endDate) errors.push('La data di inizio è successiva alla data di fine.');
-    if (scenario.initialCapital < 0) errors.push('Il capitale iniziale non può essere negativo.');
-    if (scenario.annualContribution < 0) errors.push('Il versamento annuale non può essere negativo.');
+    if (scenario.startDate && scenario.endDate && scenario.startDate > scenario.endDate) errors.push('La data di inizio eÌ€ successiva alla data di fine.');
+    if (scenario.initialCapital < 0) errors.push('Il capitale iniziale non puoÌ€ essere negativo.');
+    if (scenario.annualContribution < 0) errors.push('Il versamento annuale non puoÌ€ essere negativo.');
     if (scenario.assets.length === 0) errors.push('Aggiungi almeno uno strumento.');
     if (Math.abs(allocationSum - 100) > 0.01) errors.push('La somma delle allocazioni deve essere 100%.');
     if (quality && !quality.canRun) {
@@ -62,6 +103,30 @@ export const BacktestBuilder: React.FC<{
   }, [scenario, allocationSum, quality]);
 
   const canRun = validationErrors.length === 0 && !qualityLoading && !isRunning;
+
+  const handleAddImportAsset = (imp: BacktestImport) => {
+    if (!imp.id || selectedImportIds.has(imp.id)) return;
+    const newAsset: BacktestAssetInput = {
+      id: `csv-${imp.id}`,
+      source: 'CSV_IMPORT',
+      ticker: imp.ticker,
+      name: imp.name,
+      allocationPct: 0,
+      assetClass: imp.assetClass,
+      currency: imp.currency,
+      importId: imp.id
+    };
+    onScenarioChange({ ...scenario, assets: [...scenario.assets, newAsset] });
+  };
+
+  const handleDeleteImport = async (imp: BacktestImport) => {
+    if (!imp.id) return;
+    await deleteBacktestImport(imp.id);
+    const nextAssets = scenario.assets.filter(asset => asset.importId !== imp.id);
+    if (nextAssets.length !== scenario.assets.length) {
+      onScenarioChange({ ...scenario, assets: nextAssets });
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -76,6 +141,37 @@ export const BacktestBuilder: React.FC<{
             <div className="text-sm font-semibold text-slate-700">{scenario.baseCurrency}</div>
           </div>
         </div>
+
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div className="text-xs text-slate-600">
+            <span className="font-semibold text-slate-700">{scenarioStateLabel || 'Scenario'}</span>
+            {isDirty && currentScenarioId && (
+              <span className="ml-2 text-amber-600">Modifiche non salvate</span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" className="ui-btn-secondary px-3 py-2 text-xs" onClick={onNewScenario}>
+              Nuovo
+            </button>
+            <button type="button" className="ui-btn-secondary px-3 py-2 text-xs" onClick={onSaveScenario}>
+              Salva scenario
+            </button>
+            <button type="button" className="ui-btn-secondary px-3 py-2 text-xs" onClick={onDuplicateScenario}>
+              Duplica
+            </button>
+            <button
+              type="button"
+              className={clsx('ui-btn-ghost px-3 py-2 text-xs text-rose-600', !currentScenarioId && 'cursor-not-allowed opacity-60')}
+              onClick={onDeleteScenario}
+              disabled={!currentScenarioId}
+            >
+              Elimina
+            </button>
+          </div>
+        </div>
+        {saveNotice && (
+          <div className="text-xs text-emerald-700">{saveNotice}</div>
+        )}
 
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           <div>
@@ -139,12 +235,41 @@ export const BacktestBuilder: React.FC<{
         </div>
       </div>
 
+      <div className="ui-panel-subtle p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold text-slate-700">Import CSV Backtest</div>
+          <button
+            type="button"
+            className="ui-btn-secondary px-3 py-2 text-xs"
+            onClick={() => setShowImportPanel(prev => !prev)}
+          >
+            {showImportPanel ? 'Chiudi import' : 'Importa CSV'}
+          </button>
+        </div>
+        {showImportPanel && (
+          <BacktestCsvImportPanel portfolioId={portfolioId} onClose={() => setShowImportPanel(false)} />
+        )}
+        <BacktestImportList
+          imports={imports}
+          selectedImportIds={selectedImportIds}
+          onAdd={handleAddImportAsset}
+          onDelete={handleDeleteImport}
+        />
+      </div>
+
       <BacktestAssetsTable
         assets={scenario.assets}
         instruments={instruments}
         onChange={(assets) => onScenarioChange({ ...scenario, assets })}
-        qualityByTicker={quality?.byTicker}
+        qualityByAssetId={quality?.byAssetId}
+        csvImports={imports}
       />
+
+      {missingCsvImports && missingCsvImports.length > 0 && (
+        <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-4 text-xs text-amber-800">
+          Import CSV non piu disponibile: {missingCsvImports.join(', ')}
+        </div>
+      )}
 
       <AllocationStatus
         total={allocationSum}
@@ -154,7 +279,7 @@ export const BacktestBuilder: React.FC<{
 
       <div className="ui-panel-subtle p-4 space-y-2">
         <div className="flex items-center justify-between">
-          <div className="text-sm font-semibold text-slate-700">Qualità dati scenario</div>
+          <div className="text-sm font-semibold text-slate-700">Qualita dati scenario</div>
           {qualityStatusLabel && (
             <span className={clsx('text-[11px] uppercase tracking-wide font-semibold px-2 py-1 rounded-full border', qualityStatusLabel.className)}>
               {qualityStatusLabel.text}
@@ -167,9 +292,9 @@ export const BacktestBuilder: React.FC<{
         )}
         {!qualityLoading && quality && (
           <div className="text-xs text-slate-600 space-y-1">
-            <div>Richiesto: {quality.requestedStartDate || '—'} → {quality.requestedEndDate || '—'}</div>
-            <div>Disponibile: {quality.availableStartDate || '—'} → {quality.availableEndDate || '—'}</div>
-            <div>Effettivo: {quality.effectiveStartDate || '—'} → {quality.effectiveEndDate || '—'}</div>
+            <div>Richiesto: {quality.requestedStartDate || '-'} {'->'} {quality.requestedEndDate || '-'}</div>
+            <div>Disponibile: {quality.availableStartDate || '-'} {'->'} {quality.availableEndDate || '-'}</div>
+            <div>Effettivo: {quality.effectiveStartDate || '-'} {'->'} {quality.effectiveEndDate || '-'}</div>
           </div>
         )}
         {!qualityLoading && quality && quality.messages.length > 0 && (
@@ -210,3 +335,7 @@ export const BacktestBuilder: React.FC<{
     </div>
   );
 };
+
+
+
+

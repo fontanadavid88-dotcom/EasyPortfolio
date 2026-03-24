@@ -199,3 +199,60 @@ export interface FxRate {
   rate: number;
   source?: string;
 }
+
+// --- BACKTEST CSV IMPORTS ---
+
+export type BacktestAssetClass = 'Equity' | 'Bond' | 'Gold' | 'Crypto' | 'Cash' | 'Other';
+
+export type BacktestImportSource = 'CSV_IMPORT';
+
+export interface BacktestImport {
+  id?: number;
+  portfolioId?: string;
+  createdAt: string;
+  updatedAt: string;
+  name: string;
+  ticker: string;
+  currency: string;
+  assetClass: BacktestAssetClass;
+  sourceLabel: BacktestImportSource;
+  rowCount: number;
+  validRowCount: number;
+  firstDate?: string;
+  lastDate?: string;
+  originalFileName: string;
+  notes?: string;
+}
+
+export interface BacktestImportPrice {
+  id?: number;
+  importId: number;
+  date: string; // YYYY-MM-DD
+  close: number;
+}
+
+export interface BacktestScenarioAssetRecord {
+  id: string;
+  source: 'APP_DB' | 'CSV_IMPORT';
+  ticker: string;
+  name: string;
+  allocationPct: number;
+  assetClass: BacktestAssetClass;
+  currency: string;
+  importId?: number;
+}
+
+export interface BacktestScenarioRecord {
+  id?: number;
+  portfolioId?: string;
+  createdAt: string;
+  updatedAt: string;
+  title: string;
+  startDate: string;
+  endDate: string;
+  initialCapital: number;
+  annualContribution: number;
+  rebalanceFrequency: 'none' | 'annual';
+  baseCurrency: string;
+  assets: BacktestScenarioAssetRecord[];
+}
