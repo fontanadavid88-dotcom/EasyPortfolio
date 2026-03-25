@@ -46,6 +46,10 @@ const resolveInstrumentForTicker = (instruments: Instrument[], ticker: string): 
 
 export const Data: React.FC = () => {
   const currentPortfolioId = getCurrentPortfolioId();
+  const settings = useLiveQuery(
+    () => db.settings.where('portfolioId').equals(currentPortfolioId).first(),
+    [currentPortfolioId]
+  );
   const location = useLocation();
   const [tab, setTab] = useState<TabKey>('prices');
   const [showUnusedTickers, setShowUnusedTickers] = useState(false);
@@ -69,6 +73,7 @@ export const Data: React.FC = () => {
     [currentPortfolioId],
     []
   );
+  const baseCurrency = settings?.baseCurrency || Currency.CHF;
   const transactions = useLiveQuery(
     () => db.transactions.where('portfolioId').equals(currentPortfolioId).toArray(),
     [currentPortfolioId],
@@ -193,13 +198,13 @@ export const Data: React.FC = () => {
   }, [instruments, transactions]);
 
   const fxPairs = useMemo(() => {
-    const base = Currency.CHF;
+    const base = baseCurrency;
     return Array.from(new Set(
       portfolioCurrencies
         .filter(c => c && c !== base)
         .map(c => `${c}/${base}`)
     )).sort();
-  }, [portfolioCurrencies]);
+  }, [portfolioCurrencies, baseCurrency]);
 
   const fxPairsKey = useMemo(() => fxPairs.join('|'), [fxPairs]);
 
@@ -357,6 +362,20 @@ export const Data: React.FC = () => {
   }, [selectedTicker, instruments]);
 
   const selectedCanonicalTicker = selectedInstrument ? getCanonicalTicker(selectedInstrument) : '';
+  const selectedCurrency = selectedInstrument?.preferredListing?.currency || selectedInstrument?.currency;
+  const selectedFxPairForTicker = useMemo(() => {
+    if (!selectedCurrency || selectedCurrency === baseCurrency) return '';
+    return `${selectedCurrency}/${baseCurrency}`;
+  }, [selectedCurrency, baseCurrency]);
+  const selectedFxLatest = useLiveQuery(
+    async () => {
+      if (!selectedFxPairForTicker) return [];
+      return queryLatestFxForPairs({ pairs: [selectedFxPairForTicker] });
+    },
+    [selectedFxPairForTicker],
+    []
+  );
+  const selectedFxLatestDate = selectedFxLatest?.[0]?.date;
   const isSelectedPreferred = !!selectedTicker && !!selectedCanonicalTicker && selectedTicker === selectedCanonicalTicker;
   const hasPriceData = useMemo(() => {
     if (!selectedTicker) return false;
@@ -513,6 +532,21 @@ export const Data: React.FC = () => {
       visiblePriceIssues: analysis.issues.filter(issue => !issue.date || issue.date >= warningsFromDate)
     };
   }, [filteredPrices, selectedInstrument, warningsFromDate]);
+  const selectedPriceLatestDate = selectedTickerBounds?.lastPriceDate || '';
+  const selectedEffectiveDate = useMemo(() => {
+    if (!selectedTicker || !selectedPriceLatestDate) return '';
+    if (!selectedFxPairForTicker) return selectedPriceLatestDate;
+    if (!selectedFxLatestDate) return '';
+    return selectedPriceLatestDate < selectedFxLatestDate ? selectedPriceLatestDate : selectedFxLatestDate;
+  }, [selectedTicker, selectedPriceLatestDate, selectedFxLatestDate, selectedFxPairForTicker]);
+  const selectedLimitingLabel = useMemo(() => {
+    if (!selectedTicker || !selectedPriceLatestDate) return 'Prezzo mancante';
+    if (!selectedFxPairForTicker) return 'Prezzo (FX non richiesto)';
+    if (!selectedFxLatestDate) return `FX mancante (${selectedFxPairForTicker})`;
+    if (selectedFxLatestDate < selectedPriceLatestDate) return `FX (${selectedFxPairForTicker})`;
+    if (selectedPriceLatestDate < selectedFxLatestDate) return 'Prezzo';
+    return 'Allineato';
+  }, [selectedTicker, selectedPriceLatestDate, selectedFxLatestDate, selectedFxPairForTicker]);
 
   const fxFiltered = useMemo(() => {
     return selectedFxRates || [];
@@ -1072,10 +1106,26 @@ export const Data: React.FC = () => {
     };
   }, [rebalanceQuality, priceChecksSummary, fxChecksSummary, navChecks]);
 
-  const getStatusBadge = (issueCount: number, stats: { gaps: number; invalid: number }) => {
-    if (issueCount === 0) return { label: 'OK', className: 'bg-emerald-100 text-emerald-800', title: 'OK: nessun problema rilevato' };
-    if (stats.gaps > 0 || stats.invalid > 0) return { label: 'INCOMPLETO', className: 'bg-amber-100 text-amber-800', title: 'Incompleto: gap o dati invalidi' };
-    return { label: 'PARZIALE', className: 'bg-slate-100 text-slate-700', title: 'Parziale: anomalie non bloccanti' };
+  const getStatusBadge = (issueCount: number, stats: { gaps: number; invalid: number; duplicates: number; outliers: number; nonMonotone: number }) => {
+    if (issueCount === 0) {
+      return { label: 'OK', className: 'bg-emerald-100 text-emerald-800', title: 'OK: nessun problema rilevato' };
+    }
+    if (stats.invalid > 0) {
+      return { label: 'INCOMPLETO (dati invalidi)', className: 'bg-amber-100 text-amber-800', title: 'Incompleto: dati invalidi' };
+    }
+    if (stats.gaps > 0) {
+      return { label: 'INCOMPLETO (gap interno)', className: 'bg-amber-100 text-amber-800', title: 'Incompleto: gap interno nella serie' };
+    }
+    if (stats.nonMonotone > 0) {
+      return { label: 'PARZIALE (date non monotone)', className: 'bg-slate-100 text-slate-700', title: 'Parziale: date non monotone' };
+    }
+    if (stats.duplicates > 0) {
+      return { label: 'PARZIALE (duplicati)', className: 'bg-slate-100 text-slate-700', title: 'Parziale: date duplicate' };
+    }
+    if (stats.outliers > 0) {
+      return { label: 'PARZIALE (outlier)', className: 'bg-slate-100 text-slate-700', title: 'Parziale: outlier nella serie' };
+    }
+    return { label: 'PARZIALE (anomalie)', className: 'bg-slate-100 text-slate-700', title: 'Parziale: anomalie non bloccanti' };
   };
 
   const openTab = (next: TabKey) => {
@@ -1343,6 +1393,28 @@ export const Data: React.FC = () => {
                       Currency bloccata: per cambiarla reimporta lo storico corretto.
                     </div>
                   )}
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-3 text-xs text-slate-700">
+                <div className="ui-panel-subtle p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">Prezzo DB latest</div>
+                  <div className="font-semibold">{selectedPriceLatestDate || 'N/D'}</div>
+                </div>
+                <div className="ui-panel-subtle p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">FX richiesto</div>
+                  <div className="font-semibold">{selectedFxPairForTicker || 'Non richiesto'}</div>
+                </div>
+                <div className="ui-panel-subtle p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">FX DB latest</div>
+                  <div className="font-semibold">{selectedFxPairForTicker ? (selectedFxLatestDate || 'N/D') : 'Non richiesto'}</div>
+                </div>
+                <div className="ui-panel-subtle p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">Data effettiva</div>
+                  <div className="font-semibold">{selectedEffectiveDate || 'N/D'}</div>
+                </div>
+                <div className="ui-panel-subtle p-3 text-slate-800">
+                  <div className="text-[10px] uppercase font-bold text-slate-600">Limite</div>
+                  <div className="font-semibold">{selectedLimitingLabel || 'N/D'}</div>
                 </div>
               </div>
 

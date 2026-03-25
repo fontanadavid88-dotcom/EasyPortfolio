@@ -1,11 +1,12 @@
 ﻿import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { calculateHoldings, calculateRebalancing, getCanonicalTicker, getLatestPricePoint, getValuationDateForHoldings } from '../services/financeUtils';
+import { calculateHoldings, calculateRebalancing, getCanonicalTicker, getValuationDateForHoldings } from '../services/financeUtils';
 import { computeHoldingsPriceDateStats } from '../services/dataFreshness';
+import { computePortfolioCoverage } from '../services/dataCoverage';
 import { diffDaysYmd } from '../services/dateUtils';
 import { RebalanceStrategy, AssetType, AssetClass, Instrument, Currency, RegionKey, PortfolioPosition, RebalancePlan } from '../types';
-import { convertAmountFromSeries } from '../services/fxService';
+import { computeCurrentValuedPositions } from '../services/positionValuation';
 import { analyzeRebalanceQuality, getIssueHelp } from '../services/dataQuality';
 import { queryLatestFxForPairs, queryLatestPricesForTickers } from '../services/dbQueries';
 import { InfoPopover } from '../components/InfoPopover';
@@ -321,69 +322,33 @@ export const Rebalance: React.FC = () => {
 
     const rebalanceData = useMemo(() => {
         if (!transactions || !prices || !instruments || !fxRates || !rebalanceDate) return null;
-        const uniqueInstruments = Array.from(
-            new Map(instruments.map(inst => [inst.ticker, inst])).values()
-        );
-        const positions: PortfolioPosition[] = [];
-        let totalValueCHF = 0;
-        const fxDates: string[] = [];
-        const valuationMeta = new Map<string, { priceCurrency: Currency; priceDate?: string; fxDate?: string; fxRateToChf?: number; valueLocal: number }>();
-
-        holdings.forEach((qty, ticker) => {
-            if (qty <= 0.000001) return;
-            const instr = uniqueInstruments.find(i => i.ticker === ticker);
-            if (!instr) return;
-            const priceTicker = getCanonicalTicker(instr);
-            const pricePoint = getLatestPricePoint(priceTicker, rebalanceDate, prices);
-            const price = pricePoint?.close || 0;
-            const priceCurrency = (pricePoint?.currency || instr.currency || Currency.CHF) as Currency;
-            const valueLocal = qty * price;
-            let fxRateToChf: number | undefined;
-            let fxDate: string | undefined;
-            let valueCHF = 0;
-            if (priceCurrency === Currency.CHF) {
-                fxRateToChf = 1;
-                fxDate = rebalanceDate;
-                valueCHF = valueLocal;
-            } else {
-                const converted = convertAmountFromSeries(valueLocal, priceCurrency, Currency.CHF, rebalanceDate, fxRates);
-                if (converted) {
-                    fxRateToChf = converted.lookup.rate;
-                    fxDate = converted.lookup.date;
-                    fxDates.push(converted.lookup.date);
-                    valueCHF = converted.value;
-                }
-            }
-            totalValueCHF += valueCHF;
-            positions.push({
-                ticker: instr.ticker,
-                name: instr.name,
-                assetType: instr.type,
-                assetClass: instr.assetClass,
-                currency: instr.currency,
-                quantity: qty,
-                currentPrice: price,
-                currentValueCHF: valueCHF,
-                targetPct: instr.targetAllocation || 0,
-                currentPct: 0
-            });
-            valuationMeta.set(instr.ticker, {
-                priceCurrency,
-                priceDate: pricePoint?.date,
-                fxDate,
-                fxRateToChf,
-                valueLocal
-            });
+        return computeCurrentValuedPositions({
+            holdings,
+            instruments,
+            prices,
+            fxRates,
+            valuationDate: rebalanceDate,
+            baseCurrency: Currency.CHF
         });
-
-        positions.forEach(p => {
-            p.currentPct = totalValueCHF > 0 ? (p.currentValueCHF / totalValueCHF) * 100 : 0;
-        });
-
-        const oldestFxDate = fxDates.length ? fxDates.sort()[0] : '';
-
-        return { positions, totalValueCHF, valuationMeta, oldestFxDate };
     }, [transactions, prices, instruments, fxRates, rebalanceDate, holdings]);
+
+    const rebalanceCoverage = useMemo(() => {
+        if (!prices || !fxRates || !instruments) return null;
+        return computePortfolioCoverage({
+            holdings,
+            instruments,
+            baseCurrency: Currency.CHF,
+            latestPrices: prices,
+            latestFx: fxRates
+        });
+    }, [holdings, instruments, prices, fxRates]);
+
+    const effectiveValuationDate = rebalanceCoverage?.effective.latest || '';
+    const limitingCoverageLabel = rebalanceCoverage?.effective.limiting
+        ? (rebalanceCoverage.effective.limiting.type === 'fx'
+            ? `FX (${rebalanceCoverage.effective.limiting.key})`
+            : `Prezzo (${rebalanceCoverage.effective.limiting.key})`)
+        : 'Allineato';
 
     const usedPriceDates = useMemo(() => {
         if (!rebalanceData?.valuationMeta) return [];
@@ -1077,6 +1042,7 @@ export const Rebalance: React.FC = () => {
                     instruments={instruments || []}
                     prices={latestPricesAll || []}
                     fxUsed={rebalanceData?.oldestFxDate || undefined}
+                    coverage={rebalanceCoverage || undefined}
                     variant="rebalance"
                     rebalanceDate={rebalanceDate || undefined}
                     usedPriceDates={usedPriceDates}
@@ -1088,6 +1054,14 @@ export const Rebalance: React.FC = () => {
                         <span>Prezzi (rebalance): {rebalanceDate || 'N/D'}</span>
                         <span>·</span>
                         <span>FX (usato): {rebalanceData?.oldestFxDate || 'N/D'}</span>
+                        <span>·</span>
+                        <span>Valutazione effettiva: {effectiveValuationDate || 'N/D'}</span>
+                        {effectiveValuationDate && limitingCoverageLabel && limitingCoverageLabel !== 'Allineato' && (
+                            <>
+                                <span>·</span>
+                                <span>Limite: {limitingCoverageLabel}</span>
+                            </>
+                        )}
                         {hasFxStale && (
                             <span className="px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 font-bold border border-amber-200">
                                 FX stale

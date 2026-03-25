@@ -202,6 +202,7 @@ export interface CoverageRow {
   from: string;
   to: string;
   status: 'OK' | 'INCOMPLETO' | 'PARZIALE';
+  reason?: string;
 }
 
 export type SyncPricesSummary = {
@@ -336,6 +337,58 @@ export const computeAutoGapRange = (
   return { from: nextDay < minFrom ? minFrom : nextDay, to: today };
 };
 
+type InternalGapRange = { from: string; to: string; gapDays: number };
+
+const resolveGapThresholdDays = (assetType: AssetType | undefined, defaultDays: number): number => {
+  if (assetType === AssetType.Crypto) return 1;
+  return defaultDays;
+};
+
+const mergeGapRanges = (ranges: InternalGapRange[], mergeWithinDays = 2): InternalGapRange[] => {
+  if (ranges.length <= 1) return ranges;
+  const sorted = ranges.slice().sort((a, b) => a.from.localeCompare(b.from));
+  const merged: InternalGapRange[] = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = merged[merged.length - 1];
+    const next = sorted[i];
+    const mergeCutoff = addDaysYmd(prev.to, mergeWithinDays);
+    if (next.from <= mergeCutoff) {
+      prev.to = next.to > prev.to ? next.to : prev.to;
+      prev.gapDays = diffDaysYmd(prev.to, prev.from) + 1;
+    } else {
+      merged.push({ ...next });
+    }
+  }
+  return merged;
+};
+
+const buildInternalGapRanges = (
+  rows: PricePoint[],
+  params: {
+    minAllowedFrom: string;
+    maxAllowedTo: string;
+    gapThresholdDays: number;
+    mergeWithinDays?: number;
+  }
+): InternalGapRange[] => {
+  const { minAllowedFrom, maxAllowedTo, gapThresholdDays, mergeWithinDays = 2 } = params;
+  if (rows.length < 2) return [];
+  const ranges: InternalGapRange[] = [];
+  for (let idx = 0; idx < rows.length - 1; idx++) {
+    const curr = rows[idx]?.date;
+    const next = rows[idx + 1]?.date;
+    if (!curr || !next) continue;
+    const gapDays = diffDaysYmd(next, curr) - 1;
+    if (gapDays < gapThresholdDays) continue;
+    let from = addDaysYmd(curr, 1);
+    let to = subDaysYmd(next, 1);
+    if (from < minAllowedFrom) from = minAllowedFrom;
+    if (to > maxAllowedTo) to = maxAllowedTo;
+    if (from <= to) ranges.push({ from, to, gapDays });
+  }
+  return mergeGapRanges(ranges, mergeWithinDays);
+};
+
 export const limitTickersByBudget = (
   tickers: string[],
   maxApiCallsPerRun?: number,
@@ -366,7 +419,20 @@ export const buildCoverageRows = (
     const okEnd = range.lastDate
       ? diffDaysYmd(today, range.lastDate) <= COVERAGE_TOLERANCE_DAYS
       : false;
-    const status: CoverageRow['status'] = okStart && okEnd ? 'OK' : okStart || okEnd ? 'PARZIALE' : 'INCOMPLETO';
+    let status: CoverageRow['status'] = okStart && okEnd ? 'OK' : okStart || okEnd ? 'PARZIALE' : 'INCOMPLETO';
+    let reason = '';
+    if (!range.firstDate || !range.lastDate) {
+      status = 'INCOMPLETO';
+      reason = 'Nessun dato';
+    } else if (status === 'OK') {
+      reason = 'Copertura completa';
+    } else if (okStart && !okEnd) {
+      reason = 'Copertura finale incompleta';
+    } else if (!okStart && okEnd) {
+      reason = 'Copertura iniziale incompleta';
+    } else {
+      reason = 'Range insufficiente';
+    }
     const instrument = rawTicker ? resolveInstrumentForTicker(instruments, rawTicker) : undefined;
 
     return {
@@ -376,7 +442,8 @@ export const buildCoverageRows = (
       instrumentId: instrument?.id ? String(instrument.id) : undefined,
       from,
       to,
-      status
+      status,
+      reason
     };
   });
 };
@@ -1171,8 +1238,10 @@ export const backfillPricesForPortfolio = async (
       range: { from: string; to: string };
       reason: 'internal-gap' | 'tail-stale';
       sortDate?: string;
+      priority: number;
     };
     const candidates: AutoGapCandidate[] = [];
+    const existingDatesByTicker = new Map<string, Set<string>>();
     for (const ticker of filtered) {
       const existing = await db.prices
         .where('[ticker+date]')
@@ -1180,35 +1249,28 @@ export const backfillPricesForPortfolio = async (
         .and(p => p.portfolioId === portfolioId)
         .sortBy('date');
       const lastDate = existing[existing.length - 1]?.date;
+      existingDatesByTicker.set(ticker, new Set(existing.map(row => row.date).filter(Boolean) as string[]));
 
-      let chosenRange: { from: string; to: string; gapDays: number } | null = null;
-      if (existing.length > 1) {
-        for (let idx = 0; idx < existing.length - 1; idx++) {
-          const curr = existing[idx]?.date;
-          const next = existing[idx + 1]?.date;
-          if (!curr || !next) continue;
-          const gapDays = diffDaysYmd(next, curr) - 1;
-          if (gapDays < staleThresholdDays) continue;
-          const fromCandidate = addDaysYmd(curr, 1);
-          const toCandidate = subDaysYmd(next, 1);
-          const from = fromCandidate < minAllowedFrom ? minAllowedFrom : fromCandidate;
-          const to = toCandidate > today ? today : toCandidate;
-          if (from > to) continue;
-          if (!chosenRange || to > chosenRange.to) {
-            chosenRange = { from, to, gapDays };
-          }
-        }
-      }
-
-      if (chosenRange) {
-        candidates.push({
-          ticker,
-          lastDate,
-          range: { from: chosenRange.from, to: chosenRange.to },
-          reason: 'internal-gap',
-          sortDate: chosenRange.to
-        });
-        continue;
+      const assetType = instrumentTypeByTicker.get(ticker);
+      const gapThresholdDays = resolveGapThresholdDays(assetType, staleThresholdDays);
+      const gapRanges = buildInternalGapRanges(existing, {
+        minAllowedFrom,
+        maxAllowedTo: today,
+        gapThresholdDays
+      });
+      if (gapRanges.length > 0) {
+        gapRanges
+          .sort((a, b) => b.to.localeCompare(a.to))
+          .forEach(range => {
+            candidates.push({
+              ticker,
+              lastDate,
+              range: { from: range.from, to: range.to },
+              reason: 'internal-gap',
+              sortDate: range.to,
+              priority: 0
+            });
+          });
       }
 
       if (isAutoGapCandidate(lastDate, today, staleThresholdDays)) {
@@ -1225,21 +1287,25 @@ export const backfillPricesForPortfolio = async (
           lastDate,
           range,
           reason: 'tail-stale',
-          sortDate: lastDate
+          sortDate: range.to,
+          priority: 1
         });
       } else {
-        summary.skipped = (summary.skipped || 0) + 1;
-        if (import.meta.env?.DEV) {
-          console.log('[PRICE][Backfill]', { ticker, reason: 'skip-up-to-date', lastDate });
+        if (gapRanges.length === 0) {
+          summary.skipped = (summary.skipped || 0) + 1;
+          if (import.meta.env?.DEV) {
+            console.log('[PRICE][Backfill]', { ticker, reason: 'skip-up-to-date', lastDate });
+          }
         }
       }
     }
 
     candidates.sort((a, b) => {
+      if (a.priority !== b.priority) return a.priority - b.priority;
       if (!a.sortDate && !b.sortDate) return 0;
-      if (!a.sortDate) return -1;
-      if (!b.sortDate) return 1;
-      return a.sortDate.localeCompare(b.sortDate);
+      if (!a.sortDate) return 1;
+      if (!b.sortDate) return -1;
+      return b.sortDate.localeCompare(a.sortDate);
     });
 
     const budgetLimit = limitTickersByBudget(candidates.map(c => c.ticker), maxApiCallsPerRun, maxDailyCalls, dailyUsed);
@@ -1247,6 +1313,7 @@ export const backfillPricesForPortfolio = async (
     summary.stoppedByBudget = budgetLimit.stoppedByBudget;
 
     const limitedCandidates = candidates.filter(c => limitedSet.has(c.ticker));
+    const internalGapMissing: string[] = [];
     for (let i = 0; i < limitedCandidates.length; i++) {
       const { ticker, range, reason } = limitedCandidates[i];
       const cfg = resolvePriceSyncConfig(ticker, settings);
@@ -1254,6 +1321,7 @@ export const backfillPricesForPortfolio = async (
       const symbol = resolveBackfillSymbol(ticker, cfg, assetType);
       const priceCurrency = priceCurrencyByTicker.get(ticker);
       const instrumentId = instrumentIdByTicker.get(ticker);
+      const existingDates = existingDatesByTicker.get(ticker) || new Set<string>();
       if (!isValidEodhdSymbol(symbol, assetType)) {
         const message = 'Symbol EODHD non valido';
         if (onProgress) onProgress({ ticker, index: i + 1, total: limitedCandidates.length, phase: 'backfill', error: message });
@@ -1287,20 +1355,28 @@ export const backfillPricesForPortfolio = async (
           });
           const deduped = new Map<string, PricePoint>();
           toSaveRaw.forEach(point => {
+            if (!point.date || existingDates.has(point.date)) return;
             deduped.set(`${point.ticker}|${point.date}|${point.portfolioId}`, point);
           });
           const toSave = Array.from(deduped.values());
           if (toSave.length > 0) {
             await db.prices.bulkPut(toSave);
+            toSave.forEach(point => existingDates.add(point.date));
             summary.updatedTickers?.push(ticker);
             if (reason === 'internal-gap' && !summary.message) {
               summary.message = `Backfill prezzi: riempito gap ${ticker} ${range.from} -> ${range.to}`;
             }
           } else {
             summary.skipped = (summary.skipped || 0) + 1;
+            if (reason === 'internal-gap') {
+              internalGapMissing.push(`${ticker} ${range.from}→${range.to}`);
+            }
           }
         } else {
           summary.skipped = (summary.skipped || 0) + 1;
+          if (reason === 'internal-gap') {
+            internalGapMissing.push(`${ticker} ${range.from}→${range.to}`);
+          }
         }
       } catch (e: any) {
         if (e?.message === 'EODHD_LIMIT_REACHED') {
@@ -1332,6 +1408,12 @@ export const backfillPricesForPortfolio = async (
       await new Promise(res => setTimeout(res, sleepMs));
     }
 
+    if (internalGapMissing.length > 0) {
+      const preview = internalGapMissing.slice(0, 2).join(', ');
+      const note = `gap interni senza dati provider: ${preview}${internalGapMissing.length > 2 ? '…' : ''}`;
+      summary.message = summary.message ? `${summary.message}; ${note}` : `Backfill prezzi: ${note}`;
+    }
+
     if (onProgress) onProgress({ ticker: '', index: limitedCandidates.length, total: limitedCandidates.length, phase: 'done' });
     return summary;
   }
@@ -1350,11 +1432,18 @@ export const backfillPricesForPortfolio = async (
         .between([ticker, Dexie.minKey], [ticker, Dexie.maxKey])
         .and(p => p.portfolioId === portfolioId)
         .sortBy('date');
+      const existingDates = new Set(existing.map(row => row.date).filter(Boolean) as string[]);
 
       const minInDb = existing[0]?.date;
       const maxInDb = existing[existing.length - 1]?.date;
 
       const ranges: { from: string; to: string }[] = [];
+      const gapThresholdDays = resolveGapThresholdDays(assetType, staleThresholdDays);
+      const internalRanges = buildInternalGapRanges(existing, {
+        minAllowedFrom,
+        maxAllowedTo: today,
+        gapThresholdDays
+      });
       if (!minInDb || minInDb > minHistoryDate) {
         const from = minHistoryDate < minAllowedFrom ? minAllowedFrom : minHistoryDate;
         ranges.push({ from, to: minInDb ? subDaysYmd(minInDb, 1) : today });
@@ -1364,6 +1453,7 @@ export const backfillPricesForPortfolio = async (
         const from = fromCandidate < minAllowedFrom ? minAllowedFrom : fromCandidate;
         ranges.push({ from, to: today });
       }
+      internalRanges.forEach(r => ranges.push({ from: r.from, to: r.to }));
 
       const limitedRanges = ranges.filter(r => r.from <= r.to);
 
@@ -1385,14 +1475,25 @@ export const backfillPricesForPortfolio = async (
         dailyUsed = bumpDailyBudget(today, 1);
         const pts = await eodhd.getHistory(resolvedSymbol, r.from, r.to);
         if (pts.length > 0) {
-          const toSave = buildPointsForSave(pts, {
+          const toSaveRaw = buildPointsForSave(pts, {
             ticker,
             instrumentId,
             currency: priceCurrency,
             portfolioId
           });
-          await db.prices.bulkPut(toSave);
-          if (!summary.updatedTickers?.includes(ticker)) summary.updatedTickers?.push(ticker);
+          const deduped = new Map<string, PricePoint>();
+          toSaveRaw.forEach(point => {
+            if (!point.date || existingDates.has(point.date)) return;
+            deduped.set(`${point.ticker}|${point.date}|${point.portfolioId}`, point);
+          });
+          const toSave = Array.from(deduped.values());
+          if (toSave.length > 0) {
+            await db.prices.bulkPut(toSave);
+            toSave.forEach(point => existingDates.add(point.date));
+            if (!summary.updatedTickers?.includes(ticker)) summary.updatedTickers?.push(ticker);
+          } else {
+            summary.skipped = (summary.skipped || 0) + 1;
+          }
         }
         await new Promise(res => setTimeout(res, sleepMs));
       }

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { db, getCurrentPortfolioId, setCurrentPortfolioId } from '../db';
 import { getTickersForBackfill, getPriceCoverage, backfillPricesForPortfolio, CoverageRow, SyncPricesSummary, resolvePriceSyncConfig, testSheetLatestPrice, SheetTestResult, getResolvedSymbol, getEodhdQuotaInfo, EodhdQuotaInfo, getEodhdDailyBudgetStatus } from '../services/priceService';
 import { AutoGapScope, getAutoGapFillEnabled, setAutoGapFillEnabled, getAutoGapFillScope, setAutoGapFillScope, getAutoSyncMeta, setAutoSyncMeta } from '../services/autoSyncService';
@@ -12,7 +12,8 @@ import { fetchAppsScriptPing, fetchAssetsMap, fetchMacro, applyAssetsMapToSettin
 import { getLastGapFillAt, getLastLatestSyncAt } from '../services/syncStatusService';
 import { checkProxyHealth } from '../services/apiHealthService';
 import type { ProxyHealth } from '../services/apiHealthService';
-import { deleteInstrumentGloballySafely } from '../services/dbQueries';
+import { deleteInstrumentGloballySafely, queryLatestFxForPairs } from '../services/dbQueries';
+import { computeFxCoverageForPairs } from '../services/dataCoverage';
 import { addHiddenTicker, getHiddenTickersForPortfolio, removeHiddenTicker, removeHiddenTickerEverywhere } from '../services/portfolioVisibility';
 import { isIsin, normalizeTicker, resolveEodhdSymbol, hasExchangeSuffix } from '../services/symbolUtils';
 import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType, Transaction } from '../types';
@@ -22,7 +23,6 @@ import { format, subDays } from 'date-fns';
 import { useLocation } from 'react-router-dom';
 import { resetSymbolMigrationFlag, runSymbolMigrationOnce } from '../services/symbolMigration';
 import clsx from 'clsx';
-import Dexie from 'dexie';
 
 type InstrumentListingRow = {
   id?: number;
@@ -48,21 +48,6 @@ const SETTINGS_SECTIONS: { key: ActiveSection; label: string }[] = [
 const isActiveSection = (value: string | null | undefined): value is ActiveSection => {
   return SETTINGS_SECTIONS.some(section => section.key === value);
 };
-
-const readLocalValue = (key: string): string | null => {
-  try {
-    if (typeof localStorage === 'undefined') return null;
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-};
-
-const getPriceSyncMeta = (portfolioId: string) => ({
-  lastSyncAt: readLocalValue(`prices:lastSyncAt:${portfolioId}`),
-  lastBackfillAt: readLocalValue(`prices:lastBackfillAt:${portfolioId}`),
-  lastSyncStatus: readLocalValue(`prices:lastSyncStatus:${portfolioId}`)
-});
 
 const formatLocalDateTime = (iso?: string | null) => {
   if (!iso) return 'mai';
@@ -109,7 +94,7 @@ export const Settings: React.FC = () => {
   const [fxBackfillLoading, setFxBackfillLoading] = useState(false);
   const [fxBackfillStatus, setFxBackfillStatus] = useState('');
   const [fxBackfillSummary, setFxBackfillSummary] = useState<FxBackfillSummary | null>(null);
-  const [fxLastDateInfo, setFxLastDateInfo] = useState<{ global?: string; details?: string; pairs: string[] } | null>(null);
+  const [fxLastDateInfo, setFxLastDateInfo] = useState<{ latest?: string; common?: string; details?: string; pairs: string[]; missingPairs?: string[] } | null>(null);
   const [fxLastDateLoading, setFxLastDateLoading] = useState(false);
   const [eodhdTests, setEodhdTests] = useState<Record<string, { status: string; symbol?: string; message?: string; httpStatus?: number; sample?: string; contentType?: string; rawPreview?: string; parseError?: string; url?: string }>>({});
   const [rawModal, setRawModal] = useState<{ open: boolean; title: string; content: string }>({ open: false, title: '', content: '' });
@@ -136,11 +121,9 @@ export const Settings: React.FC = () => {
   const focusHandledRef = useRef<string | null>(null);
   const [settingsId, setSettingsId] = useState<number | undefined>(undefined);
   const currentPortfolioId = getCurrentPortfolioId();
-  const [priceSyncMeta, setPriceSyncMeta] = useState(() => getPriceSyncMeta(currentPortfolioId));
   useEffect(() => {
     setLastLatestSyncAtState(getLastLatestSyncAt(currentPortfolioId));
     setLastGapFillAtState(getLastGapFillAt(currentPortfolioId));
-    setPriceSyncMeta(getPriceSyncMeta(currentPortfolioId));
   }, [currentPortfolioId]);
   const [activeSection, setActiveSection] = useState<ActiveSection>(() => {
     if (typeof window === 'undefined') return 'prices';
@@ -368,32 +351,25 @@ export const Settings: React.FC = () => {
       const baseCurrency = config.baseCurrency || Currency.CHF;
       const pairs = await getFxPairsForPortfolio(currentPortfolioId, baseCurrency);
       if (!pairs.length) {
-        setFxLastDateInfo({ global: undefined, details: '', pairs: [] });
+        setFxLastDateInfo({ latest: undefined, common: undefined, details: '', pairs: [], missingPairs: [] });
         return;
       }
-      const details: string[] = [];
-      const dates: string[] = [];
-      for (const pair of pairs) {
-        const [base, quote] = pair.split('/') as [Currency, Currency];
-        if (!base || !quote) continue;
-        const last = await db.fxRates
-          .where('[baseCurrency+quoteCurrency+date]')
-          .between([base, quote, Dexie.minKey], [base, quote, Dexie.maxKey])
-          .last();
-        const lastDate = last?.date;
-        if (lastDate) {
-          details.push(`${pair} ${lastDate}`);
-          dates.push(lastDate);
-        } else {
-          details.push(`${pair} n/d`);
-        }
-      }
-      const global = dates.length
-        ? dates.reduce((min, d) => (d < min ? d : min), dates[0])
-        : 'N/D';
-      setFxLastDateInfo({ global, details: details.join(' ? '), pairs });
+      const latestFx = await queryLatestFxForPairs({ pairs });
+      const coverage = computeFxCoverageForPairs(pairs, latestFx || []);
+      const details = coverage.requiredPairs.map(pair => {
+        const info = coverage.byPair[pair];
+        if (!info?.date) return `${pair} n/d`;
+        return info.inverseUsed && info.sourcePair ? `${pair} ${info.date} (inv ${info.sourcePair})` : `${pair} ${info.date}`;
+      });
+      setFxLastDateInfo({
+        latest: coverage.latest,
+        common: coverage.common,
+        details: details.join(' - '),
+        pairs: coverage.requiredPairs,
+        missingPairs: coverage.missingPairs
+      });
     } catch {
-      setFxLastDateInfo({ global: undefined, details: '', pairs: [] });
+      setFxLastDateInfo({ latest: undefined, common: undefined, details: '', pairs: [], missingPairs: [] });
     } finally {
       setFxLastDateLoading(false);
     }
@@ -880,7 +856,6 @@ export const Settings: React.FC = () => {
         setLastLatestSyncAtState(outcome.latestSyncAt);
       }
       await loadFxLastDates();
-      setPriceSyncMeta(getPriceSyncMeta(currentPortfolioId));
       const fxSuffix = fxNotice && fxNotice.status !== 'ok' ? `\n${fxNotice.message}` : '';
       if (outcome.priceResult.status === 'ok') {
         alert(`Prezzi aggiornati con successo!${fxSuffix}\n${summary}`);
@@ -916,7 +891,6 @@ export const Settings: React.FC = () => {
         setLastGapFillAtState(outcome.gapFillAt);
       }
       setBudgetStatus(getEodhdDailyBudgetStatus());
-      setPriceSyncMeta(getPriceSyncMeta(currentPortfolioId));
       if (outcome.ok) {
         setGapFillAllStatus('Gap-fill completato.');
       } else {
@@ -1788,17 +1762,15 @@ export const Settings: React.FC = () => {
           <div>
             <h2 className="text-lg font-bold mb-2 flex items-center gap-2 text-slate-900">
               <span className="material-symbols-outlined text-primary">bolt</span>
-              Operazioni
+              Azioni dati
             </h2>
-            <div className="text-xs text-slate-600">Aggiorna i dati di oggi o riempi i buchi storici.</div>
-            <div className="text-[11px] text-slate-500 mt-2">
-              Ultimo sync: {lastLatestSyncAt ? new Date(lastLatestSyncAt).toLocaleString('it-IT') : 'mai'} · Gap-fill: {lastGapFillAt ? new Date(lastGapFillAt).toLocaleString('it-IT') : 'mai'}
-            </div>
-            {gapFillAllStatus && (
-              <div className="text-[11px] text-slate-600 mt-1">Gap-fill: {gapFillAllStatus}</div>
-            )}
+            <div className="text-xs text-slate-600">Aggiorna latest, completa storico e importa CSV.</div>
           </div>
-          <div className="flex flex-wrap gap-2">
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+          <div className="ui-panel-subtle p-4 space-y-2">
+            <div className="text-[11px] uppercase font-bold text-slate-500">Aggiorna latest</div>
+            <div className="text-[11px] text-slate-500">Prezzi + FX (Apps Script se attivo).</div>
             <button
               onClick={handleSync}
               disabled={loading}
@@ -1812,10 +1784,25 @@ export const Settings: React.FC = () => {
               ) : (
                 <>
                   <span className="material-symbols-outlined text-sm">sync</span>
-                  Aggiorna oggi
+                  Aggiorna latest
                 </>
               )}
             </button>
+            <div className="text-[11px] text-slate-500">
+              Ultimo sync (processo): {lastLatestSyncAt ? new Date(lastLatestSyncAt).toLocaleString('it-IT') : 'mai'}
+            </div>
+            {latestSyncDetail && (
+              <div className="text-[11px] text-slate-600">{latestSyncDetail}</div>
+            )}
+            {fxSyncNotice && (
+              <div className={fxSyncNotice.status === 'ok' ? 'text-emerald-700 text-[11px]' : fxSyncNotice.status === 'warn' ? 'text-amber-700 text-[11px]' : 'text-red-700 text-[11px]'}>
+                FX: {fxSyncNotice.message}
+              </div>
+            )}
+          </div>
+          <div className="ui-panel-subtle p-4 space-y-2">
+            <div className="text-[11px] uppercase font-bold text-slate-500">Completa storico</div>
+            <div className="text-[11px] text-slate-500">Gap-fill prezzi + FX dove necessario.</div>
             <button
               type="button"
               onClick={handleGapFillAll}
@@ -1824,13 +1811,52 @@ export const Settings: React.FC = () => {
               className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
             >
               <span className="material-symbols-outlined text-sm">timeline</span>
-              {gapFillAllRunning ? 'Riempiendo...' : 'Riempi buchi'}
+              {gapFillAllRunning ? 'Completando...' : 'Completa storico'}
             </button>
+            <div className="text-[11px] text-slate-500">
+              Gap-fill (processo): {lastGapFillAt ? new Date(lastGapFillAt).toLocaleString('it-IT') : 'mai'}
+            </div>
+            {gapFillAllStatus && (
+              <div className="text-[11px] text-slate-600">Gap-fill: {gapFillAllStatus}</div>
+            )}
+          </div>
+          <div className="ui-panel-subtle p-4 space-y-2">
+            <div className="text-[11px] uppercase font-bold text-slate-500">Importa dati</div>
+            <div className="text-[11px] text-slate-500">CSV prezzi o tassi FX.</div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="bg-white border border-borderSoft text-slate-700 px-3 py-2 rounded-lg text-xs font-bold hover:bg-slate-50"
+                onClick={() => priceCsvRef.current?.click()}
+                ref={importPriceButtonRef}
+              >
+                Importa prezzi CSV
+              </button>
+              <button
+                type="button"
+                className="bg-white border border-borderSoft text-slate-700 px-3 py-2 rounded-lg text-xs font-bold hover:bg-slate-50"
+                onClick={() => fxCsvRef.current?.click()}
+                ref={importFxButtonRef}
+              >
+                Importa FX CSV
+              </button>
+              <input type="file" ref={priceCsvRef} className="hidden" accept=".csv,text/csv" onChange={handlePriceCsvImport} />
+              <input type="file" ref={fxCsvRef} className="hidden" accept=".csv,text/csv" onChange={handleFxImport} />
+            </div>
+            <div className="flex items-center gap-2 text-[11px] text-slate-600">
+              <span>FX base</span>
+              <select className="border border-borderSoft rounded px-2 py-1" value={fxBase} onChange={e => setFxBase(e.target.value as Currency)}>
+                {Object.values(Currency).map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <span>/</span>
+              <select className="border border-borderSoft rounded px-2 py-1" value={fxQuote} onChange={e => setFxQuote(e.target.value as Currency)}>
+                {Object.values(Currency).map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
           </div>
         </div>
       </div>
-
-      <div className="flex flex-wrap items-center gap-2">
+<div className="flex flex-wrap items-center gap-2">
         {SETTINGS_SECTIONS.map(section => {
           const isActive = activeSection === section.key;
           return (
@@ -1930,18 +1956,27 @@ export const Settings: React.FC = () => {
                     <div className="text-xs text-slate-600">Exchange preferiti: {(config.preferredExchangesOrder || ['SW','US','LSE','XETRA','MI','PA']).join(', ')}</div>
                     <div className="text-xs text-slate-600">Backfill: dal {config.minHistoryDate || '2020-01-01'} ({(config.priceBackfillScope || 'current') === 'all' ? 'Completo' : 'Solo correnti'})</div>
                     <div className="text-xs text-slate-600">
-                      <span className="text-slate-500">FX last date:</span>{' '}
+                      <span className="text-slate-500">FX DB latest:</span>{' '}
                       {fxLastDateLoading
                         ? '...'
                         : fxLastDateInfo?.pairs?.length
                           ? (
                             <>
-                              <span className="font-semibold">{fxLastDateInfo.global}</span>
-                              {fxLastDateInfo.details ? <span className="text-slate-500"> ({fxLastDateInfo.details})</span> : null}
+                              <span className="font-semibold">{fxLastDateInfo.latest || 'N/D'}</span>
+                              <span className="text-slate-500"> - Comune:</span>{' '}
+                              <span className="font-semibold">{fxLastDateInfo.common || 'N/D'}</span>
                             </>
                           )
-                          : 'N/D'}
+                          : 'Non richiesto'}
                     </div>
+                    {fxLastDateInfo?.missingPairs?.length ? (
+                      <div className="text-[11px] text-amber-700">
+                        Coppie mancanti: {fxLastDateInfo.missingPairs.slice(0, 3).join(', ')}{fxLastDateInfo.missingPairs.length > 3 ? '...' : ''}
+                      </div>
+                    ) : null}
+                    {fxLastDateInfo?.details ? (
+                      <div className="text-[11px] text-slate-500">Dettagli: {fxLastDateInfo.details}</div>
+                    ) : null}
                   {saveNotice && <div className="text-xs text-green-700 mt-2">{saveNotice}</div>}
                 </div>
                 <button
@@ -2165,108 +2200,17 @@ export const Settings: React.FC = () => {
               <div className="text-xs text-slate-600">
                 Copertura: {coverageSummary.okCount}/{coverageSummary.total} tickers - {coverageSummary.earliest || coverage.earliestCoveredDate || 'N/D'} - {coverageSummary.latest || coverage.latestCoveredDate || 'N/D'}
               </div>
-              <div className="text-xs text-slate-600 space-y-1">
-                <div><span className="font-semibold text-slate-700">Aggiorna prezzi:</span> aggiorna i valori di oggi (Sheets/EODHD) e rinfresca l'app.</div>
-                <div><span className="font-semibold text-slate-700">Scarica storico:</span> usa quando mancano periodi o hai appena importato nuovi strumenti.</div>
-              </div>
-              <div className="flex flex-wrap gap-3">
-                <button
-                  onClick={handleSync}
-                  disabled={loading}
-                  className="bg-[#0052a3] text-white px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-blue-600 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                >
-                  {loading ? (
-                    <>
-                      <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
-                      Aggiornamento...
-                    </>
-                  ) : (
-                    <>
-                      <span className="material-symbols-outlined text-sm">sync</span>
-                      Aggiorna Prezzi
-                    </>
-                  )}
-                </button>
-                <button
-                  onClick={handleBackfill}
-                  disabled={bfLoading}
-                  className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                >
-                  {bfLoading ? (
-                    <>
-                      <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
-                      Scaricamento...
-                    </>
-                  ) : (
-                    <>
-                      <span className="material-symbols-outlined text-sm">download</span>
-                      Scarica storico prezzi
-                    </>
-                  )}
-                </button>
-                <button
-                  onClick={handleFxBackfill}
-                  disabled={fxBackfillLoading}
-                  className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
-                >
-                  {fxBackfillLoading ? (
-                    <>
-                      <span className="material-symbols-outlined animate-spin text-sm">refresh</span>
-                      Backfill FX...
-                    </>
-                  ) : (
-                    <>
-                      <span className="material-symbols-outlined text-sm">currency_exchange</span>
-                      Backfill FX
-                    </>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleTestEodhdAll}
-                  disabled={!config.eodhdApiKey?.trim() || isTestingAll}
-                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600 disabled:opacity-60"
-                >
-                  {isTestingAll
-                    ? `Test EODHD (tutti)... ${testAllProgress.done}/${testAllProgress.total}`
-                    : 'Test EODHD (tutti)'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleRerunSymbolMigration}
-                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
-                >
-                  Riesegui migrazione symbol
-                </button>
-                <button
-                  onClick={() => {
-                    setCoverageExpanded(prev => {
-                      const next = !prev;
-                      if (next) {
-                        setActiveSection('coverage');
-                      }
-                      return next;
-                    });
-                  }}
-                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
-                >
-                  {coverageExpanded ? 'Nascondi copertura' : 'Dettagli copertura'}
-                </button>
+              <div className="text-xs text-slate-600">
+                Per aggiornare i dati usa la sezione <span className="font-semibold">Azioni dati</span> (Aggiorna latest, Completa storico, Importa CSV).
               </div>
               <div className="text-[11px] text-slate-500">
-                Ultimo sync: {formatLocalDateTime(priceSyncMeta.lastSyncAt)} · Backfill: {formatLocalDateTime(priceSyncMeta.lastBackfillAt)}
+                Ultimo sync (processo): {formatLocalDateTime(lastLatestSyncAt)} - Gap-fill (processo): {formatLocalDateTime(lastGapFillAt)}
               </div>
-              {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
-              {fxBackfillStatus && <div className="text-xs text-slate-600 font-medium">{fxBackfillStatus}</div>}
-              {bfStatus && (bfStatus.toLowerCase().includes('errore') || bfStatus.toLowerCase().includes('quota') || bfStatus.toLowerCase().includes('interrotto')) && (
-                <div className="text-xs text-amber-700">
-                  Suggerimento: verifica la chiave EODHD e riprova. Se il problema persiste, usa il Data Inspector per vedere quali ticker mancano.
-                </div>
+              {latestSyncDetail && (
+                <div className="text-[11px] text-slate-600">{latestSyncDetail}</div>
               )}
-              {fxBackfillSummary && fxBackfillSummary.status !== 'ok' && (
-                <div className="text-xs text-amber-700">
-                  FX backfill: {fxBackfillSummary.message || 'operazione non completata'}. Apri Data Inspector (FX) per verificare i gap.
-                </div>
+              {gapFillAllStatus && (
+                <div className="text-[11px] text-slate-600">Gap-fill: {gapFillAllStatus}</div>
               )}
               {syncSummary && (
                 <div className="text-xs text-slate-600 space-y-1">
@@ -2274,9 +2218,6 @@ export const Settings: React.FC = () => {
                     <span className="text-slate-500">Sync:</span>{' '}
                     <span className={`px-2 py-0.5 rounded-full font-bold ${syncStatusClass}`}>{syncStatusLabel}</span>
                   </div>
-                  {latestSyncDetail && (
-                    <div className="text-slate-600">{latestSyncDetail}</div>
-                  )}
                   {fxSyncNotice && (
                     <div className={fxSyncNotice.status === 'ok' ? 'text-emerald-700' : fxSyncNotice.status === 'warn' ? 'text-amber-700' : 'text-red-700'}>
                       FX: {fxSyncNotice.message}
@@ -2330,21 +2271,10 @@ export const Settings: React.FC = () => {
                       <option value="allPortfolios">Tutti i portafogli</option>
                     </select>
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleAutoGapNow}
-                    disabled={autoGapRunning || !config.eodhdApiKey?.trim()}
-                    className="text-xs font-bold text-[#0052a3] hover:text-blue-600 disabled:opacity-60"
-                  >
-                    {autoGapRunning ? 'Gap-fill in corso...' : 'Esegui gap-fill ora'}
-                  </button>
                 </div>
                 <div className="text-[11px] text-slate-500">
-                  Ultimo auto-sync: {autoSyncLabel} ? Gap-fill: {gapFillLabel} ? Budget oggi usato: {budgetStatus.used}
+                  Ultimo auto-sync: {autoSyncLabel} - Gap-fill: {gapFillLabel} - Budget oggi usato: {budgetStatus.used}
                 </div>
-                {autoGapStatus && (
-                  <div className="text-[11px] text-slate-600">{autoGapStatus}</div>
-                )}
               </div>
             </div>
             )}
@@ -2461,6 +2391,13 @@ export const Settings: React.FC = () => {
                   />
                   Mostra rimossi{hiddenTickers.length ? ` (${hiddenTickers.length})` : ''}
                 </label>
+                <button
+                  type="button"
+                  onClick={() => setCoverageExpanded(prev => !prev)}
+                  className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+                >
+                  {coverageExpanded ? 'Nascondi dettagli' : 'Mostra dettagli'}
+                </button>
                 <InfoPopover
                   ariaLabel="Info Copertura prezzi"
                   title="Come leggere la copertura prezzi"
@@ -2469,7 +2406,7 @@ export const Settings: React.FC = () => {
                       <ul className="list-disc list-inside space-y-1">
                         <li>La tabella mostra per ogni strumento il range di date per cui abbiamo prezzi salvati nel database.</li>
                         <li>Se vedi PARZIALE/INCOMPLETO, i grafici (ritorni annuali, drawdown, CAGR) possono risultare incompleti o N/D.</li>
-                        <li>Per estendere lo storico: usa "Scarica storico prezzi" oppure importa un CSV prezzi dal tuo provider.</li>
+                        <li>Per estendere lo storico: usa "Completa storico" oppure importa un CSV prezzi dal tuo provider.</li>
                         <li>Lo strumento mostrato (ticker) è il listing usato per i prezzi; se è sbagliato, correggilo in "Listings & FX".</li>
                         <li>Consiglio: per SIX/CHF usa un listing .SW e importa prezzi in CHF (SIX-first).</li>
                         <li><strong>Escludi</strong> blocca il sync/backfill a livello globale. <strong>Rimuovi dal portafoglio</strong> nasconde solo per questo portafoglio.</li>
@@ -2635,9 +2572,14 @@ export const Settings: React.FC = () => {
                             <div className="text-xs">Al {row.to}</div>
                           </td>
                           <td className="px-3 py-2">
-                            <span className={`text-xs font-bold px-2 py-1 rounded-lg ${statusClass}`}>
-                              {statusLabel}
-                            </span>
+                            <div className="flex flex-col gap-1">
+                              <span className={`text-xs font-bold px-2 py-1 rounded-lg ${statusClass}`}>
+                                {statusLabel}
+                              </span>
+                              {!isExcluded && row.status !== 'OK' && row.reason && (
+                                <span className="text-[10px] text-slate-500">{row.reason}</span>
+                              )}
+                            </div>
                           </td>
                           <td className="px-3 py-2">
                             <div className="flex flex-col gap-2">
@@ -3022,34 +2964,6 @@ export const Settings: React.FC = () => {
               >
                 Salva listing preferito
               </button>
-              <button
-                type="button"
-                className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-50"
-                onClick={() => priceCsvRef.current?.click()}
-                ref={importPriceButtonRef}
-              >
-                Importa prezzi (CSV)
-              </button>
-              <input type="file" ref={priceCsvRef} className="hidden" accept=".csv,text/csv" onChange={handlePriceCsvImport} />
-              <button
-                type="button"
-                className="bg-white border border-borderSoft text-slate-700 px-4 py-2 rounded-lg text-sm font-bold hover:bg-slate-50"
-                onClick={() => fxCsvRef.current?.click()}
-                ref={importFxButtonRef}
-                >
-                Importa FX (CSV)
-              </button>
-              <input type="file" ref={fxCsvRef} className="hidden" accept=".csv,text/csv" onChange={handleFxImport} />
-              <div className="flex items-center gap-2 text-xs text-slate-600">
-                <span>FX base</span>
-                <select className="border border-borderSoft rounded px-2 py-1" value={fxBase} onChange={e => setFxBase(e.target.value as Currency)}>
-                  {Object.values(Currency).map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-                <span>/</span>
-                <select className="border border-borderSoft rounded px-2 py-1" value={fxQuote} onChange={e => setFxQuote(e.target.value as Currency)}>
-                  {Object.values(Currency).map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
             </div>
           </div>
 
@@ -3208,6 +3122,71 @@ export const Settings: React.FC = () => {
                   </div>
                 )}
 
+                <div className="ui-panel-dense p-6 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="text-sm font-bold text-slate-900">Diagnostica dati</div>
+                      <div className="text-xs text-slate-600">Azioni avanzate per backfill, gap e test provider.</div>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={handleBackfill}
+                      disabled={bfLoading || !config.eodhdApiKey?.trim()}
+                      className="bg-white border border-borderSoft text-slate-700 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50"
+                    >
+                      {bfLoading ? 'Backfill prezzi...' : 'Backfill completo prezzi'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleFxBackfill}
+                      disabled={fxBackfillLoading || !config.eodhdApiKey?.trim()}
+                      className="bg-white border border-borderSoft text-slate-700 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50"
+                    >
+                      {fxBackfillLoading ? 'Backfill FX...' : 'Backfill FX manuale'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleAutoGapNow}
+                      disabled={autoGapRunning || !config.eodhdApiKey?.trim()}
+                      className="bg-white border border-borderSoft text-slate-700 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50 hover:bg-slate-50"
+                    >
+                      {autoGapRunning ? 'Gap-fill in corso...' : 'Gap-fill ora (auto)'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleTestEodhdAll}
+                      disabled={!config.eodhdApiKey?.trim() || isTestingAll}
+                      className="text-xs font-bold text-[#0052a3] hover:text-blue-600 disabled:opacity-60 px-2"
+                    >
+                      {isTestingAll
+                        ? `Test EODHD (tutti)... ${testAllProgress.done}/${testAllProgress.total}`
+                        : 'Test EODHD (tutti)'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRerunSymbolMigration}
+                      className="text-xs font-bold text-[#0052a3] hover:text-blue-600 px-2"
+                    >
+                      Riesegui migrazione symbol
+                    </button>
+                  </div>
+                  {bfStatus && <div className="text-xs text-slate-600 font-medium">{bfStatus}</div>}
+                  {fxBackfillStatus && <div className="text-xs text-slate-600 font-medium">{fxBackfillStatus}</div>}
+                  {autoGapStatus && <div className="text-xs text-slate-600 font-medium">{autoGapStatus}</div>}
+                  {fxBackfillSummary && fxBackfillSummary.status !== 'ok' && (
+                    <div className="text-xs text-amber-700">
+                      FX backfill: {fxBackfillSummary.message || 'operazione non completata'}. Apri Data Inspector (FX) per verificare i gap.
+                    </div>
+                  )}
+                  {bfStatus && (bfStatus.toLowerCase().includes('errore') || bfStatus.toLowerCase().includes('quota') || bfStatus.toLowerCase().includes('interrotto')) && (
+                    <div className="text-xs text-amber-700">
+                      Suggerimento: verifica la chiave EODHD e riprova. Se il problema persiste, usa il Data Inspector per vedere quali ticker mancano.
+                    </div>
+                  )}
+                </div>
+
                 {/* REPAIR IMPORTED TRANSACTIONS */}
       <div className="ui-panel-dense p-6 space-y-3">
         <div className="flex items-center justify-between">
@@ -3238,7 +3217,7 @@ export const Settings: React.FC = () => {
                   return (
                     <tr key={tx.id ?? `${txDate}-${tx.instrumentTicker || 'no-ticker'}`} className="border-t border-borderSoft">
                       <td className="px-3 py-2 text-slate-700">{txDate}</td>
-                      <td className="px-3 py-2 font-semibold">{tx.instrumentTicker || '—'}</td>
+                      <td className="px-3 py-2 font-semibold">{tx.instrumentTicker || '-'}</td>
                       <td className="px-3 py-2">{tx.type}</td>
                       <td className="px-3 py-2 text-right">{Number(tx.quantity || 0).toLocaleString('it-CH')}</td>
                       <td className="px-3 py-2">
@@ -3289,7 +3268,7 @@ export const Settings: React.FC = () => {
         </h2>
         <p className="text-sm text-red-700/70 mb-6 leading-relaxed">
           Se l'applicazione non visualizza i dati corretti o hai conflitti con versioni precedenti, puoi resettare il database.
-          Questo canceller? tutto e ricaricher? i dati demo.
+          Questo cancellerà tutto e ricaricherà i dati demo.
         </p>
         <button
           onClick={handleReset}
@@ -3403,6 +3382,7 @@ export const Settings: React.FC = () => {
     </div>
   );
 };
+
 
 
 

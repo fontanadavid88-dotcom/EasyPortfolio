@@ -75,7 +75,8 @@ export const analyzePriceSeries = (
     assetType?: AssetType;
   }
 ): { stats: SeriesStats; issues: SeriesIssue[] } => {
-  const gapDays = options?.gapDays ?? PRICE_GAP_DAYS;
+  const isCrypto = options?.assetClass === AssetClass.CRYPTO || options?.assetType === AssetType.Crypto;
+  const gapDays = options?.gapDays ?? (isCrypto ? 1 : PRICE_GAP_DAYS);
   const outlierThreshold = options?.outlierThreshold ?? 0.2;
   const thresholds = getOutlierThresholds(options?.assetClass, options?.assetType, outlierThreshold);
   const sorted = [...points].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
