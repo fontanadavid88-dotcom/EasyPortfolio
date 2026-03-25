@@ -263,26 +263,54 @@ export const runBacktest = (
     externalFlows.push({ date: startDate, amount: scenario.initialCapital });
   }
 
-  const startMonth = startDate.slice(5, 7);
+  const startMonthKey = startDate.slice(5, 7);
   const startYear = Number(startDate.slice(0, 4));
-  let lastContributionYear = startYear;
+  const startMonth = Number(startMonthKey);
   let lastRebalanceYear = startYear;
+
+  const contributionAmount = Number.isFinite(scenario.periodicContributionAmount)
+    ? scenario.periodicContributionAmount
+    : 0;
+  const contributionFrequency = scenario.contributionFrequency || 'none';
+  const contributionPeriodMonths = (() => {
+    switch (contributionFrequency) {
+      case 'monthly':
+        return 1;
+      case 'quarterly':
+        return 3;
+      case 'semiannual':
+        return 6;
+      case 'annual':
+        return 12;
+      default:
+        return 0;
+    }
+  })();
+  const contributedMonths = new Set<string>();
 
   const navSeries = dateIndex.map(date => {
     const currentYear = Number(date.slice(0, 4));
-    const currentMonth = date.slice(5, 7);
-    const isAnniversaryMonth = currentYear > startYear && currentMonth === startMonth;
+    const currentMonthKey = date.slice(5, 7);
+    const currentMonth = Number(currentMonthKey);
+    const isAnniversaryMonth = currentYear > startYear && currentMonthKey === startMonthKey;
 
-    if (isAnniversaryMonth && scenario.annualContribution > 0 && currentYear !== lastContributionYear) {
-      weights.forEach(asset => {
-        const price = priceBaseByAsset.get(asset.assetId)?.get(date) || 0;
-        if (!price || price <= 0) return;
-        const addUnits = (scenario.annualContribution * asset.weight) / price;
-        holdings.set(asset.assetId, (holdings.get(asset.assetId) || 0) + addUnits);
-      });
-      contributionCumulative += scenario.annualContribution;
-      externalFlows.push({ date, amount: scenario.annualContribution });
-      lastContributionYear = currentYear;
+    if (contributionAmount > 0 && contributionPeriodMonths > 0) {
+      const monthKey = date.slice(0, 7);
+      const monthsDiff = (currentYear - startYear) * 12 + (currentMonth - startMonth);
+      const isAligned = monthsDiff >= 0 && monthsDiff % contributionPeriodMonths === 0;
+      const isAnnualFirstMonth = contributionFrequency === 'annual' && monthsDiff === 0;
+
+      if (isAligned && !isAnnualFirstMonth && !contributedMonths.has(monthKey)) {
+        weights.forEach(asset => {
+          const price = priceBaseByAsset.get(asset.assetId)?.get(date) || 0;
+          if (!price || price <= 0) return;
+          const addUnits = (contributionAmount * asset.weight) / price;
+          holdings.set(asset.assetId, (holdings.get(asset.assetId) || 0) + addUnits);
+        });
+        contributionCumulative += contributionAmount;
+        externalFlows.push({ date, amount: contributionAmount });
+        contributedMonths.add(monthKey);
+      }
     }
 
     if (isAnniversaryMonth && scenario.rebalanceFrequency === 'annual' && currentYear !== lastRebalanceYear) {

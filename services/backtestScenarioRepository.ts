@@ -13,7 +13,8 @@ const buildScenarioRecord = (scenario: BacktestScenarioInput, portfolioId: strin
     startDate: scenario.startDate,
     endDate: scenario.endDate,
     initialCapital: scenario.initialCapital,
-    annualContribution: scenario.annualContribution,
+    periodicContributionAmount: scenario.periodicContributionAmount,
+    contributionFrequency: scenario.contributionFrequency,
     rebalanceFrequency: scenario.rebalanceFrequency,
     baseCurrency: String(scenario.baseCurrency),
     assets: scenario.assets.map(asset => ({
@@ -52,7 +53,8 @@ export const updateBacktestScenario = async (params: {
     startDate: scenario.startDate,
     endDate: scenario.endDate,
     initialCapital: scenario.initialCapital,
-    annualContribution: scenario.annualContribution,
+    periodicContributionAmount: scenario.periodicContributionAmount,
+    contributionFrequency: scenario.contributionFrequency,
     rebalanceFrequency: scenario.rebalanceFrequency,
     baseCurrency: String(scenario.baseCurrency),
     assets: scenario.assets.map(asset => ({
@@ -98,12 +100,20 @@ export const duplicateBacktestScenario = async (id: number): Promise<number | nu
   const existing = await db.backtestScenarios.get(id);
   if (!existing) return null;
   const now = nowIso();
+  const legacyAnnual = typeof existing.annualContribution === 'number' ? existing.annualContribution : 0;
+  const periodicContributionAmount = typeof existing.periodicContributionAmount === 'number'
+    ? existing.periodicContributionAmount
+    : legacyAnnual;
+  const contributionFrequency = existing.contributionFrequency
+    ?? (legacyAnnual > 0 ? 'annual' : 'none');
   const record: BacktestScenarioRecord = {
     ...existing,
     id: undefined,
     createdAt: now,
     updatedAt: now,
-    title: `${existing.title} (copia)`
+    title: `${existing.title} (copia)`,
+    periodicContributionAmount,
+    contributionFrequency
   };
   const newId = await db.backtestScenarios.add(record);
   return Number(newId);

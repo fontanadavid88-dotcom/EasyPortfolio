@@ -251,7 +251,9 @@ export interface BacktestScenarioRecord {
   startDate: string;
   endDate: string;
   initialCapital: number;
-  annualContribution: number;
+  periodicContributionAmount?: number;
+  contributionFrequency?: 'none' | 'monthly' | 'quarterly' | 'semiannual' | 'annual';
+  annualContribution?: number; // legacy
   rebalanceFrequency: 'none' | 'annual';
   baseCurrency: string;
   assets: BacktestScenarioAssetRecord[];

@@ -1,8 +1,10 @@
 import React, { useMemo } from 'react';
 import { Transaction, Instrument, PricePoint } from '../types';
 import { computeHoldingsPriceDateStats } from '../services/dataFreshness';
+import { CoverageSummary } from '../services/dataCoverage';
 import { diffDaysYmd } from '../services/dateUtils';
 import { InfoPopover } from './InfoPopover';
+import { getLastGapFillAt, getLastLatestSyncAt } from '../services/syncStatusService';
 
 type DataStatusBarProps = {
   portfolioId: string;
@@ -10,18 +12,10 @@ type DataStatusBarProps = {
   instruments: Instrument[];
   prices: PricePoint[];
   fxUsed?: string;
+  coverage?: CoverageSummary | null;
   variant?: 'default' | 'rebalance';
   rebalanceDate?: string;
   usedPriceDates?: { ticker: string; date?: string }[];
-};
-
-const safeGet = (key: string): string | null => {
-  try {
-    if (typeof localStorage === 'undefined') return null;
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
 };
 
 const formatDateTime = (iso?: string | null) => {
@@ -37,6 +31,7 @@ export const DataStatusBar: React.FC<DataStatusBarProps> = ({
   instruments,
   prices,
   fxUsed,
+  coverage,
   variant = 'default',
   rebalanceDate,
   usedPriceDates
@@ -45,11 +40,11 @@ export const DataStatusBar: React.FC<DataStatusBarProps> = ({
     () => computeHoldingsPriceDateStats(transactions || [], instruments || [], prices || []),
     [transactions, instruments, prices]
   );
-  const lastSyncAt = safeGet(`prices:lastSyncAt:${portfolioId}`);
-  const lastBackfillAt = safeGet(`prices:lastBackfillAt:${portfolioId}`);
+  const lastSyncAt = getLastLatestSyncAt(portfolioId);
+  const lastBackfillAt = getLastGapFillAt(portfolioId);
 
-  const priceCommon = stats.priceCommonAsOf;
-  const priceLatest = stats.priceLatestAsOf;
+  const priceCommon = coverage?.price.common || stats.priceCommonAsOf;
+  const priceLatest = coverage?.price.latest || stats.priceLatestAsOf;
 
   const hasUsedDates = Boolean(
     variant === 'rebalance'
@@ -79,6 +74,17 @@ export const DataStatusBar: React.FC<DataStatusBarProps> = ({
 
   const hasCommonDetail = Boolean(priceCommon && priceLatest && priceCommon !== priceLatest);
   const rebalancePriceLabel = rebalanceDate || priceLatest || 'N/D';
+  const fxUsedLabel = (() => {
+    if (coverage?.fxUsed) {
+      if (coverage.fxUsed.status === 'ok') return coverage.fxUsed.date || 'N/D';
+      if (coverage.fxUsed.status === 'not-needed') return 'non richiesto';
+      if (coverage.fxUsed.status === 'missing') return coverage.fxUsed.reason || 'FX mancante';
+      return coverage.fxUsed.reason || 'non determinabile';
+    }
+    if (fxUsed && fxUsed !== 'N/D') return fxUsed;
+    if (fxUsed === 'N/D') return 'non determinabile';
+    return 'non determinabile';
+  })();
 
   return (
     <div className="ui-panel-subtle px-3 py-2">
@@ -180,13 +186,13 @@ export const DataStatusBar: React.FC<DataStatusBarProps> = ({
         )}
 
         <span className="px-2 py-1 rounded-full bg-white border border-slate-200 text-slate-700">
-          FX (usato): {fxUsed || 'N/D'}
+          FX (usato): {fxUsedLabel}
         </span>
         <span className="px-2 py-1 rounded-full bg-white border border-slate-200 text-slate-700">
-          Sync: {formatDateTime(lastSyncAt)}
+          Sync (processo): {formatDateTime(lastSyncAt)}
         </span>
         <span className="px-2 py-1 rounded-full bg-white border border-slate-200 text-slate-700">
-          Backfill: {formatDateTime(lastBackfillAt)}
+          Backfill (processo): {formatDateTime(lastBackfillAt)}
         </span>
       </div>
     </div>

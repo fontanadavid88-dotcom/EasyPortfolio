@@ -1,6 +1,7 @@
 ﻿import React from 'react';
 import clsx from 'clsx';
 import { BacktestScenarioRecord } from '../../types';
+import { formatScenarioContribution } from './backtestUiUtils';
 
 const formatDate = (value?: string) => value ? value.slice(0, 10) : '-';
 
@@ -24,6 +25,7 @@ export const BacktestScenarioList: React.FC<{
         <div className="space-y-2">
           {scenarios.map(scenario => {
             const isActive = currentScenarioId === scenario.id;
+            const contributionLabel = formatScenarioContribution(scenario);
             return (
               <div
                 key={scenario.id}
@@ -37,7 +39,7 @@ export const BacktestScenarioList: React.FC<{
                     {scenario.title || 'Scenario senza titolo'}
                   </div>
                   <div className="text-xs text-slate-500">
-                    {scenario.startDate} {'->'} {scenario.endDate} - {scenario.assets?.length || 0} asset - Aggiornato {formatDate(scenario.updatedAt)}
+                    {scenario.startDate} {'->'} {scenario.endDate} - {scenario.assets?.length || 0} asset - Contributo: {contributionLabel} - Aggiornato {formatDate(scenario.updatedAt)}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">

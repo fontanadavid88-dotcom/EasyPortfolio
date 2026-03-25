@@ -1,12 +1,16 @@
-import React, { useEffect, useMemo, useState } from 'react';
+﻿import React, { useEffect, useMemo, useState } from 'react';
 import { db, getCurrentPortfolioId } from '../db';
 import { useLiveQuery } from 'dexie-react-hooks';
-import { calculateHoldings, calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly, getCanonicalTicker, buildBenchmarkComparisonSeries } from '../services/financeUtils';
+import { calculateHoldings, calculatePortfolioState, calculateHistoricalPerformance, calculateAnalytics, Granularity, calculateAllocationByAssetClass, calculateRegionExposure, getPortfolioDateBounds, getRegionLabel, computeMwrrSeries, downsampleHistoryToMonthly, getCanonicalTicker, getValuationDateForHoldings, buildBenchmarkComparisonSeries } from '../services/financeUtils';
 import { DEFAULT_INDICATORS, computeMacroIndex, mapIndexToPhase, MacroIndicatorConfig } from '../services/macroService';
 import { queryFxForPairsRange, queryLatestFxForPairs, queryLatestPricesForTickers, queryPriceBoundsForTickers, queryPricesForTickersRange } from '../services/dbQueries';
 import { runGapFill, runLatestSync } from '../services/syncActionsService';
 import { downsampleSeries } from '../services/chartUtils';
 import { computeSyncStatus, getFxPairsForHoldings, getHoldingsTickers, getLastGapFillAt, getLastLatestSyncAt } from '../services/syncStatusService';
+import { computePortfolioCoverage } from '../services/dataCoverage';
+import { computeCurrentValuedPositions } from '../services/positionValuation';
+import { computePositionCostBasis } from '../services/positionCostBasis';
+import { formatQuantity } from '../services/quantityFormat';
 import {
   PRIMARY_BLUE,
   ACCENT_ORANGE,
@@ -54,6 +58,52 @@ const KPICard = ({ title, value, subValue, highlight = false, alert = false }: {
     </div>
   </div>
 );
+
+const POSITIONS_MAX = 8;
+
+const formatMoney = (value: number, currency: Currency, decimals: number) => {
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  return new Intl.NumberFormat('it-CH', {
+    style: 'currency',
+    currency,
+    currencyDisplay: 'code',
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals
+  }).format(value);
+};
+
+const formatUnitPrice = (value: number, currency: Currency) => {
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  const decimals = value < 1 ? 4 : 2;
+  return formatMoney(value, currency, decimals);
+};
+
+const formatSignedUnitPrice = (value: number, currency: Currency) => {
+  if (!Number.isFinite(value)) return '—';
+  const abs = Math.abs(value);
+  const decimals = abs < 1 ? 4 : 2;
+  const formatted = new Intl.NumberFormat('it-CH', {
+    style: 'currency',
+    currency,
+    currencyDisplay: 'code',
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals
+  }).format(abs);
+  const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+  return `${sign}${formatted}`;
+};
+
+const formatSignedPct = (value: number) => {
+  if (!Number.isFinite(value)) return '—';
+  const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+  return `${sign}${Math.abs(value).toFixed(1)}%`;
+};
+
+const formatChfValue = (value: number) => {
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  const decimals = value < 100 ? 2 : 0;
+  return formatMoney(value, Currency.CHF, decimals);
+};
 
 
 
@@ -249,6 +299,10 @@ export const Dashboard: React.FC = () => {
     return calculateHoldings(transactions);
   }, [transactions]);
 
+  const costBasisByTicker = useMemo(() => {
+    return computePositionCostBasis(transactions || []);
+  }, [transactions]);
+
   const priceTickers = useMemo(() => {
     const set = new Set<string>();
     (instruments || []).forEach(inst => {
@@ -375,8 +429,54 @@ export const Dashboard: React.FC = () => {
       today: format(new Date(), 'yyyy-MM-dd')
     });
   }, [baseCurrency, holdings, instruments, latestPrices, latestFx, prices, fxRatesRange, priceQueryEnd]);
+  const coverage = useMemo(() => {
+    return computePortfolioCoverage({
+      holdings,
+      instruments: instruments || [],
+      baseCurrency,
+      latestPrices: latestPrices || [],
+      latestFx: latestFx || []
+    });
+  }, [holdings, instruments, baseCurrency, latestPrices, latestFx]);
   const hasTransactions = (transactions?.length || 0) > 0;
   const hasAnyPrices = (prices?.length || 0) > 0;
+  const priceCoverageOk = coverage.price.total === 0 || coverage.price.missingTickers.length === 0;
+  const fxCoverageOk = !coverage.fx.needed || coverage.fx.missingPairs.length === 0;
+  const [showAllPositions, setShowAllPositions] = useState(false);
+
+  const valuationDate = useMemo(() => {
+    if (!transactions || !latestPrices || !instruments) return '';
+    return getValuationDateForHoldings(transactions, latestPrices, instruments) || '';
+  }, [transactions, latestPrices, instruments]);
+  const valuationDateEffective = coverage.price.latest || valuationDate || '';
+
+  const valuedPositions = useMemo(() => {
+    if (!valuationDateEffective || !prices || !instruments || !fxRatesRange) return null;
+    return computeCurrentValuedPositions({
+      holdings,
+      instruments: instruments || [],
+      prices: prices || [],
+      fxRates: fxRatesRange || [],
+      valuationDate: valuationDateEffective,
+      baseCurrency: Currency.CHF
+    });
+  }, [holdings, instruments, prices, fxRatesRange, valuationDateEffective]);
+
+  const positionsSorted = useMemo(() => {
+    const list = valuedPositions?.positions || [];
+    return list
+      .filter(p => p.quantity > 0.000001)
+      .sort((a, b) => b.currentValueCHF - a.currentValueCHF);
+  }, [valuedPositions]);
+
+  const positionsVisible = useMemo(() => {
+    return showAllPositions ? positionsSorted : positionsSorted.slice(0, POSITIONS_MAX);
+  }, [positionsSorted, showAllPositions]);
+
+  const hasMorePositions = positionsSorted.length > POSITIONS_MAX;
+  const instrumentByTicker = useMemo(() => {
+    return new Map((instruments || []).map(inst => [inst.ticker, inst]));
+  }, [instruments]);
 
   // --- Filter State (Global) ---
   const [timeRange, setTimeRange] = useState<'3M' | '6M' | '1Y' | '5Y' | '10Y' | 'YTD' | 'MAX'>('MAX');
@@ -900,7 +1000,7 @@ export const Dashboard: React.FC = () => {
         : 'Mancanti: -';
       const summary = `${updatedLabel}. ${missingLabel}`;
       if (outcome.priceResult.status === 'ok' || outcome.priceResult.status === 'partial') {
-        setLatestSyncStatus(`${summary}${fxLabel ? ` · ${fxLabel}` : ''}`);
+        setLatestSyncStatus(`${summary}${fxLabel ? ` - ${fxLabel}` : ''}`);
       } else {
         setLatestSyncStatus(outcome.priceResult.message || 'Aggiornamento incompleto');
       }
@@ -961,34 +1061,43 @@ export const Dashboard: React.FC = () => {
         transactions={transactions || []}
         instruments={instruments || []}
         prices={prices || []}
+        coverage={coverage}
       />
 
       <div className="ui-panel p-4">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="flex flex-wrap gap-6">
             <div className="flex items-start gap-2">
-              <span className={clsx('mt-1 h-2.5 w-2.5 rounded-full', syncStatus.latestPricesOk ? 'bg-emerald-500' : 'bg-amber-400')} />
+              <span className={clsx('mt-1 h-2.5 w-2.5 rounded-full', priceCoverageOk ? 'bg-emerald-500' : 'bg-amber-400')} />
               <div>
-                <div className="text-xs font-bold text-slate-700">Prezzi latest (Sheet)</div>
+                <div className="text-xs font-bold text-slate-700">Prezzi DB (copertura)</div>
                 <div className="text-[11px] text-slate-500">
-                  Ultimo: {syncStatus.latestPricesAt || '—'} · {syncStatus.priceCoverage.ok}/{syncStatus.priceCoverage.total}
+                  Ultimo DB: {coverage.price.latest || 'N/D'} · Comune: {coverage.price.common || 'N/D'} · {coverage.price.total - coverage.price.missingTickers.length}/{coverage.price.total}
                 </div>
-                {syncStatus.missingTickers.length > 0 && (
+                {coverage.price.missingTickers.length > 0 && (
                   <div className="text-[11px] text-amber-700">
-                    Mancanti: {syncStatus.missingTickers.slice(0, 4).join(', ')}{syncStatus.missingTickers.length > 4 ? '…' : ''}
+                    Mancanti: {coverage.price.missingTickers.slice(0, 4).join(', ')}{coverage.price.missingTickers.length > 4 ? '...' : ''}
                   </div>
                 )}
               </div>
             </div>
             <div className="flex items-start gap-2">
-              <span className={clsx('mt-1 h-2.5 w-2.5 rounded-full', syncStatus.latestFxOk ? 'bg-emerald-500' : 'bg-amber-400')} />
+              <span className={clsx('mt-1 h-2.5 w-2.5 rounded-full', fxCoverageOk ? 'bg-emerald-500' : 'bg-amber-400')} />
               <div>
-                <div className="text-xs font-bold text-slate-700">FX latest (Sheet)</div>
-                <div className="text-[11px] text-slate-500">Ultimo: {syncStatus.latestFxAt || '—'}</div>
-                {syncStatus.missingPairs.length > 0 && (
-                  <div className="text-[11px] text-amber-700">
-                    Coppie mancanti: {syncStatus.missingPairs.slice(0, 3).join(', ')}{syncStatus.missingPairs.length > 3 ? '…' : ''}
-                  </div>
+                <div className="text-xs font-bold text-slate-700">FX DB (copertura)</div>
+                {coverage.fx.needed ? (
+                  <>
+                    <div className="text-[11px] text-slate-500">
+                      Ultimo DB: {coverage.fx.latest || 'N/D'} · Comune: {coverage.fx.common || 'N/D'}
+                    </div>
+                    {coverage.fx.missingPairs.length > 0 && (
+                      <div className="text-[11px] text-amber-700">
+                        Coppie mancanti: {coverage.fx.missingPairs.slice(0, 3).join(', ')}{coverage.fx.missingPairs.length > 3 ? '...' : ''}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-[11px] text-slate-500">FX non richiesto per i ticker correnti</div>
                 )}
               </div>
             </div>
@@ -1002,10 +1111,17 @@ export const Dashboard: React.FC = () => {
                 <div className="text-[11px] text-slate-500">
                   Mismatch valuta: {syncStatus.quality.currencyMismatch} · Stale: {syncStatus.quality.stale}
                 </div>
+                <div className="text-[11px] text-slate-500">
+                  Data effettiva: {coverage.effective.latest || 'N/D'}
+                </div>
+                {coverage.effective.limiting && (
+                  <div className="text-[11px] text-slate-500">
+                    Limite: {coverage.effective.limiting.type === 'fx' ? 'FX' : 'Prezzi'} {coverage.effective.limiting.key}
+                  </div>
+                )}
               </div>
             </div>
           </div>
-
           <div className="flex flex-col gap-2 min-w-[220px]">
             <div className="flex gap-2">
               <button
@@ -1014,7 +1130,7 @@ export const Dashboard: React.FC = () => {
                 disabled={latestSyncRunning}
                 className="ui-btn-primary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-60"
               >
-                {latestSyncRunning ? 'Aggiorno...' : 'Aggiorna oggi'}
+                {latestSyncRunning ? 'Aggiorno...' : 'Aggiorna latest'}
               </button>
               <button
                 type="button"
@@ -1022,15 +1138,15 @@ export const Dashboard: React.FC = () => {
                 disabled={gapFillRunning || !settings?.eodhdApiKey?.trim()}
                 className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-60"
               >
-                {gapFillRunning ? 'Riempiendo...' : 'Riempi buchi'}
+                {gapFillRunning ? 'Completando...' : 'Completa storico'}
               </button>
             </div>
             <div className="text-[11px] text-slate-500">
-              Ultimo sync: {lastLatestSyncAt ? new Date(lastLatestSyncAt).toLocaleString('it-IT') : 'mai'} · Gap-fill: {lastGapFillAt ? new Date(lastGapFillAt).toLocaleString('it-IT') : 'mai'}
+              Ultimo sync (processo): {lastLatestSyncAt ? new Date(lastLatestSyncAt).toLocaleString('it-IT') : 'mai'} - Gap-fill (processo): {lastGapFillAt ? new Date(lastGapFillAt).toLocaleString('it-IT') : 'mai'}
             </div>
             {(latestSyncStatus || gapFillStatus) && (
               <div className="text-[11px] text-slate-600">
-                {latestSyncStatus ? `Sync: ${latestSyncStatus}` : ''}{latestSyncStatus && gapFillStatus ? ' · ' : ''}{gapFillStatus ? `Gap: ${gapFillStatus}` : ''}
+                {latestSyncStatus ? `Sync: ${latestSyncStatus}` : ''}{latestSyncStatus && gapFillStatus ? ' - ' : ''}{gapFillStatus ? `Gap: ${gapFillStatus}` : ''}
               </div>
             )}
           </div>
@@ -1116,6 +1232,119 @@ export const Dashboard: React.FC = () => {
             subValue="Dal picco max"
             alert
           />
+      </div>
+
+      {/* Posizioni attuali */}
+      <div className="ui-panel p-6">
+        <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+          <div>
+            <h3 className="font-bold text-slate-900 text-xs uppercase tracking-wider flex items-center gap-2">
+              <span className="w-1 h-4 rounded-full bg-[#0052a3] shadow-[0_0_10px_rgba(0,82,163,0.5)]"></span> Posizioni attuali
+            </h3>
+            <div className="text-xs text-slate-600 mt-1">Valorizzazione corrente per posizione</div>
+          </div>
+          {hasMorePositions && (
+            <button
+              type="button"
+              onClick={() => setShowAllPositions(prev => !prev)}
+              className="text-xs font-bold text-[#0052a3] hover:text-blue-600"
+            >
+              {showAllPositions ? 'Mostra meno' : 'Vedi tutte'}
+            </button>
+          )}
+        </div>
+
+        {positionsSorted.length === 0 ? (
+          <div className="text-xs text-slate-500">Nessuna posizione disponibile.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs min-w-[920px]">
+              <thead className="bg-slate-100 text-[11px] text-slate-600 uppercase">
+                <tr>
+                  <th className="px-3 py-2 text-left">Ticker</th>
+                  <th className="px-3 py-2 text-left">Nome</th>
+                  <th className="px-3 py-2 text-right">Quote</th>
+                  <th className="px-3 py-2 text-right">PMC</th>
+                  <th className="px-3 py-2 text-right">Prezzo attuale</th>
+                  <th className="px-3 py-2 text-right">Diff. vs PMC</th>
+                  <th className="px-3 py-2 text-right">Valore CHF</th>
+                  <th className="px-3 py-2 text-right">Peso %</th>
+                </tr>
+              </thead>
+              <tbody>
+                {positionsVisible.map(pos => {
+                  const instrument = instrumentByTicker.get(pos.ticker);
+                  const priceMissing = !pos.priceDate || pos.currentPrice <= 0;
+                  const needsFx = pos.priceCurrency !== Currency.CHF;
+                  const fxMissing = !priceMissing && needsFx && !pos.fxRateToChf;
+                  const isValued = !priceMissing && !fxMissing;
+                  const isPriceStale = Boolean(pos.priceDate && valuationDateEffective && pos.priceDate < valuationDateEffective);
+                  const costBasis = costBasisByTicker.get(pos.ticker);
+                  const pmcValue = costBasis?.avgCost;
+                  const pmcCurrency = (costBasis?.currency || pos.priceCurrency || instrument?.currency || Currency.CHF) as Currency;
+                  const hasPmc = Number.isFinite(pmcValue) && (pmcValue as number) > 0;
+                  const pmcCurrencyMismatch = Boolean(hasPmc && pos.priceCurrency && pmcCurrency && pos.priceCurrency !== pmcCurrency);
+                  const canComputeDiff = !priceMissing && hasPmc && !pmcCurrencyMismatch;
+                  const diffValue = canComputeDiff ? pos.currentPrice - (pmcValue as number) : undefined;
+                  const diffPct = canComputeDiff && pmcValue ? (diffValue as number) / (pmcValue as number) * 100 : undefined;
+                  const diffTone = !canComputeDiff
+                    ? 'text-slate-500'
+                    : (Math.abs(diffValue as number) < 1e-8 ? 'text-slate-500' : (diffValue as number) > 0 ? 'text-emerald-600' : 'text-rose-600');
+                  const missingBadge = (label: string) => (
+                    <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200 text-[10px] font-bold">
+                      {label}
+                    </span>
+                  );
+
+                  return (
+                    <tr key={pos.ticker} className="border-t border-borderSoft">
+                      <td className="px-3 py-2 font-semibold text-slate-700">{pos.ticker}</td>
+                      <td className="px-3 py-2 text-slate-700">{pos.name}</td>
+                      <td className="px-3 py-2 text-right text-slate-700">
+                        {formatQuantity(pos.quantity, instrument, pos.ticker)}
+                      </td>
+                      <td className="px-3 py-2 text-right text-slate-700">
+                        {hasPmc
+                          ? formatUnitPrice(pmcValue as number, pmcCurrency)
+                          : '—'}
+                      </td>
+                      <td className="px-3 py-2 text-right text-slate-700">
+                        {priceMissing ? (
+                          missingBadge('Prezzo mancante')
+                        ) : (
+                          <span title={`Prezzo al ${pos.priceDate || 'N/D'}`}>
+                            {formatUnitPrice(pos.currentPrice, pos.priceCurrency)}
+                            {isPriceStale && <span className="ml-1 text-amber-600" title={`Prezzo al ${pos.priceDate}`}>•</span>}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        {canComputeDiff ? (
+                          <div className={`flex flex-col items-end ${diffTone}`}>
+                            <span className="font-semibold">{formatSignedUnitPrice(diffValue as number, pmcCurrency)}</span>
+                            <span className="text-[10px]">{formatSignedPct(diffPct as number)}</span>
+                          </div>
+                        ) : (
+                          <span className="text-slate-500">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right text-slate-700">
+                        {priceMissing
+                          ? missingBadge('Prezzo mancante')
+                          : fxMissing
+                            ? missingBadge('FX mancante')
+                            : formatChfValue(pos.currentValueCHF)}
+                      </td>
+                      <td className="px-3 py-2 text-right text-slate-700">
+                        {isValued ? `${pos.currentPct.toFixed(1)}%` : '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* ROW 2: Performance Chart */}
@@ -1737,7 +1966,7 @@ export const Dashboard: React.FC = () => {
                     {hasIncompleteRegionData && (
                       <div className="flex items-center justify-between text-xs bg-amber-50 border border-amber-100 rounded-lg px-2 py-1.5">
                         <span className="font-semibold text-amber-800">Non definito</span>
-                        <span className="font-bold text-amber-800">{`${(unassignedRegion?.pct ?? 0).toFixed(1)}% · CHF ${Math.round(unassignedRegion?.value ?? 0).toLocaleString()}`}</span>
+                        <span className="font-bold text-amber-800">{`${(unassignedRegion?.pct ?? 0).toFixed(1)}% - CHF ${Math.round(unassignedRegion?.value ?? 0).toLocaleString()}`}</span>
                       </div>
                     )}
                   </div>
@@ -1747,7 +1976,7 @@ export const Dashboard: React.FC = () => {
                     {hasIncompleteRegionData && (
                       <div className="flex items-center justify-between text-xs bg-amber-50 border border-amber-100 rounded-lg px-2 py-1.5">
                         <span className="font-semibold text-amber-800">Non definito</span>
-                        <span className="font-bold text-amber-800">{`${(unassignedRegion?.pct ?? 0).toFixed(1)}% · CHF ${Math.round(unassignedRegion?.value ?? 0).toLocaleString()}`}</span>
+                        <span className="font-bold text-amber-800">{`${(unassignedRegion?.pct ?? 0).toFixed(1)}% - CHF ${Math.round(unassignedRegion?.value ?? 0).toLocaleString()}`}</span>
                       </div>
                     )}
                   </div>
@@ -1772,6 +2001,9 @@ export const Dashboard: React.FC = () => {
     </div>
   );
 };
+
+
+
 
 
 

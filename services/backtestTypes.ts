@@ -18,7 +18,8 @@ export type BacktestScenarioInput = {
   startDate: string;
   endDate: string;
   initialCapital: number;
-  annualContribution: number;
+  periodicContributionAmount: number;
+  contributionFrequency: 'none' | 'monthly' | 'quarterly' | 'semiannual' | 'annual';
   rebalanceFrequency: 'none' | 'annual';
   baseCurrency: Currency;
   assets: BacktestAssetInput[];

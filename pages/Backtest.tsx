@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { subDays, format } from 'date-fns';
 import { db, getCurrentPortfolioId } from '../db';
-import { Currency } from '../types';
+import { BacktestScenarioRecord, Currency } from '../types';
 import { BacktestScenarioInput, BacktestResult } from '../services/backtestTypes';
 import { BacktestBuilder } from '../components/backtest/BacktestBuilder';
 import { BacktestResults } from '../components/backtest/BacktestResults';
@@ -10,6 +10,7 @@ import { buildBacktestScenarioDataKey, loadBacktestScenarioData } from '../servi
 import { runBacktest } from '../services/backtestEngine';
 import { listBacktestImports } from '../services/backtestImportRepository';
 import { BacktestScenarioList } from '../components/backtest/BacktestScenarioList';
+import { BacktestComparisonPanel } from '../components/backtest/BacktestComparisonPanel';
 import { createBacktestScenario, deleteBacktestScenario, duplicateBacktestScenario, getBacktestScenarioById, listBacktestScenarios, saveBacktestScenario } from '../services/backtestScenarioRepository';
 
 export const Backtest: React.FC = () => {
@@ -36,7 +37,8 @@ export const Backtest: React.FC = () => {
     startDate: defaultStart,
     endDate: defaultEnd,
     initialCapital: 10000,
-    annualContribution: 0,
+    periodicContributionAmount: 0,
+    contributionFrequency: 'none',
     rebalanceFrequency: 'none',
     baseCurrency,
     assets: []
@@ -53,10 +55,6 @@ export const Backtest: React.FC = () => {
 
   const scenarioSnapshot = useMemo(() => JSON.stringify(scenario), [scenario]);
   const isDirty = useMemo(() => (savedSnapshot ? scenarioSnapshot !== savedSnapshot : false), [scenarioSnapshot, savedSnapshot]);
-  const scenarioStateLabel = useMemo(() => {
-    if (currentScenarioId) return isDirty ? 'Modifiche non salvate' : 'Scenario salvato';
-    return 'Nuovo scenario';
-  }, [currentScenarioId, isDirty]);
 
   const missingCsvImports = useMemo(() => {
     const importIds = new Set((imports || []).map(item => item.id));
@@ -65,13 +63,21 @@ export const Backtest: React.FC = () => {
       .map(asset => asset.ticker);
   }, [scenario.assets, imports]);
 
-  const applyScenarioRecord = (record: { id?: number; title: string; startDate: string; endDate: string; initialCapital: number; annualContribution: number; rebalanceFrequency: 'none' | 'annual'; baseCurrency: string; assets: BacktestScenarioInput['assets'] }) => {
+  const applyScenarioRecord = (record: BacktestScenarioRecord) => {
+    const legacyAnnual = typeof record.annualContribution === 'number' ? record.annualContribution : 0;
+    const periodicContributionAmount = typeof record.periodicContributionAmount === 'number'
+      ? record.periodicContributionAmount
+      : legacyAnnual;
+    const contributionFrequency = record.contributionFrequency
+      ?? (legacyAnnual > 0 ? 'annual' : 'none');
+
     const nextScenario: BacktestScenarioInput = {
       title: record.title,
       startDate: record.startDate,
       endDate: record.endDate,
       initialCapital: record.initialCapital,
-      annualContribution: record.annualContribution,
+      periodicContributionAmount,
+      contributionFrequency,
       rebalanceFrequency: record.rebalanceFrequency,
       baseCurrency: (record.baseCurrency as Currency) || scenario.baseCurrency,
       assets: record.assets || []
@@ -186,6 +192,10 @@ export const Backtest: React.FC = () => {
             onDuplicate={handleDuplicateScenario}
             onDelete={handleDeleteScenario}
           />
+          <BacktestComparisonPanel
+            scenarios={scenarios || []}
+            portfolioId={portfolioId}
+          />
           <BacktestBuilder
             scenario={scenario}
             instruments={instruments || []}
@@ -194,7 +204,6 @@ export const Backtest: React.FC = () => {
             quality={scenarioData?.quality || null}
             qualityLoading={dataLoading}
             currentScenarioId={currentScenarioId}
-            scenarioStateLabel={scenarioStateLabel}
             isDirty={isDirty}
             saveNotice={saveNotice}
             missingCsvImports={missingCsvImports}

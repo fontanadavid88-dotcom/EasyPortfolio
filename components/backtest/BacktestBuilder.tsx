@@ -35,7 +35,6 @@ export const BacktestBuilder: React.FC<{
   quality: BacktestDataQualitySummary | null;
   qualityLoading?: boolean;
   currentScenarioId?: number | null;
-  scenarioStateLabel?: string;
   isDirty?: boolean;
   saveNotice?: string | null;
   missingCsvImports?: string[];
@@ -54,7 +53,6 @@ export const BacktestBuilder: React.FC<{
   quality,
   qualityLoading,
   currentScenarioId,
-  scenarioStateLabel,
   isDirty,
   saveNotice,
   missingCsvImports,
@@ -78,6 +76,15 @@ export const BacktestBuilder: React.FC<{
     });
     return ids;
   }, [scenario.assets]);
+  const scenarioStatus = useMemo(() => {
+    if (!currentScenarioId) {
+      return { text: 'Nuovo scenario', className: 'bg-slate-100 text-slate-600 border-slate-200' };
+    }
+    if (isDirty) {
+      return { text: 'Modifiche non salvate', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+    }
+    return { text: 'Scenario salvato', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
+  }, [currentScenarioId, isDirty]);
 
   const qualityStatusLabel = useMemo(() => {
     if (!quality?.status) return null;
@@ -93,7 +100,7 @@ export const BacktestBuilder: React.FC<{
     if (!scenario.startDate || !scenario.endDate) errors.push('Date non valide.');
     if (scenario.startDate && scenario.endDate && scenario.startDate > scenario.endDate) errors.push('La data di inizio eÌ€ successiva alla data di fine.');
     if (scenario.initialCapital < 0) errors.push('Il capitale iniziale non puoÌ€ essere negativo.');
-    if (scenario.annualContribution < 0) errors.push('Il versamento annuale non puoÌ€ essere negativo.');
+    if (scenario.periodicContributionAmount < 0) errors.push('Il versamento non puo essere negativo.');
     if (scenario.assets.length === 0) errors.push('Aggiungi almeno uno strumento.');
     if (Math.abs(allocationSum - 100) > 0.01) errors.push('La somma delle allocazioni deve essere 100%.');
     if (quality && !quality.canRun) {
@@ -133,7 +140,12 @@ export const BacktestBuilder: React.FC<{
       <div className="ui-panel p-6 space-y-5">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">Backtest</h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-2xl font-bold text-slate-900">Backtest</h1>
+              <span className={clsx('text-[11px] uppercase tracking-wide font-semibold px-2 py-1 rounded-full border', scenarioStatus.className)}>
+                {scenarioStatus.text}
+              </span>
+            </div>
             <p className="text-sm text-slate-500">Costruisci uno scenario e simula un portafoglio modello.</p>
           </div>
           <div className="text-xs text-slate-400 text-right">
@@ -144,10 +156,7 @@ export const BacktestBuilder: React.FC<{
 
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div className="text-xs text-slate-600">
-            <span className="font-semibold text-slate-700">{scenarioStateLabel || 'Scenario'}</span>
-            {isDirty && currentScenarioId && (
-              <span className="ml-2 text-amber-600">Modifiche non salvate</span>
-            )}
+            <span className="font-semibold text-slate-700">Azioni scenario</span>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <button type="button" className="ui-btn-secondary px-3 py-2 text-xs" onClick={onNewScenario}>
@@ -212,14 +221,36 @@ export const BacktestBuilder: React.FC<{
             />
           </div>
           <div>
-            <label className="text-sm font-semibold text-slate-700">Versamento annuale</label>
+            <label className="text-sm font-semibold text-slate-700">Importo versamento</label>
             <input
               type="number"
               min="0"
               className="ui-input mt-2"
-              value={scenario.annualContribution}
-              onChange={e => onScenarioChange({ ...scenario, annualContribution: Number(e.target.value) })}
+              value={scenario.periodicContributionAmount}
+              onChange={e => onScenarioChange({ ...scenario, periodicContributionAmount: Number(e.target.value) })}
             />
+          </div>
+          <div>
+            <label className="text-sm font-semibold text-slate-700">Frequenza versamento</label>
+            <select
+              className="ui-input mt-2"
+              value={scenario.contributionFrequency}
+              onChange={e => onScenarioChange({ ...scenario, contributionFrequency: e.target.value as BacktestScenarioInput['contributionFrequency'] })}
+            >
+              <option value="none">Nessuno</option>
+              <option value="monthly">Mensile</option>
+              <option value="quarterly">Trimestrale</option>
+              <option value="semiannual">Semestrale</option>
+              <option value="annual">Annuale</option>
+            </select>
+          </div>
+          <div className="md:col-span-2 xl:col-span-3 text-xs text-slate-500 space-y-1">
+            <div>
+              L'importo e applicato per ogni rata in base alla frequenza scelta (Mensile=ogni mese, Trimestrale=ogni 3 mesi, Semestrale=ogni 6 mesi, Annuale=ogni anno).
+            </div>
+            <div>
+              I versamenti seguono il mese della data iniziale e usano il punto mensile disponibile.
+            </div>
           </div>
           <div>
             <label className="text-sm font-semibold text-slate-700">Ribilanciamento</label>

@@ -2,6 +2,7 @@ import React, { useMemo } from 'react';
 import { Area, AreaChart, Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid, Legend, LabelList } from 'recharts';
 import { BacktestResult, BacktestScenarioInput } from '../../services/backtestTypes';
 import { CHART_COLORS, COLORS } from '../../constants';
+import { contributionFrequencyLabel, resolveContributionFields } from './backtestUiUtils';
 
 const formatCurrency = (value: number, currency: string) => {
   if (!Number.isFinite(value)) return '—';
@@ -49,6 +50,11 @@ export const BacktestResults: React.FC<{
 }> = ({ scenario, result, onBack }) => {
   const effectiveStart = result.effectiveStartDate || scenario.startDate;
   const effectiveEnd = result.effectiveEndDate || scenario.endDate;
+  const { amount: contributionAmount, frequency: contributionFrequency } = resolveContributionFields(scenario);
+  const contributionFrequencyText = contributionFrequencyLabel(contributionFrequency);
+  const contributionAmountText = contributionAmount > 0 && contributionFrequency !== 'none'
+    ? formatCurrency(contributionAmount, scenario.baseCurrency)
+    : 'Nessuno';
   const navSeries = result.navSeries || [];
   const chartSeries = useMemo(() => {
     if (navSeries.length <= 450) return navSeries;
@@ -114,9 +120,26 @@ export const BacktestResults: React.FC<{
           <div>
             <h1 className="text-2xl font-bold text-slate-900">{scenario.title}</h1>
             <div className="text-sm text-slate-500 space-y-1">
-              <div>Periodo richiesto: {scenario.startDate} → {scenario.endDate}</div>
-              <div>Periodo simulato: {effectiveStart} → {effectiveEnd}</div>
-              <div>Base {scenario.baseCurrency} · Ribilanciamento {scenario.rebalanceFrequency === 'annual' ? 'annuale' : 'no'}</div>
+              <div>Periodo richiesto: {scenario.startDate} {'->'} {scenario.endDate}</div>
+              <div>Periodo simulato: {effectiveStart} {'->'} {effectiveEnd}</div>
+              <div>Base {scenario.baseCurrency} - Ribilanciamento {scenario.rebalanceFrequency === 'annual' ? 'annuale' : 'no'}</div>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-600">
+              <div className="px-2 py-1 rounded-md border border-slate-200 bg-slate-50">
+                <span className="font-semibold text-slate-700">Frequenza versamento:</span> {contributionFrequencyText}
+              </div>
+              <div className="px-2 py-1 rounded-md border border-slate-200 bg-slate-50">
+                <span className="font-semibold text-slate-700">Importo versamento:</span> {contributionAmountText}
+              </div>
+              <div className="px-2 py-1 rounded-md border border-slate-200 bg-slate-50">
+                <span className="font-semibold text-slate-700">Periodo simulato:</span> {effectiveStart} {'->'} {effectiveEnd}
+              </div>
+              <div className="px-2 py-1 rounded-md border border-slate-200 bg-slate-50">
+                <span className="font-semibold text-slate-700">Strumenti:</span> {scenario.assets.length}
+              </div>
+              <div className="px-2 py-1 rounded-md border border-slate-200 bg-slate-50">
+                <span className="font-semibold text-slate-700">Ribilanciamento:</span> {scenario.rebalanceFrequency === 'annual' ? 'Annuale' : 'No'}
+              </div>
             </div>
             {effectiveEnd < scenario.endDate && (
               <div className="mt-2 inline-flex items-center text-[11px] uppercase tracking-wide font-semibold px-2 py-1 rounded-full border bg-amber-50 text-amber-700 border-amber-200">
