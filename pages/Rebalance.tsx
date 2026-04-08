@@ -91,7 +91,8 @@ export const Rebalance: React.FC = () => {
         assetClass: AssetClass.STOCK,
         currency: Currency.CHF,
         sector: '',
-        region: '' as RegionKey | ''
+        region: '' as RegionKey | '',
+        terPct: ''
     });
     const [editAssetInitialRegion, setEditAssetInitialRegion] = useState<RegionKey | ''>('');
     const defaultStrategy = RebalanceStrategy.Accumulate;
@@ -634,7 +635,8 @@ export const Rebalance: React.FC = () => {
             assetClass: instrument.assetClass || AssetClass.STOCK,
             currency: instrument.currency || Currency.CHF,
             sector: instrument.sector || '',
-            region: regionValue
+            region: regionValue,
+            terPct: instrument.terPct !== undefined ? String(instrument.terPct) : ''
         });
         setEditAssetInitialRegion(initialRegion);
         setEditAssetModalOpen(true);
@@ -646,6 +648,13 @@ export const Rebalance: React.FC = () => {
         setEditAssetInitialRegion('');
     };
 
+    const parseOptionalPct = (value: string) => {
+        const trimmed = value.trim();
+        if (!trimmed) return undefined;
+        const parsed = Number(trimmed);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+    };
+
     const handleSaveAssetMeta = async (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         if (!editingAsset) return;
@@ -654,7 +663,8 @@ export const Rebalance: React.FC = () => {
             type: editAssetForm.type,
             assetClass: editAssetForm.assetClass,
             currency: editAssetForm.currency,
-            sector: editAssetForm.sector.trim() || undefined
+            sector: editAssetForm.sector.trim() || undefined,
+            terPct: parseOptionalPct(editAssetForm.terPct)
         };
 
         const regionChanged = editAssetForm.region !== editAssetInitialRegion;
@@ -843,6 +853,18 @@ export const Rebalance: React.FC = () => {
                                         <option key={opt.key} value={opt.key}>{opt.label}</option>
                                     ))}
                                 </select>
+                            </div>
+                            <div>
+                                <label className="block text-xs font-bold text-gray-400 uppercase mb-1.5">TER % annuo (opzionale)</label>
+                                <input
+                                    type="number"
+                                    placeholder="0.20"
+                                    step="0.01"
+                                    min="0"
+                                    value={editAssetForm.terPct}
+                                    onChange={e => setEditAssetForm({ ...editAssetForm, terPct: e.target.value })}
+                                    className="ui-input w-full text-sm font-mono"
+                                />
                             </div>
 
                             <div className="pt-4 flex gap-3">

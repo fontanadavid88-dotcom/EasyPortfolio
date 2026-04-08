@@ -16,13 +16,14 @@ import { deleteInstrumentGloballySafely, queryLatestFxForPairs } from '../servic
 import { computeFxCoverageForPairs } from '../services/dataCoverage';
 import { addHiddenTicker, getHiddenTickersForPortfolio, removeHiddenTicker, removeHiddenTickerEverywhere } from '../services/portfolioVisibility';
 import { isIsin, normalizeTicker, resolveEodhdSymbol, hasExchangeSuffix } from '../services/symbolUtils';
-import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType, Transaction } from '../types';
+import { AppSettings, Currency, InstrumentListing, Instrument, PriceProviderType, PriceTickerConfig, RegionKey, AssetType, Transaction, InflationPoint, InflationAnnualPoint } from '../types';
 import { InfoPopover } from '../components/InfoPopover';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { format, subDays } from 'date-fns';
 import { useLocation } from 'react-router-dom';
 import { resetSymbolMigrationFlag, runSymbolMigrationOnce } from '../services/symbolMigration';
 import clsx from 'clsx';
+import { dedupeInflationCsvRows, getAnnualInflationCoverage, getInflationCoverage, mergeInflationRowsWithExisting } from '../services/inflationService';
 
 type InstrumentListingRow = {
   id?: number;
@@ -35,12 +36,13 @@ type InstrumentListingRow = {
 };
 
 type FxRateRowWithId = FxRateRow & { id?: number };
-type ActiveSection = 'prices' | 'connections' | 'coverage' | 'backup' | 'advanced';
+type ActiveSection = 'prices' | 'connections' | 'coverage' | 'inflation' | 'backup' | 'advanced';
 
 const SETTINGS_SECTIONS: { key: ActiveSection; label: string }[] = [
   { key: 'prices', label: 'Prezzi & Backfill' },
   { key: 'connections', label: 'Provider & Connessioni' },
   { key: 'coverage', label: 'Ticker / Listings / Coverage' },
+  { key: 'inflation', label: 'Inflazione' },
   { key: 'backup', label: 'Backup & Import' },
   { key: 'advanced', label: 'Avanzate' }
 ];
@@ -94,6 +96,11 @@ export const Settings: React.FC = () => {
   const [fxBackfillLoading, setFxBackfillLoading] = useState(false);
   const [fxBackfillStatus, setFxBackfillStatus] = useState('');
   const [fxBackfillSummary, setFxBackfillSummary] = useState<FxBackfillSummary | null>(null);
+  const [inflationStatus, setInflationStatus] = useState('');
+  const [annualInflationCurrency, setAnnualInflationCurrency] = useState<Currency>(Currency.CHF);
+  const [annualInflationYear, setAnnualInflationYear] = useState(String(new Date().getFullYear() - 1));
+  const [annualInflationRatePct, setAnnualInflationRatePct] = useState('');
+  const [editingAnnualInflationId, setEditingAnnualInflationId] = useState<number | undefined>(undefined);
   const [fxLastDateInfo, setFxLastDateInfo] = useState<{ latest?: string; common?: string; details?: string; pairs: string[]; missingPairs?: string[] } | null>(null);
   const [fxLastDateLoading, setFxLastDateLoading] = useState(false);
   const [eodhdTests, setEodhdTests] = useState<Record<string, { status: string; symbol?: string; message?: string; httpStatus?: number; sample?: string; contentType?: string; rawPreview?: string; parseError?: string; url?: string }>>({});
@@ -147,6 +154,7 @@ export const Settings: React.FC = () => {
   const importPriceButtonRef = useRef<HTMLButtonElement | null>(null);
   const fxCsvRef = useRef<HTMLInputElement | null>(null);
   const importFxButtonRef = useRef<HTMLButtonElement | null>(null);
+  const inflationCsvRef = useRef<HTMLInputElement | null>(null);
   const [fxBase, setFxBase] = useState<Currency>(Currency.CHF);
   const [fxQuote, setFxQuote] = useState<Currency>(Currency.USD);
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -173,6 +181,16 @@ export const Settings: React.FC = () => {
     []
   ) as InstrumentListingRow[];
   const fxRates = useLiveQuery(() => db.fxRates.toArray(), [], []) as FxRateRowWithId[];
+  const inflationRates = useLiveQuery(
+    () => db.inflationRates.where('portfolioId').equals(currentPortfolioId).toArray(),
+    [currentPortfolioId],
+    []
+  ) as InflationPoint[];
+  const inflationAnnualRates = useLiveQuery(
+    () => db.inflationAnnualRates.where('portfolioId').equals(currentPortfolioId).toArray(),
+    [currentPortfolioId],
+    []
+  ) as InflationAnnualPoint[];
   const allTransactions = useLiveQuery(
     () => db.transactions.toArray(),
     [],
@@ -1065,7 +1083,9 @@ export const Settings: React.FC = () => {
       instruments: await db.instruments.toArray(),
       transactions: await db.transactions.toArray(),
       prices: await db.prices.toArray(),
-      macro: await db.macro.toArray()
+      macro: await db.macro.toArray(),
+      inflationRates: await db.inflationRates.toArray(),
+      inflationAnnualRates: await db.inflationAnnualRates.toArray()
     };
 
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -1305,6 +1325,154 @@ export const Settings: React.FC = () => {
     } finally {
       if (fxCsvRef.current) fxCsvRef.current.value = '';
     }
+  };
+
+  const handleInflationImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setInflationStatus('Import inflazione in corso...');
+    try {
+      const text = await file.text();
+      const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      if (lines.length < 2) throw new Error('CSV vuoto o senza righe dati.');
+      const header = lines[0].split(',').map(col => col.trim().toLowerCase());
+      const dateIdx = header.indexOf('date');
+      const currencyIdx = header.indexOf('currency');
+      const indexIdx = header.indexOf('index');
+      if (dateIdx < 0 || currencyIdx < 0 || indexIdx < 0) {
+        throw new Error('Header richiesto: date,currency,index');
+      }
+
+      const parsedRows: InflationPoint[] = [];
+      const errors: string[] = [];
+      lines.slice(1).forEach((line, idx) => {
+        const cols = line.split(',').map(col => col.trim());
+        const date = cols[dateIdx] || '';
+        const currency = cols[currencyIdx] as Currency;
+        const index = toNum(cols[indexIdx]);
+        const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date) && !Number.isNaN(new Date(`${date}T00:00:00`).getTime());
+        const validCurrency = (Object.values(Currency) as string[]).includes(currency);
+        if (!validDate || !validCurrency || index === null || index <= 0) {
+          errors.push(`Riga ${idx + 2}: data/valuta/index non validi`);
+          return;
+        }
+        parsedRows.push({
+          currency,
+          date,
+          index,
+          source: 'csv',
+          portfolioId: currentPortfolioId
+        });
+      });
+
+      const deduped = dedupeInflationCsvRows(parsedRows);
+      const currencies = Array.from(new Set(deduped.rows.map(row => row.currency)));
+      const existingRows: InflationPoint[] = [];
+      for (const currency of currencies) {
+        const rowsForCurrency = await db.inflationRates
+          .where('currency')
+          .equals(currency)
+          .filter(row => row.portfolioId === currentPortfolioId)
+          .toArray();
+        existingRows.push(...rowsForCurrency);
+      }
+      const merged = mergeInflationRowsWithExisting(deduped.rows, existingRows);
+      if (merged.rows.length > 0) await db.inflationRates.bulkPut(merged.rows);
+      setInflationStatus(
+        `CPI mensile: ${merged.insertedCount} nuove, ${merged.updatedCount} aggiornate, ${deduped.duplicateCount} duplicate ignorate, ${errors.length} errori.`
+      );
+    } catch (err: any) {
+      setInflationStatus(err?.message || 'Errore import inflazione.');
+    } finally {
+      if (inflationCsvRef.current) inflationCsvRef.current.value = '';
+    }
+  };
+
+  const resetAnnualInflationForm = () => {
+    setEditingAnnualInflationId(undefined);
+    setAnnualInflationCurrency(config.baseCurrency || Currency.CHF);
+    setAnnualInflationYear(String(new Date().getFullYear() - 1));
+    setAnnualInflationRatePct('');
+  };
+
+  const handleSaveAnnualInflation = async () => {
+    const year = Number(annualInflationYear);
+    const ratePct = Number(annualInflationRatePct);
+    if (!Number.isInteger(year) || year < 1900 || year > 2200) {
+      setInflationStatus('Anno non valido.');
+      return;
+    }
+    if (!Number.isFinite(ratePct) || ratePct < -50 || ratePct > 100) {
+      setInflationStatus('Inflazione % non valida. Usa un valore tra -50 e 100.');
+      return;
+    }
+    const existingRows = await db.inflationAnnualRates
+      .where('[currency+year]')
+      .equals([annualInflationCurrency, year])
+      .toArray();
+    const existing = existingRows.find(row => row.portfolioId === currentPortfolioId);
+    const payload: InflationAnnualPoint = {
+      id: existing?.id || editingAnnualInflationId,
+      portfolioId: currentPortfolioId,
+      currency: annualInflationCurrency,
+      year,
+      ratePct,
+      source: 'manual'
+    };
+    await db.inflationAnnualRates.put(payload);
+    if (editingAnnualInflationId && existing?.id && existing.id !== editingAnnualInflationId) {
+      await db.inflationAnnualRates.delete(editingAnnualInflationId);
+    }
+    setInflationStatus(existing || editingAnnualInflationId ? 'Inflazione annuale aggiornata.' : 'Inflazione annuale salvata.');
+    resetAnnualInflationForm();
+  };
+
+  const handleEditAnnualInflation = (row: InflationAnnualPoint) => {
+    setEditingAnnualInflationId(row.id);
+    setAnnualInflationCurrency(row.currency);
+    setAnnualInflationYear(String(row.year));
+    setAnnualInflationRatePct(String(row.ratePct));
+  };
+
+  const handleDeleteAnnualInflation = async (row: InflationAnnualPoint) => {
+    if (!row.id) return;
+    if (!confirm(`Eliminare inflazione ${row.currency} ${row.year}?`)) return;
+    await db.inflationAnnualRates.delete(row.id);
+    setInflationStatus(`Inflazione annuale ${row.currency} ${row.year} eliminata.`);
+    if (editingAnnualInflationId === row.id) resetAnnualInflationForm();
+  };
+
+  const handleInflationExport = async () => {
+    const rows = await db.inflationRates
+      .where('portfolioId')
+      .equals(currentPortfolioId)
+      .sortBy('date');
+    const sorted = rows.sort((a, b) => {
+      const currencyOrder = a.currency.localeCompare(b.currency);
+      return currencyOrder !== 0 ? currencyOrder : a.date.localeCompare(b.date);
+    });
+    const csv = [
+      'date,currency,index',
+      ...sorted.map(row => `${row.date},${row.currency},${row.index}`)
+    ].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `easyportfolio-inflation-${currentPortfolioId}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setInflationStatus(`Esportate ${sorted.length} righe CPI.`);
+  };
+
+  const handleInflationResetCurrency = async (currency: Currency) => {
+    if (!confirm(`Eliminare i dati inflazione ${currency} per questo portafoglio?`)) return;
+    const ids = (inflationRates || [])
+      .filter(row => row.currency === currency)
+      .map(row => row.id)
+      .filter((id): id is number => typeof id === 'number');
+    if (ids.length > 0) await db.inflationRates.bulkDelete(ids);
+    setInflationStatus(`Reset inflazione ${currency}: ${ids.length} righe eliminate.`);
   };
 
   useEffect(() => {
@@ -1573,6 +1741,30 @@ export const Settings: React.FC = () => {
       }))
       .sort((a, b) => a.key.localeCompare(b.key));
   }, [fxRates, instruments, config.baseCurrency]);
+
+  const inflationCoverage = useMemo(() => {
+    return Object.values(Currency).map(currency => getInflationCoverage(inflationRates || [], currency));
+  }, [inflationRates]);
+
+  const annualInflationCoverage = useMemo(() => {
+    return Object.values(Currency).map(currency => getAnnualInflationCoverage(inflationAnnualRates || [], currency));
+  }, [inflationAnnualRates]);
+
+  const annualInflationRows = useMemo(() => {
+    return [...(inflationAnnualRates || [])].sort((a, b) => {
+      const currencyOrder = a.currency.localeCompare(b.currency);
+      return currencyOrder !== 0 ? currencyOrder : b.year - a.year;
+    });
+  }, [inflationAnnualRates]);
+
+  const preferredInflationMode = useMemo(() => {
+    const base = config.baseCurrency || Currency.CHF;
+    const monthly = getInflationCoverage(inflationRates || [], base);
+    if (monthly.count > 0) return 'mensile';
+    const annual = getAnnualInflationCoverage(inflationAnnualRates || [], base);
+    if (annual.count > 0) return 'annuale';
+    return 'assente';
+  }, [config.baseCurrency, inflationRates, inflationAnnualRates]);
 
   const handleDeleteListing = async (row: InstrumentListingRow) => {
     const usage = listingUsage.get(row.symbol);
@@ -2275,6 +2467,245 @@ export const Settings: React.FC = () => {
                 <div className="text-[11px] text-slate-500">
                   Ultimo auto-sync: {autoSyncLabel} - Gap-fill: {gapFillLabel} - Budget oggi usato: {budgetStatus.used}
                 </div>
+              </div>
+            </div>
+            )}
+
+            {activeSection === 'inflation' && (
+            <div className="ui-panel-dense p-4 space-y-4 text-sm text-slate-700">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-bold text-slate-900">Inflazione</div>
+                  <div className="text-xs text-slate-600 mt-1">
+                    Annuale manuale per KPI sintetici, CSV mensile per grafici e range più precisi.
+                  </div>
+                </div>
+                <InfoPopover
+                  ariaLabel="Come preparare l'import inflazione"
+                  title="Come preparare l'import inflazione"
+                  renderContent={() => (
+                    <div className="space-y-3 text-sm">
+                      <div>
+                        <div className="font-bold text-slate-900">Modalità</div>
+                        <ul className="list-disc list-inside space-y-1">
+                          <li>Annuale manuale: consigliata per uso semplice e KPI reali sintetici.</li>
+                          <li>Mensile CSV: consigliata per massima precisione su grafici e range.</li>
+                        </ul>
+                      </div>
+                      <div>
+                        <div className="font-bold text-slate-900">CSV atteso</div>
+                        <div className="font-mono text-xs bg-slate-50 border border-slate-200 rounded p-2 mt-1">
+                          date,currency,index<br />
+                          2025-12-01,CHF,100<br />
+                          2026-01-01,CHF,99.9416
+                        </div>
+                      </div>
+                      <div>
+                        <div className="font-bold text-slate-900">Regole CSV</div>
+                        <ul className="list-disc list-inside space-y-1">
+                          <li>Date in formato YYYY-MM-DD.</li>
+                          <li>Currency es. CHF.</li>
+                          <li>Index maggiore di 0.</li>
+                          <li>Una sola riga per data: i reimport aggiornano righe esistenti senza doppioni.</li>
+                        </ul>
+                      </div>
+                      <div>
+                        <div className="font-bold text-slate-900">Fonte UST/BFS</div>
+                        <p>
+                          Usa la sezione tabelle dell'Ufficio Federale di Statistica / UST sull'Indice nazionale dei prezzi al consumo.
+                        </p>
+                        <a
+                          href="https://www.bfs.admin.ch/bfs/it/home/statistiche/prezzi/indice-nazionale-prezzi-consumo.html"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[#0052a3] font-bold underline"
+                        >
+                          Pagina ufficiale UST/BFS
+                        </a>
+                      </div>
+                      <div>
+                        <div className="font-bold text-slate-900">File mensile svizzero</div>
+                        <p>Dataset UST/BFS <span className="font-mono">su-i-05.02.66</span>, foglio <span className="font-mono">INDEX_m</span>, riga nazionale totale <span className="font-mono">100_100</span> (Total / Totale).</p>
+                      </div>
+                      <p className="text-slate-600">I dati annuali bastano per KPI sintetici; i mensili servono per una modalità reale più precisa su grafici e range dinamici.</p>
+                    </div>
+                  )}
+                />
+              </div>
+
+              <div className="ui-panel-subtle p-4 space-y-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div>
+                    <div className="text-sm font-bold text-slate-900">Inflazione annuale manuale</div>
+                    <div className="text-xs text-slate-600 mt-1">Consigliata per KPI reali sintetici.</div>
+                  </div>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">Semplice</span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Valuta</label>
+                    <select
+                      className="ui-input w-full text-sm"
+                      value={annualInflationCurrency}
+                      onChange={e => setAnnualInflationCurrency(e.target.value as Currency)}
+                    >
+                      {Object.values(Currency).map(currency => <option key={currency} value={currency}>{currency}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Anno</label>
+                    <input
+                      className="ui-input w-full text-sm font-mono"
+                      type="number"
+                      step="1"
+                      min="1900"
+                      max="2200"
+                      value={annualInflationYear}
+                      onChange={e => setAnnualInflationYear(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Inflazione %</label>
+                    <input
+                      className="ui-input w-full text-sm font-mono"
+                      type="number"
+                      step="0.01"
+                      min="-50"
+                      max="100"
+                      placeholder="1.4"
+                      value={annualInflationRatePct}
+                      onChange={e => setAnnualInflationRatePct(e.target.value)}
+                    />
+                  </div>
+                  <div className="flex items-end gap-2">
+                    <button
+                      type="button"
+                      onClick={handleSaveAnnualInflation}
+                      className="ui-btn-primary px-4 py-2 rounded-lg text-xs font-bold"
+                    >
+                      {editingAnnualInflationId ? 'Aggiorna' : 'Salva'}
+                    </button>
+                    {editingAnnualInflationId && (
+                      <button
+                        type="button"
+                        onClick={resetAnnualInflationForm}
+                        className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold"
+                      >
+                        Annulla
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs min-w-[520px]">
+                    <thead className="bg-slate-100 text-[11px] text-slate-600 uppercase">
+                      <tr>
+                        <th className="px-3 py-2 text-left">Valuta</th>
+                        <th className="px-3 py-2 text-left">Anno</th>
+                        <th className="px-3 py-2 text-right">Inflazione %</th>
+                        <th className="px-3 py-2 text-left">Origine</th>
+                        <th className="px-3 py-2 text-right">Azioni</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {annualInflationRows.length === 0 ? (
+                        <tr>
+                          <td className="px-3 py-3 text-slate-500" colSpan={5}>Nessun dato annuale inserito.</td>
+                        </tr>
+                      ) : annualInflationRows.map(row => (
+                        <tr key={`${row.currency}-${row.year}-${row.id || 'new'}`} className="border-t border-borderSoft">
+                          <td className="px-3 py-2 font-semibold text-slate-900">{row.currency}</td>
+                          <td className="px-3 py-2 text-slate-700">{row.year}</td>
+                          <td className="px-3 py-2 text-right font-mono text-slate-700">{row.ratePct.toFixed(2)}%</td>
+                          <td className="px-3 py-2 text-slate-600">{row.source || 'manual'}</td>
+                          <td className="px-3 py-2 text-right">
+                            <button type="button" className="text-[#0052a3] font-bold mr-3" onClick={() => handleEditAnnualInflation(row)}>Modifica</button>
+                            <button type="button" className="text-red-700 font-bold" onClick={() => handleDeleteAnnualInflation(row)}>Elimina</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="ui-panel-subtle p-4 space-y-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div>
+                    <div className="text-sm font-bold text-slate-900">CSV mensile avanzato</div>
+                    <div className="text-xs text-slate-600 mt-1">Per grafici/range più precisi. Formato CSV: date,currency,index.</div>
+                  </div>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">Precisione mensile</span>
+                </div>
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    type="button"
+                    onClick={() => inflationCsvRef.current?.click()}
+                    className="ui-btn-primary px-4 py-2 rounded-lg text-xs font-bold"
+                  >
+                    Importa CSV mensile
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleInflationExport}
+                    className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold"
+                  >
+                    Export CSV mensile
+                  </button>
+                  <input
+                    type="file"
+                    accept=".csv,text/csv"
+                    ref={inflationCsvRef}
+                    onChange={handleInflationImport}
+                    className="hidden"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <div className="text-sm font-bold text-slate-900">Stato copertura</div>
+                <div className="text-xs text-slate-600 mt-1">
+                  Modalità preferita per {config.baseCurrency || Currency.CHF}: {preferredInflationMode}.
+                </div>
+              </div>
+              {inflationStatus && (
+                <div className="text-xs text-slate-600">{inflationStatus}</div>
+              )}
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+                {inflationCoverage.map(row => (
+                  <div key={row.currency} className="ui-panel-subtle p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-sm font-bold text-slate-900">{row.currency}</div>
+                      <span className={clsx(
+                        'text-[10px] font-bold px-2 py-0.5 rounded-full',
+                        row.count > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600'
+                      )}>
+                        {row.count > 0 ? `${row.count} righe` : 'vuoto'}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-600 mt-2">
+                      Mensile: {row.firstDate || 'N/D'} - {row.lastDate || 'N/D'}
+                    </div>
+                    <div className="text-[11px] text-slate-600 mt-1">
+                      Annuale: {(() => {
+                        const annual = annualInflationCoverage.find(item => item.currency === row.currency);
+                        return annual?.count ? `${annual.firstYear} - ${annual.lastYear}` : 'N/D';
+                      })()}
+                    </div>
+                    {row.count > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => handleInflationResetCurrency(row.currency)}
+                        className="mt-2 text-[11px] font-bold text-red-700 hover:text-red-600"
+                      >
+                        Reset {row.currency}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="text-[11px] text-slate-500">
+                La Dashboard usa prima i dati mensili CPI; se mancano, usa l'inflazione annuale per KPI stimati senza mostrare un grafico reale falsamente preciso.
               </div>
             </div>
             )}

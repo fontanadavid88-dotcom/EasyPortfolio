@@ -53,6 +53,7 @@ export interface Instrument {
   assetClass?: AssetClass;
   regionAllocation?: Partial<Record<RegionKey, number>>;
   tradePrecisionDecimals?: number;
+  terPct?: number; // percentage, e.g. 0.20 = 0.20%
 }
 
 export interface InstrumentListing {
@@ -198,6 +199,24 @@ export interface FxRate {
   date: string; // yyyy-mm-dd
   rate: number;
   source?: string;
+}
+
+export interface InflationPoint {
+  id?: number;
+  portfolioId?: string;
+  currency: Currency;
+  date: string; // YYYY-MM-DD, monthly CPI observation date
+  index: number; // CPI index level, not YoY percentage
+  source?: string; // 'csv' | 'sheet' | 'manual'
+}
+
+export interface InflationAnnualPoint {
+  id?: number;
+  portfolioId?: string;
+  currency: Currency;
+  year: number; // e.g. 2024
+  ratePct: number; // e.g. 1.4 = 1.4%
+  source?: string; // 'manual' | 'sheet' | 'import'
 }
 
 // --- BACKTEST CSV IMPORTS ---

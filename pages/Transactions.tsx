@@ -149,7 +149,8 @@ export const Transactions: React.FC = () => {
         price: 0,
         fees: 0,
         date: new Date().toISOString().split('T')[0],
-        currency: Currency.USD
+        currency: Currency.USD,
+        terPct: ''
     });
     const [isinLookupStatus, setIsinLookupStatus] = useState<'idle' | 'loading' | 'resolved' | 'multiple' | 'none' | 'error'>('idle');
     const [isinLookupMessage, setIsinLookupMessage] = useState('');
@@ -164,6 +165,12 @@ export const Transactions: React.FC = () => {
 
     const numberValue = (value: number) => (Number.isFinite(value) ? value : "");
     const parseNumberInput = (value: string) => { const trimmed = value.trim(); if (!trimmed) return NaN; const parsed = parseFloat(trimmed); return Number.isFinite(parsed) ? parsed : NaN; };
+    const parseOptionalPct = (value: string) => {
+        const trimmed = value.trim();
+        if (!trimmed) return undefined;
+        const parsed = Number(trimmed);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+    };
     const normalizedTicker = normalizeTicker(assetForm.ticker);
     const normalizedIsin = normalizeIsin(assetForm.isin);
     const resolvedTicker = resolveEodhdSymbol(normalizedTicker, assetForm.type);
@@ -200,7 +207,8 @@ export const Transactions: React.FC = () => {
         assetClass: AssetClass.STOCK,
         currency: Currency.CHF,
         sector: '',
-        region: '' as RegionKey | ''
+        region: '' as RegionKey | '',
+        terPct: ''
     });
     const [editAssetInitialRegion, setEditAssetInitialRegion] = useState<RegionKey | ''>('');
 
@@ -345,7 +353,8 @@ export const Transactions: React.FC = () => {
             assetClass: inferredClass,
             currency: instrument.currency || Currency.CHF,
             sector: instrument.sector || '',
-            region: regionValue
+            region: regionValue,
+            terPct: instrument.terPct !== undefined ? String(instrument.terPct) : ''
         });
         setEditAssetInitialRegion(initialRegion);
         setEditAssetModalOpen(true);
@@ -365,7 +374,8 @@ export const Transactions: React.FC = () => {
             type: editAssetForm.type,
             assetClass: editAssetForm.assetClass,
             currency: editAssetForm.currency,
-            sector: editAssetForm.sector.trim() || undefined
+            sector: editAssetForm.sector.trim() || undefined,
+            terPct: parseOptionalPct(editAssetForm.terPct)
         };
 
         const regionChanged = editAssetForm.region !== editAssetInitialRegion;
@@ -504,6 +514,7 @@ export const Transactions: React.FC = () => {
             assetClass: assetForm.assetClass,
             currency: assetForm.currency,
             targetAllocation: 0,
+            terPct: parseOptionalPct(assetForm.terPct),
             isin: isinValue || undefined,
             preferredListing,
             listings,
@@ -563,7 +574,8 @@ export const Transactions: React.FC = () => {
             price: 0,
             fees: 0,
             date: new Date().toISOString().split("T")[0],
-            currency: Currency.USD
+            currency: Currency.USD,
+            terPct: ""
         });
         setIsinLookupStatus('idle');
         setIsinLookupMessage('');
@@ -981,6 +993,19 @@ export const Transactions: React.FC = () => {
                                     </select>
                                 </div>
                             </div>
+                            <div>
+                                <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">TER % annuo (opzionale)</label>
+                                <input
+                                    type="number"
+                                    placeholder="0.20"
+                                    step="0.01"
+                                    min="0"
+                                    value={assetForm.terPct}
+                                    onChange={e => setAssetForm({ ...assetForm, terPct: e.target.value })}
+                                    className="ui-input w-full text-sm font-mono"
+                                />
+                                <div className="text-[11px] text-slate-500 mt-1">Esempio: 0.20 significa 0.20% annuo.</div>
+                            </div>
 
                             {/* Initial Transaction Section */}
                             <div className="border-t border-white/10 pt-3 mt-2">
@@ -1295,6 +1320,18 @@ export const Transactions: React.FC = () => {
                                         <option key={opt.key} value={opt.key}>{opt.label}</option>
                                     ))}
                                 </select>
+                            </div>
+                            <div>
+                                <label className="block text-xs font-bold text-slate-700 font-medium uppercase mb-1.5">TER % annuo (opzionale)</label>
+                                <input
+                                    type="number"
+                                    placeholder="0.20"
+                                    step="0.01"
+                                    min="0"
+                                    value={editAssetForm.terPct}
+                                    onChange={e => setEditAssetForm({ ...editAssetForm, terPct: e.target.value })}
+                                    className="ui-input w-full text-sm font-mono"
+                                />
                             </div>
 
                             <div className="pt-4 flex gap-3">

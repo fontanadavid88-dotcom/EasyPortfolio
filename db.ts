@@ -1,5 +1,5 @@
 import Dexie, { Table, Transaction as DexieTransaction } from 'dexie';
-import { Instrument, Transaction, PricePoint, MacroIndicator, AppSettings, Currency, AssetType, TransactionType, AssetClass, RebalancePlan, BacktestImport, BacktestImportPrice, BacktestScenarioRecord } from './types';
+import { Instrument, Transaction, PricePoint, MacroIndicator, AppSettings, Currency, AssetType, TransactionType, AssetClass, RebalancePlan, BacktestImport, BacktestImportPrice, BacktestScenarioRecord, InflationPoint, InflationAnnualPoint } from './types';
 import { subDays, format } from 'date-fns';
 
 export class PortfolioDB extends Dexie {
@@ -15,6 +15,8 @@ export class PortfolioDB extends Dexie {
   backtestImports!: Table<BacktestImport>;
   backtestImportPrices!: Table<BacktestImportPrice>;
   backtestScenarios!: Table<BacktestScenarioRecord>;
+  inflationRates!: Table<InflationPoint>;
+  inflationAnnualRates!: Table<InflationAnnualPoint>;
 
   constructor() {
     super('EasyPortfolioDB');
@@ -170,6 +172,39 @@ export class PortfolioDB extends Dexie {
       backtestImports: '++id, portfolioId, ticker, createdAt',
       backtestImportPrices: '++id, importId, [importId+date], date',
       backtestScenarios: '++id, portfolioId, updatedAt'
+    });
+
+    (this as any).version(10).stores({
+      instruments: '++id, ticker, type, portfolioId, isin, assetClass, regionAllocation',
+      transactions: '++id, date, instrumentTicker, type, account, portfolioId',
+      prices: '++id, [ticker+date], [instrumentId+date], date, portfolioId',
+      macro: '++id, date, portfolioId',
+      settings: '++id, portfolioId',
+      portfolios: '++id, portfolioId',
+      instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
+      fxRates: '++id, [baseCurrency+quoteCurrency+date]',
+      rebalancePlans: 'id, portfolioId, createdAt',
+      backtestImports: '++id, portfolioId, ticker, createdAt',
+      backtestImportPrices: '++id, importId, [importId+date], date',
+      backtestScenarios: '++id, portfolioId, updatedAt',
+      inflationRates: '++id, [currency+date], currency, date, portfolioId'
+    });
+
+    (this as any).version(11).stores({
+      instruments: '++id, ticker, type, portfolioId, isin, assetClass, regionAllocation',
+      transactions: '++id, date, instrumentTicker, type, account, portfolioId',
+      prices: '++id, [ticker+date], [instrumentId+date], date, portfolioId',
+      macro: '++id, date, portfolioId',
+      settings: '++id, portfolioId',
+      portfolios: '++id, portfolioId',
+      instrumentListings: '++id, isin, exchangeCode, symbol, portfolioId',
+      fxRates: '++id, [baseCurrency+quoteCurrency+date]',
+      rebalancePlans: 'id, portfolioId, createdAt',
+      backtestImports: '++id, portfolioId, ticker, createdAt',
+      backtestImportPrices: '++id, importId, [importId+date], date',
+      backtestScenarios: '++id, portfolioId, updatedAt',
+      inflationRates: '++id, [currency+date], currency, date, portfolioId',
+      inflationAnnualRates: '++id, [currency+year], currency, year, portfolioId'
     });
   }
 }

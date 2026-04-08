@@ -11,6 +11,8 @@ import { computePortfolioCoverage } from '../services/dataCoverage';
 import { computeCurrentValuedPositions } from '../services/positionValuation';
 import { computePositionCostBasis } from '../services/positionCostBasis';
 import { formatQuantity } from '../services/quantityFormat';
+import { computePortfolioCostMetrics } from '../services/portfolioCostService';
+import { computeRealNavBalanceMetrics, resolveInflationInputForRange } from '../services/inflationService';
 import {
   PRIMARY_BLUE,
   ACCENT_ORANGE,
@@ -30,7 +32,7 @@ import { format, subMonths } from 'date-fns';
 import clsx from 'clsx';
 import { InfoPopover } from '../components/InfoPopover';
 import { DataStatusBar } from '../components/DataStatusBar';
-import { Currency, RegionKey } from '../types';
+import { Currency, InflationAnnualPoint, InflationPoint, RegionKey } from '../types';
 
 // --- Sub-Components ---
 
@@ -103,6 +105,23 @@ const formatChfValue = (value: number) => {
   if (!Number.isFinite(value) || value <= 0) return '—';
   const decimals = value < 100 ? 2 : 0;
   return formatMoney(value, Currency.CHF, decimals);
+};
+
+const formatCurrencyValue = (value: number, currency: Currency, decimals?: number) => {
+  if (!Number.isFinite(value)) return '—';
+  const resolvedDecimals = decimals ?? (Math.abs(value) < 100 ? 2 : 0);
+  return new Intl.NumberFormat('it-CH', {
+    style: 'currency',
+    currency,
+    currencyDisplay: 'code',
+    minimumFractionDigits: resolvedDecimals,
+    maximumFractionDigits: resolvedDecimals
+  }).format(value);
+};
+
+const formatPctValue = (value: number, decimals = 2) => {
+  if (!Number.isFinite(value)) return '—';
+  return `${value.toFixed(decimals)}%`;
 };
 
 
@@ -416,6 +435,18 @@ export const Dashboard: React.FC = () => {
     []
   );
 
+  const inflationRates = useLiveQuery(
+    () => db.inflationRates.where('portfolioId').equals(currentPortfolioId).toArray(),
+    [currentPortfolioId],
+    []
+  ) as InflationPoint[];
+
+  const inflationAnnualRates = useLiveQuery(
+    () => db.inflationAnnualRates.where('portfolioId').equals(currentPortfolioId).toArray(),
+    [currentPortfolioId],
+    []
+  ) as InflationAnnualPoint[];
+
   const syncStatus = useMemo(() => {
     return computeSyncStatus({
       baseCurrency,
@@ -482,8 +513,16 @@ export const Dashboard: React.FC = () => {
   const [timeRange, setTimeRange] = useState<'3M' | '6M' | '1Y' | '5Y' | '10Y' | 'YTD' | 'MAX'>('MAX');
   const [metric, setMetric] = useState<'PERF' | 'TWRR' | 'MWRR'>('PERF');
   const [valueMode, setValueMode] = useState<'NAV' | 'PERF_INDEX'>('NAV');
+  const [performanceMode, setPerformanceMode] = useState<'nominal' | 'real'>('nominal');
   const [benchmarkEnabled, setBenchmarkEnabled] = useState(false);
   const [benchmarkTicker, setBenchmarkTicker] = useState('');
+  const isRealMode = performanceMode === 'real';
+
+  useEffect(() => {
+    if (isRealMode && metric === 'MWRR') {
+      setMetric('TWRR');
+    }
+  }, [isRealMode, metric]);
 
   // --- Macro State ---
   const [macroConfig] = useState<MacroIndicatorConfig[]>(() => {
@@ -591,24 +630,59 @@ export const Dashboard: React.FC = () => {
     });
   }, [baseHistory, rangeStartDate, rangeEndDate]);
 
+  const inflationInput = useMemo(() => {
+    return resolveInflationInputForRange({
+      history: rangeHistory,
+      monthlyPoints: inflationRates || [],
+      annualPoints: inflationAnnualRates || [],
+      currency: baseCurrency
+    });
+  }, [rangeHistory, inflationRates, inflationAnnualRates, baseCurrency]);
+
+  const inflationMetrics = useMemo(() => {
+    return inflationInput.mode === 'annual' && inflationInput.annualMetrics
+      ? inflationInput.annualMetrics
+      : inflationInput.monthlyMetrics;
+  }, [inflationInput]);
+
+  const realRangeHistory = useMemo(() => {
+    return inflationInput.mode === 'monthly' ? inflationInput.realHistory : [];
+  }, [inflationInput]);
+
+  const activeRangeHistory = useMemo(() => {
+    return isRealMode && inflationInput.mode === 'monthly' ? realRangeHistory : rangeHistory;
+  }, [isRealMode, inflationInput.mode, realRangeHistory, rangeHistory]);
+
+  const costMetrics = useMemo(() => {
+    return computePortfolioCostMetrics({
+      transactions: transactions || [],
+      instruments: instruments || [],
+      positions: valuedPositions?.positions || [],
+      fxRates: fxRatesRange || [],
+      rangeStartDate,
+      rangeEndDate,
+      baseCurrency
+    });
+  }, [transactions, instruments, valuedPositions, fxRatesRange, rangeStartDate, rangeEndDate, baseCurrency]);
+
   const chartGranularity: Granularity = useMemo(() => {
     if (kpiGranularity === 'monthly') return 'monthly';
-    if (timeRange === 'MAX' && rangeHistory.length > CHART_DOWNSAMPLE_THRESHOLD) return 'monthly';
+    if (timeRange === 'MAX' && activeRangeHistory.length > CHART_DOWNSAMPLE_THRESHOLD) return 'monthly';
     return 'daily';
-  }, [kpiGranularity, timeRange, rangeHistory.length]);
+  }, [kpiGranularity, timeRange, activeRangeHistory.length]);
 
   const chartHistory = useMemo(() => {
-    if (!rangeHistory.length) return [];
+    if (!activeRangeHistory.length) return [];
     if (chartGranularity === 'monthly' && kpiGranularity === 'daily') {
-      const downsampled = downsampleHistoryToMonthly(rangeHistory);
-      const firstPoint = rangeHistory[0];
-      const byDate = new Map<string, typeof rangeHistory[number]>();
+      const downsampled = downsampleHistoryToMonthly(activeRangeHistory);
+      const firstPoint = activeRangeHistory[0];
+      const byDate = new Map<string, typeof activeRangeHistory[number]>();
       if (firstPoint) byDate.set(firstPoint.date, firstPoint);
       downsampled.forEach(point => byDate.set(point.date, point));
       return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
     }
-    return rangeHistory;
-  }, [rangeHistory, chartGranularity, kpiGranularity]);
+    return activeRangeHistory;
+  }, [activeRangeHistory, chartGranularity, kpiGranularity]);
 
   const chartHistoryDownsampled = useMemo(() => {
     if (!chartHistory.length) return [];
@@ -617,8 +691,8 @@ export const Dashboard: React.FC = () => {
   }, [chartHistory, chartGranularity]);
 
   const analytics = useMemo(() => {
-    return calculateAnalytics(rangeHistory, kpiGranularity);
-  }, [rangeHistory, kpiGranularity]);
+    return calculateAnalytics(activeRangeHistory, kpiGranularity);
+  }, [activeRangeHistory, kpiGranularity]);
 
   const analyticsAll = useMemo(() => {
     if (!baseHistory.length) return null;
@@ -633,27 +707,32 @@ export const Dashboard: React.FC = () => {
   }, [state, instruments]);
 
   const perfBaseNav = useMemo(() => {
+    const base = activeRangeHistory.find(point => point.value > 0);
+    return base?.value || 0;
+  }, [activeRangeHistory]);
+
+  const nominalPerfBaseNav = useMemo(() => {
     const base = rangeHistory.find(point => point.value > 0);
     return base?.value || 0;
   }, [rangeHistory]);
 
   const hasPerfBase = perfBaseNav > 0;
-  const hasIncompleteData = hasTransactions && (!hasAnyPrices || !baseHistory.length || !hasPerfBase);
+  const hasIncompleteData = hasTransactions && (!hasAnyPrices || !baseHistory.length || nominalPerfBaseNav <= 0);
   const twrrBaseIndex = useMemo(() => {
-    const base = rangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
+    const base = activeRangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
     return base?.cumulativeTWRRIndex || 1;
-  }, [rangeHistory]);
+  }, [activeRangeHistory]);
   const twrrBaseDate = useMemo(() => {
-    const base = rangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
+    const base = activeRangeHistory.find(point => (point.cumulativeTWRRIndex ?? 0) > 0);
     return base?.date;
-  }, [rangeHistory]);
+  }, [activeRangeHistory]);
 
   const mwrrSeries = useMemo(() => {
-    if (metric !== 'MWRR' || !rangeHistory.length) return [];
+    if (isRealMode || metric !== 'MWRR' || !rangeHistory.length) return [];
     return computeMwrrSeries(rangeHistory, transactions || []);
-  }, [metric, rangeHistory, transactions]);
+  }, [isRealMode, metric, rangeHistory, transactions]);
 
-  const benchmarkModeAvailable = metric === 'PERF' && valueMode === 'PERF_INDEX';
+  const benchmarkModeAvailable = !isRealMode && metric === 'PERF' && valueMode === 'PERF_INDEX';
 
   const benchmarkOptions = useMemo(() => {
     const options = new Map<string, { value: string; label: string }>();
@@ -748,6 +827,7 @@ export const Dashboard: React.FC = () => {
       return {
         ...point,
         displayDate: format(new Date(point.date), 'MMM yy'),
+        nominalValue: (point as any).nominalValue,
         perfIndex,
         perfPct,
         twrrRangePct,
@@ -819,9 +899,9 @@ export const Dashboard: React.FC = () => {
   }, [benchmarkActive, portfolioComparisonStats, benchmarkStats]);
 
   const investedAtEnd = useMemo(() => {
-    if (!rangeHistory.length) return 0;
-    return rangeHistory[rangeHistory.length - 1].invested || 0;
-  }, [rangeHistory]);
+    if (!activeRangeHistory.length) return 0;
+    return activeRangeHistory[activeRangeHistory.length - 1].invested || 0;
+  }, [activeRangeHistory]);
 
   const renderChartTooltip = ({ active, payload, label }: any) => {
     if (!active || !payload || !payload.length) return null;
@@ -840,11 +920,11 @@ export const Dashboard: React.FC = () => {
         <div className="ui-panel-dense px-4 py-3 min-w-[220px]">
           <div className="text-xs text-slate-600 mb-1">{point.displayDate || label}</div>
           <div className="flex items-center justify-between text-sm font-bold text-slate-900">
-            <span>{benchmarkActive ? 'Portafoglio confronto' : 'Portafoglio'}</span>
+            <span>{isRealMode ? 'Portafoglio reale' : benchmarkActive ? 'Portafoglio confronto' : 'Portafoglio'}</span>
             <span>{(benchmarkActive ? comparisonIndex : perfIndex)?.toFixed(2) ?? 'N/D'}</span>
           </div>
           <div className="flex items-center justify-between text-xs mt-1">
-            <span className="text-slate-600">Rendimento</span>
+            <span className="text-slate-600">{isRealMode ? 'Rendimento reale' : 'Rendimento'}</span>
             <span className={clsx("font-bold", (benchmarkActive ? (comparisonPct ?? 0) : perfPct) >= 0 ? "text-green-600" : "text-red-600")}>
               {benchmarkActive
                 ? (comparisonPct !== null ? `${comparisonPct.toFixed(2)}%` : 'N/D')
@@ -879,6 +959,7 @@ export const Dashboard: React.FC = () => {
 
     if (metric === 'PERF') {
       const value = point.value ?? 0;
+      const nominalValue = point.nominalValue ?? value;
       const invested = point.invested ?? 0;
       const profit = value - invested;
       const profitPct = invested > 0 ? (profit / invested) * 100 : null;
@@ -886,9 +967,23 @@ export const Dashboard: React.FC = () => {
         <div className="ui-panel-dense px-4 py-3 min-w-[220px]">
           <div className="text-xs text-slate-600 mb-1">{point.displayDate || label}</div>
           <div className="flex items-center justify-between text-sm font-bold text-slate-900">
-            <span>Valore</span>
+            <span>{isRealMode ? 'Valore reale' : 'Valore'}</span>
             <span>{`CHF ${Math.round(value).toLocaleString()}`}</span>
           </div>
+          {isRealMode && (
+            <div className="flex items-center justify-between text-xs text-slate-600 mt-1">
+              <span>Nominale</span>
+              <span>{`CHF ${Math.round(nominalValue).toLocaleString()}`}</span>
+            </div>
+          )}
+          {isRealMode && point.inflationGrowthFromStart && (
+            <div className="flex items-center justify-between text-xs text-slate-600 mt-1">
+              <span>Inflazione</span>
+              <span>{`${((point.inflationGrowthFromStart - 1) * 100).toFixed(2)}%`}</span>
+            </div>
+          )}
+          {!isRealMode && (
+            <>
           <div className="flex items-center justify-between text-xs text-slate-600 mt-1">
             <span>Investito</span>
             <span>{`CHF ${Math.round(invested).toLocaleString()}`}</span>
@@ -899,6 +994,8 @@ export const Dashboard: React.FC = () => {
               {`CHF ${Math.round(profit).toLocaleString()}`}{profitPct !== null ? ` (${profitPct.toFixed(2)}%)` : ''}
             </span>
           </div>
+            </>
+          )}
         </div>
       );
     }
@@ -967,8 +1064,47 @@ export const Dashboard: React.FC = () => {
 
   const [macroInfoOpen, setMacroInfoOpen] = useState(false);
   const maxDrawdownValue = analytics?.maxDrawdown ?? 0;
+  const activeFirstPoint = activeRangeHistory[0];
+  const activeLastPoint = activeRangeHistory[activeRangeHistory.length - 1];
+  const nominalRangeFirstPoint = rangeHistory[0];
+  const nominalRangeLastPoint = rangeHistory[rangeHistory.length - 1];
+  const realCoverageOk = inflationInput.mode !== 'none' && inflationMetrics.hasCoverage;
+  const realChartAvailable = isRealMode && inflationInput.canRenderRealChart;
+  const annualRealFinalValue = inflationInput.mode === 'annual' && inflationInput.annualMetrics && nominalRangeLastPoint
+    ? nominalRangeLastPoint.value / inflationInput.annualMetrics.inflationGrowth
+    : undefined;
+  const realKpiStartValue = inflationInput.mode === 'annual'
+    ? nominalRangeFirstPoint?.value
+    : activeFirstPoint?.value;
+  const realKpiEndValue = inflationInput.mode === 'annual'
+    ? annualRealFinalValue
+    : activeLastPoint?.value;
+  const realNavBalanceMetrics = realCoverageOk && nominalRangeLastPoint
+    ? computeRealNavBalanceMetrics({
+      currentValue: nominalRangeLastPoint.value,
+      investedCapital: investedAtEnd,
+      inflationGrowth: inflationMetrics.inflationGrowth
+    })
+    : null;
+  const realReturnPctForMode = metric === 'PERF' && valueMode === 'NAV'
+    ? realNavBalanceMetrics?.realBalancePct
+    : inflationMetrics.realReturnPct;
+  const realKpiCagr = inflationInput.mode === 'annual' && inflationInput.annualMetrics
+    ? inflationInput.annualMetrics.realCagrPct
+    : inflationMetrics.realCagrPct;
   const chartGranularityLabel = chartGranularity === 'monthly' ? 'Monthly' : 'Daily';
   const kpiGranularityLabel = kpiGranularity === 'monthly' ? 'Monthly' : 'Daily';
+  const getMetricHelpTitle = (mode: 'PERF' | 'TWRR' | 'MWRR') => {
+    if (isRealMode && mode === 'MWRR') return 'MWRR reale non disponibile';
+    if (mode === 'PERF') return 'Valore: usa NAV o indice Performance in base al toggle a destra';
+    if (mode === 'TWRR') return 'Rendimento ponderato nel tempo, indipendente dai flussi';
+    return 'Rendimento ponderato per il denaro, sensibile a depositi e prelievi';
+  };
+  const getValueModeHelpTitle = (mode: 'NAV' | 'PERF_INDEX') => {
+    return mode === 'NAV'
+      ? 'Profitto/saldo rispetto al capitale investito'
+      : 'Indice base 100 sul NAV iniziale del range';
+  };
   const handleLatestSync = async () => {
     if (latestSyncRunning) return;
     if (!settings) {
@@ -1200,6 +1336,44 @@ export const Dashboard: React.FC = () => {
 
       {/* KPI ROW */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-3 md:gap-4">
+        {isRealMode ? (
+          <>
+          <KPICard
+            title="Capitale iniziale reale"
+            value={realCoverageOk && realKpiStartValue !== undefined ? formatCurrencyValue(realKpiStartValue, Currency.CHF) : '—'}
+            subValue="Range selezionato"
+          />
+          <KPICard
+            title="Capitale finale reale"
+            value={realCoverageOk && realKpiEndValue !== undefined ? formatCurrencyValue(realKpiEndValue, Currency.CHF) : '—'}
+            subValue={realCoverageOk ? (inflationInput.mode === 'annual' ? 'KPI reale stimato' : `Deflazionato ${baseCurrency}`) : 'Inflazione non disponibile'}
+            highlight
+          />
+          <KPICard
+            title="Rendimento reale"
+            value={realCoverageOk && realReturnPctForMode !== undefined ? formatPctValue(realReturnPctForMode) : '—'}
+            subValue={metric === 'PERF' && valueMode === 'NAV' ? 'Vs capitale investito' : 'Range'}
+            highlight
+          />
+          <KPICard
+            title="CAGR reale"
+            value={realCoverageOk ? formatPctValue(realKpiCagr) : '—'}
+            subValue={inflationInput.mode === 'annual' ? 'Stima annuale' : 'Da serie reale'}
+          />
+          <KPICard
+            title="Inflazione cumulata"
+            value={realCoverageOk ? formatPctValue(inflationMetrics.inflationReturnPct) : '—'}
+            subValue={inflationMetrics.startDate && inflationMetrics.endDate ? `${inflationMetrics.startDate} - ${inflationMetrics.endDate}` : 'Coverage CPI mancante'}
+          />
+          <KPICard
+            title={inflationInput.mode === 'annual' ? 'Fonte inflazione' : 'Drawdown reale'}
+            value={inflationInput.mode === 'annual' ? 'Annuale' : (realCoverageOk ? formatPctValue(maxDrawdownValue) : '—')}
+            subValue={inflationInput.mode === 'annual' ? 'Stima' : 'Da serie reale'}
+            alert
+          />
+          </>
+        ) : (
+          <>
           <KPICard
             title="Capitale Iniziale"
             value={`CHF ${((state?.investedCapital ?? 0) / 1000).toFixed(1)}k`}
@@ -1232,6 +1406,38 @@ export const Dashboard: React.FC = () => {
             subValue="Dal picco max"
             alert
           />
+          </>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 md:gap-4">
+        <div className="ui-panel-dense p-4">
+          <div className="text-[11px] uppercase font-bold text-slate-600">TER medio</div>
+          <div className="text-xl font-bold text-slate-900 mt-1">{formatPctValue(costMetrics.weightedTerPct)}</div>
+          <div className="text-[11px] text-slate-500 mt-1">Ponderato sul valore corrente</div>
+        </div>
+        <div className="ui-panel-dense p-4">
+          <div className="text-[11px] uppercase font-bold text-slate-600">Costo annuo TER</div>
+          <div className="text-xl font-bold text-slate-900 mt-1">{formatCurrencyValue(costMetrics.annualTerCostBase, Currency.CHF)}</div>
+          <div className="text-[11px] text-slate-500 mt-1">Stima su posizioni correnti</div>
+        </div>
+        <div className="ui-panel-dense p-4">
+          <div className="text-[11px] uppercase font-bold text-slate-600">Commissioni range</div>
+          <div className="text-xl font-bold text-slate-900 mt-1">{formatCurrencyValue(costMetrics.transactionFeesRangeBase, baseCurrency)}</div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            YTD {formatCurrencyValue(costMetrics.transactionFeesYtdBase, baseCurrency)}
+            {costMetrics.missingFxCount ? ` - FX mancanti: ${costMetrics.missingFxCount}` : ''}
+          </div>
+        </div>
+        <div className="ui-panel-dense p-4">
+          <div className="text-[11px] uppercase font-bold text-slate-600">Coverage TER</div>
+          <div className="text-xl font-bold text-slate-900 mt-1">{formatPctValue(costMetrics.terCoveragePct, 1)}</div>
+          <div className="text-[11px] text-slate-500 mt-1">
+            {costMetrics.missingTerTickers.length
+              ? `Missing: ${costMetrics.missingTerTickers.slice(0, 4).join(', ')}${costMetrics.missingTerTickers.length > 4 ? '...' : ''}`
+              : 'TER coperti per le posizioni valorizzate'}
+          </div>
+        </div>
       </div>
 
       {/* Posizioni attuali */}
@@ -1266,7 +1472,7 @@ export const Dashboard: React.FC = () => {
                   <th className="px-3 py-2 text-right">Quote</th>
                   <th className="px-3 py-2 text-right">PMC</th>
                   <th className="px-3 py-2 text-right">Prezzo attuale</th>
-                  <th className="px-3 py-2 text-right">Diff. vs PMC</th>
+                  <th className="px-3 py-2 text-right">Delta</th>
                   <th className="px-3 py-2 text-right">Valore CHF</th>
                   <th className="px-3 py-2 text-right">Peso %</th>
                 </tr>
@@ -1318,7 +1524,7 @@ export const Dashboard: React.FC = () => {
                           </span>
                         )}
                       </td>
-                      <td className="px-3 py-2 text-right">
+                      <td className="px-3 py-2 text-right leading-tight">
                         {canComputeDiff ? (
                           <div className={`flex flex-col items-end ${diffTone}`}>
                             <span className="font-semibold">{formatSignedUnitPrice(diffValue as number, pmcCurrency)}</span>
@@ -1392,13 +1598,14 @@ export const Dashboard: React.FC = () => {
             </div>
             <InfoPopover
               ariaLabel="Info grafico rendimento"
-              title="Valore vs TWRR vs MWRR"
+              title="Come leggere i rendimenti"
               renderContent={() => (
-                <div className="text-sm space-y-1">
-                  <p><strong>Valore:</strong> profitto vs investito (CHF).</p>
-                  <p><strong>Performance:</strong> indice 100 rebased sul range.</p>
-                  <p><strong>TWRR:</strong> rendimento ponderato nel tempo (indipendente dai flussi).</p>
-                  <p><strong>MWRR:</strong> rendimento ponderato per il denaro (sensibile a depositi/prelievi).</p>
+                <div className="text-sm space-y-2">
+                  <p><strong>Value (NAV):</strong> saldo/profitto rispetto al capitale investito. In reale, il valore corrente viene deflazionato e confrontato con lo stesso capitale investito.</p>
+                  <p><strong>Performance:</strong> indice base 100 sul NAV iniziale del range. Serve a confrontare la crescita del NAV nel periodo selezionato.</p>
+                  <p><strong>TWRR:</strong> rendimento ponderato nel tempo, indipendente da depositi e prelievi.</p>
+                  <p><strong>MWRR:</strong> rendimento ponderato per il denaro, sensibile al timing dei flussi. La versione reale non è ancora disponibile.</p>
+                  <p className="text-xs text-slate-600">Value, Performance e TWRR rispondono a domande diverse: non confrontare direttamente le percentuali come se fossero lo stesso KPI.</p>
                 </div>
               )}
             />
@@ -1409,17 +1616,38 @@ export const Dashboard: React.FC = () => {
           <div className="flex items-center gap-2">
             <span className="text-[11px] font-semibold text-slate-700 uppercase tracking-wide">Analisi Temporale</span>
           </div>
-          <div className="flex flex-col sm:flex-row gap-3 w-full lg:w-auto">
+          <div className="flex flex-wrap gap-3 w-full lg:w-auto">
+            <div className="flex ui-panel-subtle p-1">
+              {([
+                { key: 'nominal', label: 'Nominale' },
+                { key: 'real', label: 'Reale' }
+              ] as const).map(option => (
+                <button
+                  key={option.key}
+                  onClick={() => setPerformanceMode(option.key)}
+                  className={clsx(
+                    "px-4 py-1.5 rounded-lg text-xs font-bold transition-all",
+                    performanceMode === option.key ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
             {/* Metric Toggle (BLUE) */}
             <div className="flex ui-panel-subtle p-1">
               {(['PERF', 'TWRR', 'MWRR'] as const).map(m => (
                 <button
                   key={m}
                   onClick={() => setMetric(m)}
+                  disabled={isRealMode && m === 'MWRR'}
                   className={clsx(
                     "px-4 py-1.5 rounded-lg text-xs font-bold transition-all",
+                    isRealMode && m === 'MWRR' && "opacity-50 cursor-not-allowed",
                     metric === m ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
                   )}
+                  title={getMetricHelpTitle(m)}
                 >
                   {m === 'PERF' ? 'Valore' : m}
                 </button>
@@ -1442,7 +1670,7 @@ export const Dashboard: React.FC = () => {
                     "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
                     valueMode === option.key ? "text-white shadow-md bg-[#0052a3]" : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
                   )}
-                  title={option.key === 'PERF_INDEX' ? 'Indice 100 rebased sul range' : 'NAV in valuta base'}
+                  title={getValueModeHelpTitle(option.key)}
                 >
                   {option.label}
                 </button>
@@ -1466,13 +1694,34 @@ export const Dashboard: React.FC = () => {
             </div>
 
           </div>
-          <div className="text-[11px] text-slate-600 lg:ml-auto">
-            {`Chart: ${chartGranularityLabel} (KPI: ${kpiGranularityLabel})`}
+          <div className="text-[11px] text-slate-600 lg:ml-auto flex flex-wrap items-center gap-1 lg:justify-end">
+            <span>{`Chart: ${chartGranularityLabel} (KPI: ${kpiGranularityLabel})`}</span>
             {kpiGranularity === 'monthly' && (
-              <span className="ml-2 px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">KPI Monthly</span>
+              <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">KPI Monthly</span>
+            )}
+            {isRealMode && (
+              <span className={clsx(
+                "px-2 py-0.5 rounded text-[10px] font-bold",
+                inflationInput.mode === 'monthly'
+                  ? "bg-emerald-100 text-emerald-700"
+                  : inflationInput.mode === 'annual'
+                    ? "bg-amber-100 text-amber-700"
+                    : "bg-slate-100 text-slate-600"
+              )}>
+                {inflationInput.coverageLabel}
+              </span>
             )}
             {metric === 'PERF' && valueMode === 'PERF_INDEX' && !hasPerfBase && (
-              <span className="ml-2 text-amber-300 font-bold">Base NAV non disponibile</span>
+              <span className="text-amber-300 font-bold">Base NAV non disponibile</span>
+            )}
+            {isRealMode && !realCoverageOk && (
+              <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-700 text-[10px] font-bold">Inflazione {baseCurrency} non sufficiente</span>
+            )}
+            {isRealMode && inflationInput.mode === 'annual' && (
+              <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px] font-bold">Grafico reale avanzato disponibile con CPI mensile</span>
+            )}
+            {isRealMode && (
+              <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px] font-bold">MWRR reale non disponibile</span>
             )}
           </div>
         </div>
@@ -1513,14 +1762,28 @@ export const Dashboard: React.FC = () => {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
             <div className="ui-panel-dense p-3">
-              <div className="text-[11px] uppercase font-bold text-slate-600">Saldo</div>
+              <div className="text-[11px] uppercase font-bold text-slate-600">{isRealMode ? 'Saldo reale' : 'Saldo'}</div>
               <div className="text-xl font-bold text-slate-900">
-                {lastChartPoint ? `CHF ${lastChartPoint.value?.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}` : 'N/D'}
+                {isRealMode && inflationInput.mode === 'annual' && annualRealFinalValue !== undefined
+                  ? `CHF ${annualRealFinalValue.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+                  : lastChartPoint
+                    ? `CHF ${lastChartPoint.value?.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+                    : 'N/D'}
               </div>
+              {isRealMode && inflationInput.mode === 'annual' && nominalRangeLastPoint && (
+                <div className="text-xs text-slate-600 mt-1">
+                  Nominale CHF {nominalRangeLastPoint.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </div>
+              )}
+              {isRealMode && inflationInput.mode === 'monthly' && lastChartPoint?.nominalValue !== undefined && (
+                <div className="text-xs text-slate-600 mt-1">
+                  Nominale CHF {lastChartPoint.nominalValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                </div>
+              )}
             </div>
             <div className="ui-panel-dense p-3">
               <div className="flex items-center justify-between">
-                <div className="text-[11px] uppercase font-bold text-slate-600">Rendimento</div>
+                <div className="text-[11px] uppercase font-bold text-slate-600">{isRealMode ? 'Rendimento reale' : 'Rendimento'}</div>
                 {metric !== 'PERF' && (
                   <span className="text-[11px] text-slate-600">Ultimo</span>
                 )}
@@ -1531,6 +1794,13 @@ export const Dashboard: React.FC = () => {
                     <span>{`Indice ${lastChartPoint.perfIndex.toFixed(1)}`}</span>
                     <span className={clsx("text-sm font-bold", lastChartPoint.perfPct >= 0 ? "text-green-600" : "text-red-600")}>
                       {`${lastChartPoint.perfPct.toFixed(2)}%`}
+                    </span>
+                  </>
+                ) : metric === 'PERF' && isRealMode && realCoverageOk && valueMode === 'NAV' && realNavBalanceMetrics ? (
+                  <>
+                    <span>{`${baseCurrency} ${realNavBalanceMetrics.realBalance.toLocaleString(undefined, { maximumFractionDigits: 0 })}`}</span>
+                    <span className={clsx("text-sm font-bold", realNavBalanceMetrics.realBalance >= 0 ? "text-green-600" : "text-red-600")}>
+                      {formatPctValue(realNavBalanceMetrics.realBalancePct)}
                     </span>
                   </>
                 ) : metric === 'PERF' && lastChartPoint && investedAtEnd > 0 ? (
@@ -1553,6 +1823,23 @@ export const Dashboard: React.FC = () => {
         )}
 
         <div className="h-[380px] w-full">
+          {isRealMode && !realChartAvailable ? (
+            <div className="h-full ui-panel-subtle flex flex-col items-center justify-center text-center p-6">
+              <div className="text-sm font-bold text-slate-900">
+                {inflationInput.mode === 'annual'
+                  ? 'Grafico reale avanzato disponibile con dati mensili CPI'
+                  : 'Dati inflazione non disponibili per il range'}
+              </div>
+              <div className="text-xs text-slate-600 mt-2 max-w-lg">
+                {inflationInput.mode === 'annual'
+                  ? 'Con inflazione annuale l’app mostra KPI reali sintetici, ma non disegna una serie storica falsamente precisa.'
+                  : 'Aggiungi dati annuali per KPI stimati o importa un CSV CPI mensile per la vista reale completa.'}
+              </div>
+              {inflationInput.warning && (
+                <div className="text-[11px] text-amber-700 mt-3">{inflationInput.warning}</div>
+              )}
+            </div>
+          ) : (
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={chartData} margin={{ top: 5, right: 0, left: 0, bottom: 0 }}>
               <defs>
@@ -1626,6 +1913,7 @@ export const Dashboard: React.FC = () => {
               )}
             </ComposedChart>
           </ResponsiveContainer>
+          )}
         </div>
       </div>
 
