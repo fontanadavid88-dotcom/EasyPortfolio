@@ -5,10 +5,11 @@ import Dexie from 'dexie';
 import { isValidEodhdSymbol, resolveEodhdSymbol } from './symbolUtils';
 import { fetchJsonWithDiagnostics, FetchJsonDiagnostics, toNum } from './diagnostics';
 import { applyAssetsMapToSettings, buildAssetsMapIndex, fetchAssetsMap, getPriceFromAssetsMap, AppsScriptAssetRow } from './appsScriptService';
-import { addDaysYmd, diffDaysYmd, subDaysYmd } from './dateUtils';
+import { addDaysYmd, diffDaysYmd, parseYmdLocal, subDaysYmd } from './dateUtils';
 import { COVERAGE_TOLERANCE_DAYS } from './constants';
 import { checkProxyHealth, ProxyHealth } from './apiHealthService';
 import { getHiddenTickersForPortfolio } from './portfolioVisibility';
+import { upsertPriceRowsByNaturalKey } from './dataWriteService';
 
 const EODHD_PROXY_ENDPOINT = '/api/eodhd-proxy';
 const EODHD_DIRECT_BASE = 'https://eodhd.com';
@@ -191,8 +192,27 @@ export const getEodhdQuotaInfo = async (
 
 interface PriceProvider {
   getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null>;
-  getHistory(ticker: string, from: string, to: string): Promise<PricePoint[]>;
+  getHistory(
+    ticker: string,
+    from: string,
+    to: string,
+    debug?: (info: PriceHistoryDebugInfo) => void
+  ): Promise<PricePoint[]>;
 }
+
+type PriceHistoryParseStats = {
+  rawCount: number;
+  parsedCount: number;
+  invalidCount: number;
+  firstDate?: string;
+  lastDate?: string;
+};
+
+type PriceHistoryDebugInfo = PriceHistoryParseStats & {
+  url: string;
+  httpStatus: number;
+  contentType?: string;
+};
 
 export interface CoverageRow {
   ticker: string;
@@ -206,12 +226,83 @@ export interface CoverageRow {
 }
 
 export type SyncPricesSummary = {
-  status: 'ok' | 'partial' | 'error' | 'quota_exhausted' | 'proxy_unreachable';
+  status: 'ok' | 'partial' | 'failed' | 'quota_exhausted' | 'proxy_unreachable';
   updatedTickers: string[];
   failedTickers: { ticker: string; reason: string }[];
   sheet: { enabled: boolean; reason?: string };
   message?: string;
   quota?: { ticker: string; httpStatus: number; contentType?: string; rawPreview?: string };
+};
+
+type LatestPriceFailureCode = 'quota_exhausted' | 'proxy_unreachable' | 'http_error' | 'invalid_payload' | 'invalid_close' | 'limit_reached';
+
+export class LatestPriceFetchError extends Error {
+  code: LatestPriceFailureCode;
+  provider: 'EODHD';
+  symbol: string;
+  httpStatus?: number;
+  payloadPreview?: string;
+
+  constructor(params: {
+    message: string;
+    code: LatestPriceFailureCode;
+    symbol: string;
+    httpStatus?: number;
+    payloadPreview?: string;
+  }) {
+    super(params.message);
+    this.name = 'LatestPriceFetchError';
+    this.code = params.code;
+    this.provider = 'EODHD';
+    this.symbol = params.symbol;
+    this.httpStatus = params.httpStatus;
+    this.payloadPreview = params.payloadPreview;
+  }
+}
+
+export const isLatestPriceFetchError = (value: unknown): value is LatestPriceFetchError => value instanceof LatestPriceFetchError;
+
+export const describeLatestPriceFetchError = (value: unknown): string => {
+  if (isLatestPriceFetchError(value)) return value.message;
+  if (value instanceof Error && value.message) return value.message;
+  return 'Errore latest EODHD';
+};
+
+const normalizePricePointDate = (value: unknown): string => {
+  if (typeof value === 'string') {
+    const raw = value.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+    const isoPrefix = raw.match(/^(\d{4}-\d{2}-\d{2})[T\s]/)?.[1];
+    if (isoPrefix && /^\d{4}-\d{2}-\d{2}$/.test(isoPrefix)) return isoPrefix;
+    const parsed = raw.includes('T')
+      ? new Date(raw)
+      : raw.includes('-')
+        ? parseYmdLocal(raw)
+        : new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return format(parsed, 'yyyy-MM-dd');
+  }
+  return format(new Date(), 'yyyy-MM-dd');
+};
+
+const buildLatestPayloadPreview = (diag: FetchJsonDiagnostics, payload?: Record<string, unknown>) => {
+  if (payload) {
+    return JSON.stringify({
+      date: payload.date ?? payload.timestamp ?? payload.previousCloseDate,
+      close: payload.close,
+      adjusted_close: payload.adjusted_close
+    }).slice(0, 300);
+  }
+  return (diag.rawPreview || '').slice(0, 300);
+};
+
+const summarizeSyncFailures = (failedTickers: { ticker: string; reason: string }[], limit = 3): string | undefined => {
+  if (!failedTickers.length) return undefined;
+  const sample = failedTickers
+    .slice(0, limit)
+    .map(item => `${item.ticker}: ${item.reason}`)
+    .join('; ');
+  const suffix = failedTickers.length > limit ? ` (+${failedTickers.length - limit} altri)` : '';
+  return sample + suffix;
 };
 
 export type BackfillMode = 'MANUAL_FULL' | 'AUTO_GAPS';
@@ -300,6 +391,7 @@ export const buildPointsForSave = (
 ): PricePoint[] => {
   return points.map(p => ({
     ...p,
+    date: normalizePricePointDate(p.date),
     ticker: params.ticker,
     instrumentId: params.instrumentId,
     currency: (params.currency || p.currency) as any,
@@ -457,41 +549,88 @@ class EodhdPriceProvider implements PriceProvider {
   }
 
   async getLatestPrice(ticker: string): Promise<Partial<PricePoint> | null> {
-    try {
-      // For real implementation, use EODHD real-time or EOD endpoint
-      const result = await fetchEodhdJson(`/api/real-time/${encodeURIComponent(ticker)}`, { fmt: 'json' }, this.apiKey);
-      const diag = result.diag;
-      if (!diag.ok && result.proxyMissing) {
-        throw new Error(PROXY_ERROR_MESSAGE);
-      }
-      if (!diag.ok) {
-        if (diag.httpStatus === 402) throw new EodhdError('quota_exhausted', diag);
-        if (diag.httpStatus >= 500) throw new Error(PROXY_ERROR_MESSAGE);
-        throw new EodhdError(`EODHD ${diag.httpStatus}`, diag);
-      }
-      if (!diag.json || typeof diag.json !== 'object') {
-        throw new EodhdError('invalid_payload', diag);
-      }
-      const data = diag.json as Record<string, unknown>;
-      const rawClose = data?.adjusted_close ?? data?.close;
-      const close = toNum(rawClose);
-      if (close === null) {
-        throw new Error('EODHD close non numerico');
-      }
-      return {
-        close,
-        date: format(new Date(), 'yyyy-MM-dd')
-      };
-    } catch (e: any) {
-      if (e?.message === PROXY_ERROR_MESSAGE) throw e;
-      if (e?.message === 'EODHD_LIMIT_REACHED') throw e;
-      if (e instanceof TypeError) throw new Error(PROXY_ERROR_MESSAGE);
-      console.error('EODHD Latest Error', e);
-      return null;
+    // For real implementation, use EODHD real-time or EOD endpoint
+    const result = await fetchEodhdJson(`/api/real-time/${encodeURIComponent(ticker)}`, { fmt: 'json' }, this.apiKey);
+    const diag = result.diag;
+    if (!diag.ok && result.proxyMissing) {
+      throw new LatestPriceFetchError({
+        code: 'proxy_unreachable',
+        symbol: ticker,
+        httpStatus: diag.httpStatus,
+        payloadPreview: diag.rawPreview,
+        message: PROXY_ERROR_MESSAGE
+      });
     }
+    if (!diag.ok) {
+      if (diag.httpStatus === 402) {
+        throw new LatestPriceFetchError({
+          code: 'quota_exhausted',
+          symbol: ticker,
+          httpStatus: diag.httpStatus,
+          payloadPreview: diag.rawPreview,
+          message: 'Quota EODHD esaurita (402)'
+        });
+      }
+      if (diag.httpStatus === 429) {
+        throw new LatestPriceFetchError({
+          code: 'http_error',
+          symbol: ticker,
+          httpStatus: diag.httpStatus,
+          payloadPreview: diag.rawPreview,
+          message: 'Rate limit EODHD (429)'
+        });
+      }
+      if (diag.httpStatus >= 500) {
+        throw new LatestPriceFetchError({
+          code: 'proxy_unreachable',
+          symbol: ticker,
+          httpStatus: diag.httpStatus,
+          payloadPreview: diag.rawPreview,
+          message: PROXY_ERROR_MESSAGE
+        });
+      }
+      throw new LatestPriceFetchError({
+        code: 'http_error',
+        symbol: ticker,
+        httpStatus: diag.httpStatus,
+        payloadPreview: diag.rawPreview,
+        message: `EODHD latest HTTP ${diag.httpStatus}`
+      });
+    }
+    if (!diag.json || typeof diag.json !== 'object') {
+      throw new LatestPriceFetchError({
+        code: 'invalid_payload',
+        symbol: ticker,
+        httpStatus: diag.httpStatus,
+        payloadPreview: diag.rawPreview,
+        message: 'Payload latest EODHD non valido'
+      });
+    }
+    const data = diag.json as Record<string, unknown>;
+    const rawClose = data?.adjusted_close ?? data?.close;
+    const close = toNum(rawClose);
+    if (close === null) {
+      throw new LatestPriceFetchError({
+        code: 'invalid_close',
+        symbol: ticker,
+        httpStatus: diag.httpStatus,
+        payloadPreview: buildLatestPayloadPreview(diag, data),
+        message: 'Payload latest EODHD non valido: close non numerico'
+      });
+    }
+    return {
+      close,
+      date: normalizePricePointDate(data?.date ?? data?.timestamp),
+      currency: data?.currency as Currency | undefined
+    };
   }
 
-  async getHistory(ticker: string, from: string, to: string): Promise<PricePoint[]> {
+  async getHistory(
+    ticker: string,
+    from: string,
+    to: string,
+    debug?: (info: PriceHistoryDebugInfo) => void
+  ): Promise<PricePoint[]> {
     try {
       const result = await fetchEodhdJson(`/api/eod/${encodeURIComponent(ticker)}`, { from, to, fmt: 'json' }, this.apiKey);
       const diag = result.diag;
@@ -521,7 +660,25 @@ class EodhdPriceProvider implements PriceProvider {
         throw new EodhdError(`invalid_payload http=${diag.httpStatus} ct=${diag.contentType || 'n/a'}`, diag);
       }
 
-      return mapEodhdHistoryRows(ticker, diag.json);
+      const parseStats: PriceHistoryParseStats | undefined = debug ? {
+        rawCount: 0,
+        parsedCount: 0,
+        invalidCount: 0
+      } : undefined;
+      const rows = mapEodhdHistoryRows(ticker, diag.json, parseStats);
+      if (debug) {
+        debug({
+          url,
+          httpStatus: diag.httpStatus,
+          contentType: diag.contentType,
+          rawCount: parseStats?.rawCount || 0,
+          parsedCount: parseStats?.parsedCount || rows.length,
+          invalidCount: parseStats?.invalidCount || 0,
+          firstDate: parseStats?.firstDate,
+          lastDate: parseStats?.lastDate
+        });
+      }
+      return rows;
     } catch (e: any) {
       if (e?.message === PROXY_ERROR_MESSAGE) throw e;
       if (e?.message === 'EODHD_LIMIT_REACHED') throw e;
@@ -538,13 +695,17 @@ export const fetchLatestEodhdPrice = async (ticker: string, apiKey?: string): Pr
   return provider.getLatestPrice(ticker);
 };
 
-export const mapEodhdHistoryRows = (ticker: string, data: unknown[]): PricePoint[] => {
-  return data
+export const mapEodhdHistoryRows = (ticker: string, data: unknown[], stats?: PriceHistoryParseStats): PricePoint[] => {
+  let invalidCount = 0;
+  const rows = data
     .map((row: any) => {
       const date = String(row?.date || '');
       const closeRaw = row?.adjusted_close ?? row?.close;
       const close = toNum(closeRaw);
-      if (!date || close === null) return null;
+      if (!date || close === null) {
+        invalidCount += 1;
+        return null;
+      }
       return {
         ticker,
         date,
@@ -553,6 +714,14 @@ export const mapEodhdHistoryRows = (ticker: string, data: unknown[]): PricePoint
       } as PricePoint;
     })
     .filter((row): row is PricePoint => Boolean(row));
+  if (stats) {
+    stats.rawCount = Array.isArray(data) ? data.length : 0;
+    stats.parsedCount = rows.length;
+    stats.invalidCount = invalidCount;
+    stats.firstDate = rows[0]?.date;
+    stats.lastDate = rows[rows.length - 1]?.date;
+  }
+  return rows;
 };
 
 // 2. Google Sheet Provider
@@ -726,7 +895,7 @@ class GoogleSheetsPriceProvider implements PriceProvider {
     };
   }
 
-  async getHistory(_ticker: string, _from: string, _to: string): Promise<PricePoint[]> {
+  async getHistory(_ticker: string, _from: string, _to: string, _debug?: (info: PriceHistoryDebugInfo) => void): Promise<PricePoint[]> {
     // Sheet is assumed to only have latest prices based on prompt description
     return [];
   }
@@ -757,9 +926,10 @@ export const syncPrices = async (
   };
   let settings = await db.settings.where('portfolioId').equals(portfolioId).first();
   if (!settings) {
-    summary.status = 'error';
+    summary.status = 'failed';
     summary.failedTickers.push({ ticker: '*', reason: 'Impostazioni mancanti' });
     summary.sheet = { enabled: false, reason: 'Impostazioni mancanti' };
+    summary.message = 'Impostazioni mancanti';
     persistSyncMeta(summary.status);
     return summary;
   }
@@ -837,7 +1007,7 @@ export const syncPrices = async (
       return summary;
     }
     if (!proxyHealth.hasEodhdKey && !proxyHealth.usingLocalKey) {
-      summary.status = 'error';
+      summary.status = 'failed';
       summary.message = EODHD_MISSING_KEY_MESSAGE;
       persistSyncMeta(summary.status);
       return summary;
@@ -907,25 +1077,43 @@ export const syncPrices = async (
         }
       } catch (e: any) {
         if (e?.message === 'EODHD_LIMIT_REACHED') {
-          summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
+          summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'failed';
           summary.message = 'Limite EODHD sessione raggiunto (20 richieste).';
           break;
         }
         if (isEodhdError(e) && e.httpStatus === 402) {
-          summary.status = 'quota_exhausted';
-          summary.message = 'Quota EODHD esaurita (402). Sync interrotta.';
-          summary.quota = {
-            ticker: priceTicker,
-            httpStatus: e.httpStatus,
-            contentType: e.contentType,
-            rawPreview: e.rawPreview
-          };
+          if (summary.updatedTickers.length > 0) {
+            summary.status = 'partial';
+            summary.message = 'Sync parziale: quota EODHD esaurita durante l\'aggiornamento.';
+            if (!failedSet.has(priceTicker)) {
+              summary.failedTickers.push({ ticker: priceTicker, reason: 'Quota EODHD esaurita (402)' });
+              failedSet.add(priceTicker);
+            }
+          } else {
+            summary.status = 'quota_exhausted';
+            summary.message = 'Quota EODHD esaurita (402). Sync interrotta.';
+            summary.quota = {
+              ticker: priceTicker,
+              httpStatus: e.httpStatus,
+              contentType: e.contentType,
+              rawPreview: e.rawPreview
+            };
+          }
           break;
         }
         eodhdError = e?.message || 'Errore EODHD';
         if (eodhdError === PROXY_ERROR_MESSAGE) {
-          summary.status = 'proxy_unreachable';
-          summary.message = proxyHealth?.message || PROXY_HELP_MESSAGE;
+          if (summary.updatedTickers.length > 0) {
+            summary.status = 'partial';
+            summary.message = proxyHealth?.message || PROXY_HELP_MESSAGE;
+            if (!failedSet.has(priceTicker)) {
+              summary.failedTickers.push({ ticker: priceTicker, reason: 'Proxy /api non raggiungibile' });
+              failedSet.add(priceTicker);
+            }
+          } else {
+            summary.status = 'proxy_unreachable';
+            summary.message = proxyHealth?.message || PROXY_HELP_MESSAGE;
+          }
           break;
         }
         if (String(eodhdError).includes('404')) {
@@ -992,7 +1180,7 @@ export const syncPrices = async (
         currency: priceCurrency,
         portfolioId
       });
-      await db.prices.bulkPut(pointsToSave);
+      await upsertPriceRowsByNaturalKey(pointsToSave);
       summary.updatedTickers.push(priceTicker);
     } else if (!failedSet.has(priceTicker)) {
       if (tickerConfig.provider === 'SHEETS') {
@@ -1018,8 +1206,18 @@ export const syncPrices = async (
     persistSyncMeta(summary.status);
     return summary;
   }
-  if (summary.failedTickers.length > 0) {
-    summary.status = summary.updatedTickers.length > 0 ? 'partial' : 'error';
+  if (summary.updatedTickers.length > 0) {
+    summary.status = summary.failedTickers.length > 0 ? 'partial' : 'ok';
+    if (!summary.message && summary.failedTickers.length > 0) {
+      summary.message = `Ticker non aggiornati: ${summarizeSyncFailures(summary.failedTickers)}`;
+    }
+  } else {
+    summary.status = 'failed';
+    if (!summary.message) {
+      summary.message = summary.failedTickers.length > 0
+        ? `Nessun ticker aggiornato. ${summarizeSyncFailures(summary.failedTickers)}`
+        : 'Nessun ticker aggiornato nel ramo latest. Verifica provider latest, mapping e payload.';
+    }
   }
   persistSyncMeta(summary.status);
   return summary;
@@ -1177,6 +1375,21 @@ export const backfillPricesForPortfolio = async (
   const eodhd = new EodhdPriceProvider(eodhdKey);
   const today = format(new Date(), 'yyyy-MM-dd');
   const minAllowedFrom = subDaysYmd(today, maxLookbackDays);
+  const buildDateSample = (from: string, to: string) => {
+    const days = diffDaysYmd(to, from) + 1;
+    if (days <= 6) {
+      return Array.from({ length: days }, (_, i) => addDaysYmd(from, i));
+    }
+    return [
+      from,
+      addDaysYmd(from, 1),
+      addDaysYmd(from, 2),
+      '…',
+      subDaysYmd(to, 2),
+      subDaysYmd(to, 1),
+      to
+    ];
+  };
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
   const priceCurrencyByTicker = new Map<string, Currency>();
   const instrumentIdByTicker = new Map<string, string>();
@@ -1243,18 +1456,19 @@ export const backfillPricesForPortfolio = async (
     const candidates: AutoGapCandidate[] = [];
     const existingDatesByTicker = new Map<string, Set<string>>();
     for (const ticker of filtered) {
+      const assetType = instrumentTypeByTicker.get(ticker);
+      const gapScanFrom = assetType === AssetType.Crypto ? minHistoryDate : minAllowedFrom;
       const existing = await db.prices
         .where('[ticker+date]')
-        .between([ticker, minAllowedFrom], [ticker, today])
+        .between([ticker, gapScanFrom], [ticker, today])
         .and(p => p.portfolioId === portfolioId)
         .sortBy('date');
       const lastDate = existing[existing.length - 1]?.date;
       existingDatesByTicker.set(ticker, new Set(existing.map(row => row.date).filter(Boolean) as string[]));
 
-      const assetType = instrumentTypeByTicker.get(ticker);
       const gapThresholdDays = resolveGapThresholdDays(assetType, staleThresholdDays);
       const gapRanges = buildInternalGapRanges(existing, {
-        minAllowedFrom,
+        minAllowedFrom: gapScanFrom,
         maxAllowedTo: today,
         gapThresholdDays
       });
@@ -1313,7 +1527,7 @@ export const backfillPricesForPortfolio = async (
     summary.stoppedByBudget = budgetLimit.stoppedByBudget;
 
     const limitedCandidates = candidates.filter(c => limitedSet.has(c.ticker));
-    const internalGapMissing: string[] = [];
+    const internalGapFailures: Array<{ ticker: string; range: { from: string; to: string }; reason: string }> = [];
     for (let i = 0; i < limitedCandidates.length; i++) {
       const { ticker, range, reason } = limitedCandidates[i];
       const cfg = resolvePriceSyncConfig(ticker, settings);
@@ -1322,6 +1536,21 @@ export const backfillPricesForPortfolio = async (
       const priceCurrency = priceCurrencyByTicker.get(ticker);
       const instrumentId = instrumentIdByTicker.get(ticker);
       const existingDates = existingDatesByTicker.get(ticker) || new Set<string>();
+      const isGapDebug = reason === 'internal-gap' && import.meta.env?.DEV;
+      const logGap = (phase: 'REQUEST' | 'RESPONSE' | 'PARSE' | 'WRITE', payload: Record<string, unknown>) => {
+        if (!isGapDebug) return;
+        console.log(`[GAP][${ticker}][${phase}]`, payload);
+      };
+      if (isGapDebug) {
+        const expectedDays = diffDaysYmd(range.to, range.from) + 1;
+        logGap('REQUEST', {
+          ticker,
+          symbol,
+          range: { from: range.from, to: range.to },
+          expectedDays,
+          expectedSample: buildDateSample(range.from, range.to)
+        });
+      }
       if (!isValidEodhdSymbol(symbol, assetType)) {
         const message = 'Symbol EODHD non valido';
         if (onProgress) onProgress({ ticker, index: i + 1, total: limitedCandidates.length, phase: 'backfill', error: message });
@@ -1345,9 +1574,66 @@ export const backfillPricesForPortfolio = async (
       usedThisRun += 1;
       dailyUsed = bumpDailyBudget(today, 1);
       try {
-        const pts = await eodhd.getHistory(symbol, range.from, range.to);
+        let parseInfo: PriceHistoryDebugInfo | null = null;
+        const pts = await eodhd.getHistory(
+          symbol,
+          range.from,
+          range.to,
+          isGapDebug ? (info) => { parseInfo = info; } : undefined
+        );
+        const parseInfoResolved = parseInfo as PriceHistoryDebugInfo | null;
+        if (isGapDebug && parseInfoResolved) {
+          logGap('PARSE', {
+            url: parseInfoResolved.url,
+            httpStatus: parseInfoResolved.httpStatus,
+            rawCount: parseInfoResolved.rawCount,
+            parsedCount: parseInfoResolved.parsedCount,
+            invalidCount: parseInfoResolved.invalidCount,
+            firstDate: parseInfoResolved.firstDate,
+            lastDate: parseInfoResolved.lastDate
+          });
+        }
+        const returnedDates = pts.map(p => p.date).filter(Boolean).sort();
+        const inRangeDates = returnedDates.filter(date => date >= range.from && date <= range.to);
+        const newDates = inRangeDates.filter(date => !existingDates.has(date));
+        if (isGapDebug) {
+          const sampleDates = returnedDates.length <= 6
+            ? returnedDates
+            : [
+              returnedDates[0],
+              returnedDates[1],
+              returnedDates[2],
+              '…',
+              returnedDates[returnedDates.length - 3],
+              returnedDates[returnedDates.length - 2],
+              returnedDates[returnedDates.length - 1]
+            ];
+          logGap('RESPONSE', {
+            rows: pts.length,
+            firstDate: returnedDates[0],
+            lastDate: returnedDates[returnedDates.length - 1],
+            sampleDates,
+            inRange: inRangeDates.length,
+            newDates: newDates.length
+          });
+        }
+        let failureReason: string | null = null;
+        if (reason === 'internal-gap') {
+          if (pts.length === 0) {
+            failureReason = 'provider_missing_data';
+          } else if (parseInfoResolved && parseInfoResolved.rawCount > 0 && parseInfoResolved.parsedCount === 0) {
+            failureReason = 'parse_or_filter_issue';
+          } else if (inRangeDates.length === 0) {
+            failureReason = 'query_range_issue';
+          } else if (newDates.length === 0) {
+            failureReason = 'write_skipped_existing';
+          }
+        }
         if (pts.length > 0) {
-          const toSaveRaw = buildPointsForSave(pts, {
+          const ptsForSave = reason === 'internal-gap'
+            ? pts.filter(p => p.date >= range.from && p.date <= range.to)
+            : pts;
+          const toSaveRaw = buildPointsForSave(ptsForSave, {
             ticker,
             instrumentId,
             currency: priceCurrency,
@@ -1360,22 +1646,49 @@ export const backfillPricesForPortfolio = async (
           });
           const toSave = Array.from(deduped.values());
           if (toSave.length > 0) {
-            await db.prices.bulkPut(toSave);
+            await upsertPriceRowsByNaturalKey(toSave);
             toSave.forEach(point => existingDates.add(point.date));
             summary.updatedTickers?.push(ticker);
             if (reason === 'internal-gap' && !summary.message) {
               summary.message = `Backfill prezzi: riempito gap ${ticker} ${range.from} -> ${range.to}`;
             }
+            if (isGapDebug) {
+              const verify = await db.prices
+                .where('[ticker+date]')
+                .between([ticker, range.from], [ticker, range.to])
+                .and(p => p.portfolioId === portfolioId)
+                .toArray();
+              logGap('WRITE', {
+                candidates: newDates.length,
+                written: toSave.length,
+                verifyCount: verify.length,
+                verifyFirst: verify[0]?.date,
+                verifyLast: verify[verify.length - 1]?.date
+              });
+              if (verify.length === 0 && newDates.length > 0) {
+                failureReason = 'persistence_issue';
+              }
+            }
+            if (reason === 'internal-gap' && failureReason === 'persistence_issue') {
+              internalGapFailures.push({ ticker, range, reason: failureReason });
+            }
           } else {
             summary.skipped = (summary.skipped || 0) + 1;
-            if (reason === 'internal-gap') {
-              internalGapMissing.push(`${ticker} ${range.from}→${range.to}`);
+            if (isGapDebug) {
+              logGap('WRITE', {
+                candidates: newDates.length,
+                written: 0,
+                reason: failureReason || 'write_skipped'
+              });
+            }
+            if (reason === 'internal-gap' && failureReason) {
+              internalGapFailures.push({ ticker, range, reason: failureReason });
             }
           }
         } else {
           summary.skipped = (summary.skipped || 0) + 1;
           if (reason === 'internal-gap') {
-            internalGapMissing.push(`${ticker} ${range.from}→${range.to}`);
+            internalGapFailures.push({ ticker, range, reason: failureReason || 'provider_missing_data' });
           }
         }
       } catch (e: any) {
@@ -1408,9 +1721,13 @@ export const backfillPricesForPortfolio = async (
       await new Promise(res => setTimeout(res, sleepMs));
     }
 
-    if (internalGapMissing.length > 0) {
-      const preview = internalGapMissing.slice(0, 2).join(', ');
-      const note = `gap interni senza dati provider: ${preview}${internalGapMissing.length > 2 ? '…' : ''}`;
+    if (internalGapFailures.length > 0) {
+      summary.internalGapFailures = internalGapFailures.length;
+      const preview = internalGapFailures
+        .slice(0, 2)
+        .map(item => `${item.ticker} ${item.range.from}..${item.range.to} (${item.reason})`)
+        .join(', ');
+      const note = `gap interno non colmato: ${preview}${internalGapFailures.length > 2 ? '…' : ''}`;
       summary.message = summary.message ? `${summary.message}; ${note}` : `Backfill prezzi: ${note}`;
     }
 
@@ -1488,7 +1805,7 @@ export const backfillPricesForPortfolio = async (
           });
           const toSave = Array.from(deduped.values());
           if (toSave.length > 0) {
-            await db.prices.bulkPut(toSave);
+            await upsertPriceRowsByNaturalKey(toSave);
             toSave.forEach(point => existingDates.add(point.date));
             if (!summary.updatedTickers?.includes(ticker)) summary.updatedTickers?.push(ticker);
           } else {
@@ -1545,6 +1862,7 @@ export type BackfillSummary = {
   skipped?: number;
   stoppedByBudget?: boolean;
   mode?: BackfillMode;
+  internalGapFailures?: number;
 };
 
 export const testSheetLatestPrice = async (sheetUrl: string, ticker: string): Promise<SheetTestResult> => {
@@ -1716,7 +2034,7 @@ export const getMarketCloseAroundDate = async (
       })
       .filter((row): row is PricePoint => Boolean(row));
     if (pointsToSave.length > 0) {
-      await db.prices.bulkPut(pointsToSave);
+      await upsertPriceRowsByNaturalKey(pointsToSave);
     }
     const status: MarketCloseAroundResult['status'] = best.date === target ? 'exact' : 'fallback';
     return { status, dateUsed: best.date, close: best.close, currency, source: 'eodhd', rawCount };

@@ -1,11 +1,12 @@
 import { AppSettings, Currency, Instrument } from '../types';
-import { syncPrices, getTickersForBackfill, backfillPricesForPortfolio, SyncPricesSummary, BackfillSummary, fetchLatestEodhdPrice, buildPointsForSave, resolvePriceSyncConfig } from './priceService';
+import { syncPrices, getTickersForBackfill, backfillPricesForPortfolio, SyncPricesSummary, BackfillSummary, fetchLatestEodhdPrice, buildPointsForSave, resolvePriceSyncConfig, describeLatestPriceFetchError, isLatestPriceFetchError } from './priceService';
 import { backfillFxRatesForPortfolio, getFxPairsForPortfolio, FxBackfillSummary } from './fxService';
 import { syncFxRates, SyncFxResult } from './appsScriptService';
 import { setLastGapFillAt, setLastLatestSyncAt } from './syncStatusService';
 import { db } from '../db';
 import { getCanonicalTicker } from './financeUtils';
 import { resolveEodhdSymbol } from './symbolUtils';
+import { upsertPriceRowsByNaturalKey } from './dataWriteService';
 
 export type SyncProgressHandler = (message: string) => void;
 
@@ -24,6 +25,44 @@ export type GapFillOutcome = {
   fxResult?: FxBackfillSummary | null;
   ok: boolean;
   gapFillAt?: string;
+};
+
+const summarizeFailedTickers = (failedTickers: { ticker: string; reason: string }[], limit = 3) => {
+  if (!failedTickers.length) return '';
+  const head = failedTickers
+    .slice(0, limit)
+    .map(item => `${item.ticker}: ${item.reason}`)
+    .join('; ');
+  return failedTickers.length > limit ? `${head} (+${failedTickers.length - limit} altri)` : head;
+};
+
+const resolveLatestSyncStatus = (
+  baseStatus: SyncPricesSummary['status'],
+  updatedCount: number,
+  failedCount: number
+): SyncPricesSummary['status'] => {
+  if (updatedCount > 0) return failedCount > 0 ? 'partial' : 'ok';
+  if (baseStatus === 'quota_exhausted') return 'quota_exhausted';
+  if (baseStatus === 'proxy_unreachable') return 'proxy_unreachable';
+  return 'failed';
+};
+
+const buildLatestSyncMessage = (
+  status: SyncPricesSummary['status'],
+  failedTickers: { ticker: string; reason: string }[],
+  baseMessage?: string
+) => {
+  const failureSummary = summarizeFailedTickers(failedTickers);
+  if (status === 'ok') return undefined;
+  if (status === 'partial') {
+    return failureSummary ? `Aggiornamento parziale. ${failureSummary}` : (baseMessage || 'Aggiornamento parziale.');
+  }
+  if (status === 'quota_exhausted' || status === 'proxy_unreachable') {
+    return baseMessage || failureSummary || 'Latest sync non completato.';
+  }
+  return failureSummary
+    ? `Nessun ticker aggiornato. ${failureSummary}`
+    : (baseMessage || 'Nessun ticker aggiornato.');
 };
 
 export const runLatestSync = async (params: {
@@ -47,6 +86,7 @@ export const runLatestSync = async (params: {
   const updatedSheetTickers = priceResult.updatedTickers || [];
   const updatedFallbackTickers: string[] = [];
   const missingTickers = new Set<string>();
+  const fallbackFailures = new Map<string, string>();
 
   const instruments = await db.instruments.where('portfolioId').equals(portfolioId).toArray();
   const instrumentByTicker = new Map<string, Instrument>();
@@ -87,22 +127,52 @@ export const runLatestSync = async (params: {
           currency: priceCurrency,
           portfolioId
         });
-        await db.prices.bulkPut(points);
+        await upsertPriceRowsByNaturalKey(points);
         updatedFallbackTickers.push(ticker);
         missingTickers.delete(ticker);
-      } catch {
-        // ignore single ticker failures for fallback
+      } catch (error) {
+        const reason = describeLatestPriceFetchError(error);
+        fallbackFailures.set(ticker, reason);
+        if (import.meta.env?.DEV) {
+          console.warn('[SYNC][LatestFallback]', {
+            ticker,
+            symbol: resolvedSymbol,
+            provider: 'EODHD',
+            httpStatus: isLatestPriceFetchError(error) ? error.httpStatus : undefined,
+            payloadPreview: isLatestPriceFetchError(error) ? error.payloadPreview : undefined,
+            reason
+          });
+        }
       }
     }
   }
 
-  const updatedTotal = updatedSheetTickers.length + updatedFallbackTickers.length;
+  const recovered = new Set(updatedFallbackTickers);
+  const mergedFailedTickers = priceResult.failedTickers
+    .filter(item => !recovered.has(item.ticker))
+    .map(item => ({ ...item, reason: fallbackFailures.get(item.ticker) || item.reason }));
+  const mergedFailureSet = new Set(mergedFailedTickers.map(item => item.ticker));
+  fallbackFailures.forEach((reason, ticker) => {
+    if (mergedFailureSet.has(ticker) || recovered.has(ticker)) return;
+    mergedFailedTickers.push({ ticker, reason });
+  });
+  const mergedUpdatedTickers = Array.from(new Set([...updatedSheetTickers, ...updatedFallbackTickers]));
+  const finalStatus = resolveLatestSyncStatus(priceResult.status, mergedUpdatedTickers.length, mergedFailedTickers.length);
+  const mergedPriceResult: SyncPricesSummary = {
+    ...priceResult,
+    status: finalStatus,
+    updatedTickers: mergedUpdatedTickers,
+    failedTickers: mergedFailedTickers,
+    message: buildLatestSyncMessage(finalStatus, mergedFailedTickers, priceResult.message)
+  };
+
+  const updatedTotal = mergedUpdatedTickers.length;
   const ok = updatedTotal > 0;
   if (ok) {
     const nowIso = new Date().toISOString();
     setLastLatestSyncAt(portfolioId, nowIso);
     return {
-      priceResult,
+      priceResult: mergedPriceResult,
       fx,
       ok,
       latestSyncAt: nowIso,
@@ -112,7 +182,7 @@ export const runLatestSync = async (params: {
     };
   }
   return {
-    priceResult,
+    priceResult: mergedPriceResult,
     fx,
     ok,
     updatedSheetTickers,
@@ -170,7 +240,9 @@ export const runGapFill = async (params: {
   }
 
   const fxOk = !pairs.length || fxResult?.status === 'ok';
-  const ok = priceResult.status === 'ok' && fxOk;
+  const ok = priceResult.status === 'ok'
+    && fxOk
+    && !(priceResult.internalGapFailures && priceResult.internalGapFailures > 0);
   if (ok) {
     const nowIso = new Date().toISOString();
     setLastGapFillAt(portfolioId, nowIso);

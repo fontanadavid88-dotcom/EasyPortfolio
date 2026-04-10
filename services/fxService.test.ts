@@ -5,6 +5,18 @@ import { fetchJsonWithDiagnostics } from './diagnostics';
 import { checkProxyHealth } from './apiHealthService';
 import { db } from '../db';
 
+vi.mock('./dataWriteService', () => ({
+  upsertFxRowsByNaturalKey: vi.fn().mockResolvedValue({
+    received: 0,
+    deduped: 0,
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    deletedDuplicates: 0,
+    written: 0
+  })
+}));
+
 vi.mock('../db', () => {
   const fxRatesTable = {
     where: vi.fn().mockReturnThis(),
@@ -44,12 +56,13 @@ vi.mock('./apiHealthService', () => ({
 }));
 
 const fetchMock = fetchJsonWithDiagnostics as unknown as { mockReset: () => void; mockResolvedValueOnce: (v: any) => void; mockImplementation: (fn: any) => void; mock: { calls: any[] } };
+const { upsertFxRowsByNaturalKey } = await import('./dataWriteService');
 const healthMock = checkProxyHealth as unknown as { mockReset: () => void; mockResolvedValue: (v: any) => void };
 
 beforeEach(() => {
   fetchMock.mockReset();
   healthMock.mockReset();
-  (db.fxRates.bulkPut as any).mockClear?.();
+  (upsertFxRowsByNaturalKey as any).mockClear?.();
   (db.fxRates as any).sortBy?.mockResolvedValue([]);
   if (typeof localStorage !== 'undefined') localStorage.clear();
 });
@@ -141,7 +154,7 @@ describe('backfillFxRatesForPortfolio', () => {
       expect(url).toContain('to=2026-02-17');
       expect(result.status).toBe('ok');
       expect(result.updatedPairs).toContain('EUR/CHF');
-      expect((db.fxRates.bulkPut as any).mock.calls.length).toBe(1);
+      expect((upsertFxRowsByNaturalKey as any).mock.calls.length).toBe(1);
     } finally {
       vi.useRealTimers();
     }
@@ -205,7 +218,7 @@ describe('backfillFxRatesForPortfolio', () => {
 
     expect(result.status).toBe('ok');
     expect(result.updatedPairs).toContain('EUR/CHF');
-    expect((db.fxRates.bulkPut as any).mock.calls.length).toBe(1);
+    expect((upsertFxRowsByNaturalKey as any).mock.calls.length).toBe(1);
     expect(fetchMock.mock.calls.length).toBe(3);
   });
 });

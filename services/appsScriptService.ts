@@ -2,6 +2,7 @@ import { AppSettings, Currency, MacroIndicator, PriceProviderType, PriceTickerCo
 import { asCurrency, asString } from './symbolUtils';
 import { fetchJsonWithDiagnostics, FetchJsonDiagnostics, toNum } from './diagnostics';
 import { db } from '../db';
+import { upsertFxRowsByNaturalKey } from './dataWriteService';
 
 export type AppsScriptDiagnostics = {
   url: string;
@@ -322,7 +323,7 @@ export const applyMacroRowsToDexie = async (
 
 export const applyFxRowsToDexie = async (
   rows: AppsScriptFxRow[],
-  db: { fxRates: { bulkPut: Function } },
+  _db: { fxRates: { bulkPut: Function } },
   source = 'apps-script'
 ): Promise<number> => {
   if (!rows.length) return 0;
@@ -336,7 +337,7 @@ export const applyFxRowsToDexie = async (
     source
   }));
 
-  await db.fxRates.bulkPut(toSave);
+  await upsertFxRowsByNaturalKey(toSave);
   if (import.meta.env?.DEV) {
     console.log('[SYNC][FX]', { saved: toSave.length, source });
   }

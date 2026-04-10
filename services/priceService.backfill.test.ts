@@ -4,6 +4,18 @@ import { fetchJsonWithDiagnostics } from './diagnostics';
 import { checkProxyHealth } from './apiHealthService';
 import { db } from '../db';
 
+vi.mock('./dataWriteService', () => ({
+  upsertPriceRowsByNaturalKey: vi.fn().mockResolvedValue({
+    received: 0,
+    deduped: 0,
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    deletedDuplicates: 0,
+    written: 0
+  })
+}));
+
 vi.mock('../db', () => {
   const pricesTable = {
     where: vi.fn().mockReturnThis(),
@@ -59,6 +71,7 @@ const fetchMock = fetchJsonWithDiagnostics as unknown as {
   mockResolvedValueOnce: (value: any) => void;
   mock: { calls: any[] };
 };
+const { upsertPriceRowsByNaturalKey } = await import('./dataWriteService');
 const healthMock = checkProxyHealth as unknown as {
   mockReset: () => void;
   mockResolvedValue: (value: any) => void;
@@ -67,7 +80,7 @@ const healthMock = checkProxyHealth as unknown as {
 beforeEach(() => {
   fetchMock.mockReset();
   healthMock.mockReset();
-  (db.prices.bulkPut as any).mockClear?.();
+  (upsertPriceRowsByNaturalKey as any).mockClear?.();
   (db.prices as any).sortBy?.mockResolvedValue([]);
   if (typeof localStorage !== 'undefined') localStorage.clear();
 });
@@ -113,7 +126,7 @@ describe('backfillPricesForPortfolio AUTO_GAPS', () => {
       expect(url).toContain('from=2026-01-17');
       expect(url).toContain('to=2026-02-03');
       expect(result.updatedTickers).toContain('BTC-USD.SW');
-      expect((db.prices.bulkPut as any).mock.calls.length).toBe(1);
+      expect((upsertPriceRowsByNaturalKey as any).mock.calls.length).toBe(1);
     } finally {
       vi.useRealTimers();
     }

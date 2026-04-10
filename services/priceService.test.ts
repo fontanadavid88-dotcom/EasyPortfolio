@@ -4,6 +4,7 @@ import {
   resolveCoverageStartDate,
   resolveSyncStartDate,
   buildPointsForSave,
+  fetchLatestEodhdPrice,
   resolvePriceSyncConfig,
   mapEodhdHistoryRows,
   computeAutoGapRange,
@@ -97,7 +98,7 @@ describe('buildPointsForSave', () => {
   it('assigns instrument currency when provider has none', () => {
     const points = [{
       ticker: 'AAPL.US',
-      date: '2026-02-10',
+      date: '2026-02-10T15:30:00Z',
       close: 123.45,
       currency: undefined as any
     }];
@@ -108,6 +109,7 @@ describe('buildPointsForSave', () => {
       portfolioId: 'default'
     });
     expect(saved[0].currency).toBe(Currency.CHF);
+    expect(saved[0].date).toBe('2026-02-10');
   });
 });
 
@@ -206,6 +208,29 @@ describe('getEodhdQuotaInfo', () => {
       expect(result.info.dailyRateLimit).toBe(100);
       expect(result.info.apiRequests).toBe(12);
     }
+    globalWithFetch.fetch = originalFetch;
+  });
+});
+
+describe('fetchLatestEodhdPrice', () => {
+  it('throws a readable error on non-numeric close payload', async () => {
+    const globalWithFetch = globalThis as typeof globalThis & { fetch?: typeof fetch };
+    const originalFetch = globalWithFetch.fetch;
+    const mockResponse = {
+      status: 200,
+      ok: true,
+      headers: { get: () => 'application/json' },
+      text: async () => JSON.stringify({ date: '2026-04-09T10:00:00Z', close: 'n/a', adjusted_close: null })
+    } as unknown as Response;
+    globalWithFetch.fetch = async () => mockResponse;
+
+    await expect(fetchLatestEodhdPrice('AAA.US', 'key')).rejects.toMatchObject({
+      message: 'Payload latest EODHD non valido: close non numerico',
+      httpStatus: 200,
+      provider: 'EODHD',
+      symbol: 'AAA.US'
+    });
+
     globalWithFetch.fetch = originalFetch;
   });
 });

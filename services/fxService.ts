@@ -5,6 +5,7 @@ import { checkProxyHealth } from './apiHealthService';
 import { fetchJsonWithDiagnostics, FetchJsonDiagnostics, toNum } from './diagnostics';
 import { addDaysYmd, diffDaysYmd, subDaysYmd } from './dateUtils';
 import { FX_STALE_DAYS } from './constants';
+import { upsertFxRowsByNaturalKey } from './dataWriteService';
 
 export const getFxRate = async (base: Currency, quote: Currency, date: string): Promise<number | null> => {
   if (base === quote) return 1;
@@ -150,7 +151,7 @@ export const importFxCsv = async (file: File, base: Currency, quote: Currency, s
   }
   if (!rows.length) return 0;
   const deduped = dedupeFxRows(rows);
-  await db.fxRates.bulkPut(deduped);
+  await upsertFxRowsByNaturalKey(deduped);
   return deduped.length;
 };
 
@@ -490,7 +491,7 @@ export const backfillFxRatesForPortfolio = async (
 
       if (rowsToSave.length > 0) {
         const deduped = dedupeFxRows(rowsToSave);
-        await db.fxRates.bulkPut(deduped);
+        await upsertFxRowsByNaturalKey(deduped);
         if (!summary.updatedPairs.includes(pair)) summary.updatedPairs.push(pair);
         if (reason === 'internal-gap' && summary.status === 'ok') {
           const note = `riempito gap ${pair} ${range.from} → ${range.to}`;

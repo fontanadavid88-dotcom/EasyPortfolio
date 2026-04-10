@@ -7,7 +7,7 @@ import { resolveListingsByIsin } from '../services/eodhdSearchService';
 import { pickDefaultListing, pickRecommendedListings } from '../services/listingService';
 import { importFxCsv, FxRateRow, backfillFxRatesForPortfolio, getFxPairsForPortfolio, FxBackfillSummary } from '../services/fxService';
 import { runGapFill, runLatestSync } from '../services/syncActionsService';
-import { detectFormat, importToDb, ImportReport, ImportTableName, validateAndNormalize } from '../services/importExportService';
+import { buildBackupPayload, detectFormat, importToDb, ImportReport, ImportTableName, validateAndNormalize } from '../services/importExportService';
 import { fetchAppsScriptPing, fetchAssetsMap, fetchMacro, applyAssetsMapToSettings, applyMacroRowsToDexie, syncFxRates, AppsScriptFxRow, APPS_SCRIPT_DISABLED_MESSAGE } from '../services/appsScriptService';
 import { getLastGapFillAt, getLastLatestSyncAt } from '../services/syncStatusService';
 import { checkProxyHealth } from '../services/apiHealthService';
@@ -56,6 +56,23 @@ const formatLocalDateTime = (iso?: string | null) => {
   const parsed = new Date(iso);
   if (Number.isNaN(parsed.getTime())) return iso;
   return parsed.toLocaleString('it-IT');
+};
+
+const describeWriteResult = (created = 0, updated = 0, unchanged = 0) => {
+  const parts: string[] = [];
+  if (created > 0) parts.push(`${created} nuove`);
+  if (updated > 0) parts.push(`${updated} aggiornate`);
+  if (unchanged > 0) parts.push(`${unchanged} invariate`);
+  return parts.length ? parts.join(', ') : 'nessuna riga scritta';
+};
+
+const summarizeFailedLatestTickers = (failedTickers: { ticker: string; reason: string }[], limit = 3) => {
+  if (!failedTickers.length) return '';
+  const sample = failedTickers
+    .slice(0, limit)
+    .map(item => `${item.ticker}: ${item.reason}`)
+    .join('; ');
+  return failedTickers.length > limit ? `${sample} (+${failedTickers.length - limit} altri)` : sample;
 };
 
 export const Settings: React.FC = () => {
@@ -220,7 +237,13 @@ export const Settings: React.FC = () => {
     transactions: 'Transazioni',
     prices: 'Prezzi',
     fxRates: 'FX',
-    macro: 'Macro'
+    macro: 'Macro',
+    inflationRates: 'Inflazione mensile',
+    inflationAnnualRates: 'Inflazione annuale',
+    rebalancePlans: 'Piani rebalance',
+    backtestImports: 'Backtest import',
+    backtestImportPrices: 'Prezzi backtest import',
+    backtestScenarios: 'Scenari backtest'
   };
 
   useEffect(() => {
@@ -855,11 +878,14 @@ export const Settings: React.FC = () => {
       const sheetCount = outcome.updatedSheetTickers.length;
       const fallbackCount = outcome.updatedFallbackTickers.length;
       const missing = outcome.missingTickers;
-      const updatedLabel = `Aggiornato: ${sheetCount} (Sheet)${fallbackCount ? ` + ${fallbackCount} (EODHD fallback)` : ''}`;
+      const updatedLabel = `Latest scritti: ${sheetCount} da Sheet${fallbackCount ? ` + ${fallbackCount} via fallback EODHD` : ''}`;
       const missingLabel = missing.length
-        ? `Mancanti: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? '...' : ''}`
-        : 'Mancanti: -';
-      const summary = `${updatedLabel}. ${missingLabel}`;
+        ? `Ticker senza latest: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? '...' : ''}`
+        : 'Ticker senza latest: nessuno';
+      const errorLabel = outcome.priceResult.failedTickers.length
+        ? `Errori: ${summarizeFailedLatestTickers(outcome.priceResult.failedTickers)}.`
+        : '';
+      const summary = `${updatedLabel}. ${missingLabel}.${errorLabel ? ` ${errorLabel}` : ''} Storico/gap non toccati.`;
       setLatestSyncDetail(summary);
       let fxNotice: { status: 'ok' | 'warn' | 'err'; message: string } | null = null;
       if (outcome.fx?.disabled) {
@@ -875,20 +901,20 @@ export const Settings: React.FC = () => {
       }
       await loadFxLastDates();
       const fxSuffix = fxNotice && fxNotice.status !== 'ok' ? `\n${fxNotice.message}` : '';
+      const resultMessage = outcome.priceResult.message ? `\n${outcome.priceResult.message}` : '';
       if (outcome.priceResult.status === 'ok') {
-        alert(`Prezzi aggiornati con successo!${fxSuffix}\n${summary}`);
+        alert(`Latest sync completato.${fxSuffix}\n${summary}`);
       } else if (outcome.priceResult.status === 'partial') {
-        alert(`Aggiornamento parziale: alcuni ticker non sono stati aggiornati.${fxSuffix}\n${summary}`);
+        alert(`Latest sync parziale.${fxSuffix}\n${summary}${resultMessage}`);
       } else if (outcome.priceResult.status === 'quota_exhausted') {
-        alert(`Quota EODHD esaurita (402). Sync interrotta per evitare chiamate inutili.${fxSuffix}`);
+        alert(`Latest sync interrotto: quota EODHD esaurita (402).${fxSuffix}${resultMessage}`);
       } else if (outcome.priceResult.status === 'proxy_unreachable') {
-        alert(`${outcome.priceResult.message || 'Proxy /api non raggiungibile.'}${fxSuffix}`);
+        alert(`Latest sync fallito: ${outcome.priceResult.message || 'Proxy /api non raggiungibile.'}${fxSuffix}`);
       } else {
-        const reason = outcome.priceResult.message ? ` ${outcome.priceResult.message}` : '';
-        alert(`Aggiornamento fallito: nessun ticker aggiornato.${reason}${fxSuffix}`);
+        alert(`Latest sync fallito.${fxSuffix}${resultMessage ? resultMessage : '\nNessun ticker aggiornato.'}`);
       }
     } catch (e: any) {
-      alert(e?.message || 'Errore aggiornamento prezzi.');
+      alert(e?.message || 'Errore latest sync.');
     } finally {
       setLoading(false);
     }
@@ -910,9 +936,9 @@ export const Settings: React.FC = () => {
       }
       setBudgetStatus(getEodhdDailyBudgetStatus());
       if (outcome.ok) {
-        setGapFillAllStatus('Gap-fill completato.');
+        setGapFillAllStatus('Storico/gap-fill completato.');
       } else {
-        setGapFillAllStatus(outcome.priceResult.message || 'Gap-fill non completato');
+        setGapFillAllStatus(outcome.priceResult.message || 'Storico/gap-fill non completato');
       }
     } catch (e: any) {
       setGapFillAllStatus(e?.message || 'Errore gap-fill');
@@ -943,16 +969,16 @@ export const Settings: React.FC = () => {
       await loadCoverage();
       setBudgetStatus(getEodhdDailyBudgetStatus());
       if (result.status === 'quota_exhausted') {
-        setBfStatus('Quota EODHD esaurita (402). Backfill interrotto.');
-        alert('Quota EODHD esaurita (402). Backfill interrotto.');
+        setBfStatus('Backfill storico interrotto: quota EODHD esaurita (402).');
+        alert('Backfill storico interrotto: quota EODHD esaurita (402).');
       } else if (result.status === 'proxy_unreachable') {
         setBfStatus(result.message || 'Proxy /api non raggiungibile.');
         alert(result.message || 'Proxy /api non raggiungibile.');
       } else if (result.status === 'ok') {
         if (result.message) setBfStatus(result.message);
-        alert('Storico aggiornato');
+        alert('Backfill storico completato.');
       } else {
-        alert(result.message || 'Backfill non completato');
+        alert(result.message || 'Backfill storico non completato');
       }
     } catch (e: any) {
       alert(e?.message || e);
@@ -988,7 +1014,7 @@ export const Settings: React.FC = () => {
       setFxBackfillSummary(result);
       await loadFxLastDates();
       if (result.status === 'quota_exhausted') {
-        setFxBackfillStatus('Quota EODHD esaurita (402). Backfill FX interrotto.');
+        setFxBackfillStatus('Backfill FX interrotto: quota EODHD esaurita (402).');
       } else if (result.status === 'proxy_unreachable') {
         setFxBackfillStatus(result.message || 'Proxy /api non raggiungibile.');
       } else if (result.status === 'error') {
@@ -1054,7 +1080,7 @@ export const Settings: React.FC = () => {
         gapError: result.message
       });
       if (result.status === 'quota_exhausted') {
-        setAutoGapStatus('Quota EODHD esaurita (402). Gap-fill interrotto.');
+        setAutoGapStatus('Gap-fill interrotto: quota EODHD esaurita (402).');
       } else if (result.status === 'proxy_unreachable') {
         setAutoGapStatus(result.message || 'Proxy /api non raggiungibile.');
       } else if (result.status === 'error') {
@@ -1077,16 +1103,7 @@ export const Settings: React.FC = () => {
   };
 
   const handleExport = async () => {
-    const payload = {
-      portfolios: await db.portfolios.toArray(),
-      settings: await db.settings.toArray(),
-      instruments: await db.instruments.toArray(),
-      transactions: await db.transactions.toArray(),
-      prices: await db.prices.toArray(),
-      macro: await db.macro.toArray(),
-      inflationRates: await db.inflationRates.toArray(),
-      inflationAnnualRates: await db.inflationAnnualRates.toArray()
-    };
+    const payload = await buildBackupPayload();
 
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -1130,13 +1147,18 @@ export const Settings: React.FC = () => {
       setImportErrors(allErrors);
 
       const discarded = Object.values(result.report.tables).some(t => t.discarded > 0);
+      const created = Object.values(result.report.tables).reduce((sum, table) => sum + (table.created || 0), 0);
+      const updated = Object.values(result.report.tables).reduce((sum, table) => sum + (table.updated || 0), 0);
+      const unchanged = Object.values(result.report.tables).reduce((sum, table) => sum + (table.unchanged || 0), 0);
+      const duplicateCleanup = Object.values(result.report.tables).reduce((sum, table) => sum + (table.deletedDuplicates || 0), 0);
+      const writeSummary = describeWriteResult(created, updated, unchanged);
       const hasErrors = allErrors.length > 0;
       if (hasErrors) {
-        setImportStatus('Import completato con errori.');
+        setImportStatus(`Import completato con errori: ${writeSummary}.${duplicateCleanup ? ` Duplicati rimossi: ${duplicateCleanup}.` : ''}`);
       } else if (discarded) {
-        setImportStatus('Import parziale: alcuni record scartati.');
+        setImportStatus(`Import parziale: ${writeSummary}. Alcuni record sono stati scartati.${duplicateCleanup ? ` Duplicati rimossi: ${duplicateCleanup}.` : ''}`);
       } else {
-        setImportStatus('Import completato.');
+        setImportStatus(`Import completato: ${writeSummary}.${duplicateCleanup ? ` Duplicati rimossi: ${duplicateCleanup}.` : ''}`);
       }
     } catch (err: any) {
       console.error('Import error', err);
@@ -1608,7 +1630,7 @@ export const Settings: React.FC = () => {
           ? 'Quota'
           : syncSummary.status === 'proxy_unreachable'
             ? 'Proxy'
-            : 'Errore'
+            : 'Fallito'
     : '';
   const syncStatusClass = syncSummary
     ? syncSummary.status === 'ok'
@@ -1962,7 +1984,7 @@ export const Settings: React.FC = () => {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
           <div className="ui-panel-subtle p-4 space-y-2">
             <div className="text-[11px] uppercase font-bold text-slate-500">Aggiorna latest</div>
-            <div className="text-[11px] text-slate-500">Prezzi + FX (Apps Script se attivo).</div>
+            <div className="text-[11px] text-slate-500">Scrive solo latest giornalieri. Non completa lo storico.</div>
             <button
               onClick={handleSync}
               disabled={loading}
@@ -1976,7 +1998,7 @@ export const Settings: React.FC = () => {
               ) : (
                 <>
                   <span className="material-symbols-outlined text-sm">sync</span>
-                  Aggiorna latest
+                  Latest sync
                 </>
               )}
             </button>
@@ -1994,7 +2016,7 @@ export const Settings: React.FC = () => {
           </div>
           <div className="ui-panel-subtle p-4 space-y-2">
             <div className="text-[11px] uppercase font-bold text-slate-500">Completa storico</div>
-            <div className="text-[11px] text-slate-500">Gap-fill prezzi + FX dove necessario.</div>
+            <div className="text-[11px] text-slate-500">Colma gap e code stale su prezzi + FX dove necessario.</div>
             <button
               type="button"
               onClick={handleGapFillAll}
@@ -2003,7 +2025,7 @@ export const Settings: React.FC = () => {
               className="ui-btn-secondary px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-50 transition shadow-sm flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
             >
               <span className="material-symbols-outlined text-sm">timeline</span>
-              {gapFillAllRunning ? 'Completando...' : 'Completa storico'}
+              {gapFillAllRunning ? 'Completando...' : 'Gap-fill storico'}
             </button>
             <div className="text-[11px] text-slate-500">
               Gap-fill (processo): {lastGapFillAt ? new Date(lastGapFillAt).toLocaleString('it-IT') : 'mai'}
@@ -2769,7 +2791,13 @@ export const Settings: React.FC = () => {
                             {importTableLabels[table as ImportTableName] || table}
                           </div>
                           <div className="text-[11px] text-slate-600">
-                            Totali: {info.total} ? Importati: {info.imported} ? Scartati: {info.discarded}
+                            Totali: {info.total} · Valide: {info.imported} · Scartate: {info.discarded}
+                            {(info.created || info.updated || info.unchanged || info.deletedDuplicates) ? (
+                              <span>
+                                {' '}· Nuove: {info.created || 0} · Aggiornate: {info.updated || 0} · Invariate: {info.unchanged || 0}
+                                {info.deletedDuplicates ? ` · Duplicati rimossi: ${info.deletedDuplicates}` : ''}
+                              </span>
+                            ) : null}
                           </div>
                           {info.error && (
                             <div className="text-[11px] text-red-700">Errore tabella: {info.error}</div>

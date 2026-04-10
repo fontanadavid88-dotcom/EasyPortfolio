@@ -9,6 +9,7 @@ import { PRICE_GAP_DAYS } from '../services/constants';
 import { fillMissingPrices } from '../services/priceBackfill';
 import { buildNavSeriesDetailed, calculateHoldings, getCanonicalTicker, getValuationDateForHoldings } from '../services/financeUtils';
 import { queryFxForPairsRange, queryLatestFxForPairs, queryLatestPricesForTickers, queryPriceBoundsForTickers, queryPricesForTickersRange } from '../services/dbQueries';
+import { upsertFxRowsByNaturalKey, upsertPriceRowsByNaturalKey } from '../services/dataWriteService';
 import { downsampleSeries } from '../services/chartUtils';
 import { addDaysYmd, subDaysYmd, diffDaysYmd } from '../services/dateUtils';
 import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
@@ -65,8 +66,32 @@ export const Data: React.FC = () => {
   const [importErrors, setImportErrors] = useState<string[]>([]);
   const [fxImportPreview, setFxImportPreview] = useState<FxRatePoint[]>([]);
   const [fxImportErrors, setFxImportErrors] = useState<string[]>([]);
+  const [priceCurrencyRepairMode, setPriceCurrencyRepairMode] = useState(false);
+  const [priceCurrencyRepairTarget, setPriceCurrencyRepairTarget] = useState<Currency | ''>('');
+  const [priceCurrencyRepairBusy, setPriceCurrencyRepairBusy] = useState(false);
+  const [priceCurrencyRepairFeedback, setPriceCurrencyRepairFeedback] = useState<{
+    tone: 'success' | 'warn';
+    lines: string[];
+  } | null>(null);
+  const [priceRepairPreview, setPriceRepairPreview] = useState<PricePoint[]>([]);
+  const [priceRepairErrors, setPriceRepairErrors] = useState<string[]>([]);
+  const [priceRepairWarnings, setPriceRepairWarnings] = useState<string[]>([]);
+  const [priceRepairMode, setPriceRepairMode] = useState<'merge' | 'replace'>('merge');
+  const [priceRepairMeta, setPriceRepairMeta] = useState<{
+    ticker: string;
+    currencyUsed: Currency;
+    firstDate?: string;
+    lastDate?: string;
+    validRows: number;
+  } | null>(null);
+  const [manualPriceDate, setManualPriceDate] = useState('');
+  const [manualPriceClose, setManualPriceClose] = useState('');
+  const [manualPriceCurrency, setManualPriceCurrency] = useState<Currency | ''>('');
+  const [manualPriceBusy, setManualPriceBusy] = useState(false);
+  const [manualPriceFeedback, setManualPriceFeedback] = useState<{ tone: 'success' | 'warn' | 'error'; message: string } | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const fxImportInputRef = useRef<HTMLInputElement | null>(null);
+  const priceRepairInputRef = useRef<HTMLInputElement | null>(null);
 
   const instruments = useLiveQuery(
     () => db.instruments.where('portfolioId').equals(currentPortfolioId).toArray(),
@@ -503,9 +528,58 @@ export const Data: React.FC = () => {
     setShowAllFxRows(false);
   }, [selectedFxPair]);
 
+  useEffect(() => {
+    setPriceCurrencyRepairMode(false);
+    setPriceCurrencyRepairTarget('');
+    setPriceCurrencyRepairBusy(false);
+    setPriceCurrencyRepairFeedback(null);
+    setPriceRepairPreview([]);
+    setPriceRepairErrors([]);
+    setPriceRepairWarnings([]);
+    setPriceRepairMeta(null);
+    setPriceRepairMode('merge');
+    setManualPriceDate('');
+    setManualPriceClose('');
+    setManualPriceCurrency('');
+    setManualPriceBusy(false);
+    setManualPriceFeedback(null);
+  }, [selectedTicker]);
+
   const filteredPrices = useMemo(() => {
     return selectedPrices || [];
   }, [selectedPrices]);
+
+  const priceSeriesCurrencySet = useMemo(() => {
+    const set = new Set<string>();
+    (filteredPrices || []).forEach(row => {
+      if (row.currency) set.add(String(row.currency));
+    });
+    return set;
+  }, [filteredPrices]);
+
+  const priceSeriesCurrency = useMemo(() => {
+    if (priceSeriesCurrencySet.size === 1) {
+      return Array.from(priceSeriesCurrencySet.values())[0];
+    }
+    return undefined;
+  }, [priceSeriesCurrencySet]);
+
+  const priceSeriesCurrencyLabel = useMemo(() => {
+    if (priceSeriesCurrency) return priceSeriesCurrency;
+    if (priceSeriesCurrencySet.size > 1) return 'VARIE';
+    return 'N/D';
+  }, [priceSeriesCurrency, priceSeriesCurrencySet]);
+
+  const expectedManualCurrency = useMemo(
+    () => (priceSeriesCurrency as Currency) || selectedCurrency || Currency.CHF,
+    [priceSeriesCurrency, selectedCurrency]
+  );
+
+  useEffect(() => {
+    if (!manualPriceCurrency) {
+      setManualPriceCurrency(expectedManualCurrency);
+    }
+  }, [expectedManualCurrency, manualPriceCurrency]);
 
   const warningsFromDate = useMemo(() => {
     if (showPreTransactions) return '';
@@ -532,6 +606,48 @@ export const Data: React.FC = () => {
       visiblePriceIssues: analysis.issues.filter(issue => !issue.date || issue.date >= warningsFromDate)
     };
   }, [filteredPrices, selectedInstrument, warningsFromDate]);
+
+  const hasSeriesCurrencyMismatch = useMemo(
+    () => priceAnalysis.issues.some(issue => issue.type === 'currencyMismatch'),
+    [priceAnalysis.issues]
+  );
+
+  const hasInstrumentCurrencyMismatch = useMemo(() => {
+    if (!selectedCurrency || !priceSeriesCurrency) return false;
+    return selectedCurrency !== priceSeriesCurrency;
+  }, [selectedCurrency, priceSeriesCurrency]);
+
+  const showPriceCurrencyRepairAction = useMemo(() => {
+    if (!selectedTicker || !hasPriceData) return false;
+    return hasSeriesCurrencyMismatch || hasInstrumentCurrencyMismatch;
+  }, [selectedTicker, hasPriceData, hasSeriesCurrencyMismatch, hasInstrumentCurrencyMismatch]);
+
+  const showPriceCurrencyRepairPanel = useMemo(() => {
+    if (!selectedTicker || !hasPriceData) return false;
+    return showPriceCurrencyRepairAction || priceCurrencyRepairMode || Boolean(priceCurrencyRepairFeedback);
+  }, [selectedTicker, hasPriceData, showPriceCurrencyRepairAction, priceCurrencyRepairMode, priceCurrencyRepairFeedback]);
+
+  const manualCurrencyWarning = useMemo(() => {
+    if (!manualPriceCurrency) return '';
+    if (priceSeriesCurrency && manualPriceCurrency !== priceSeriesCurrency) {
+      return `Currency diversa dalla serie (${priceSeriesCurrency}). Nessuna conversione applicata.`;
+    }
+    if (!priceSeriesCurrency && selectedCurrency && manualPriceCurrency !== selectedCurrency) {
+      return `Currency diversa da quella attesa (${selectedCurrency}). Nessuna conversione applicata.`;
+    }
+    return '';
+  }, [manualPriceCurrency, priceSeriesCurrency, selectedCurrency]);
+
+  const manualDateValid = useMemo(() => isValidDate(manualPriceDate), [manualPriceDate]);
+  const manualCloseValue = useMemo(() => Number(manualPriceClose), [manualPriceClose]);
+  const manualCloseValid = useMemo(
+    () => Number.isFinite(manualCloseValue) && manualCloseValue > 0,
+    [manualCloseValue]
+  );
+  const manualCanSave = useMemo(
+    () => Boolean(selectedTicker && manualDateValid && manualCloseValid && manualPriceCurrency),
+    [selectedTicker, manualDateValid, manualCloseValid, manualPriceCurrency]
+  );
   const selectedPriceLatestDate = selectedTickerBounds?.lastPriceDate || '';
   const selectedEffectiveDate = useMemo(() => {
     if (!selectedTicker || !selectedPriceLatestDate) return '';
@@ -590,6 +706,12 @@ export const Data: React.FC = () => {
       .map(p => ({ date: p.date, close: p.close }));
   }, [filteredPrices]);
 
+  const priceTableRows = useMemo(() => {
+    return filteredPrices
+      .slice()
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }, [filteredPrices]);
+
   const fxChartData = useMemo(() => {
     return fxFiltered
       .slice()
@@ -635,6 +757,82 @@ export const Data: React.FC = () => {
       .modify({ currency: next });
   };
 
+  const openPriceCurrencyRepair = () => {
+    setPriceCurrencyRepairFeedback(null);
+    setPriceCurrencyRepairMode(true);
+    if (!priceCurrencyRepairTarget) {
+      const fallback = selectedCurrency || (priceSeriesCurrency as Currency) || Currency.CHF;
+      setPriceCurrencyRepairTarget(fallback);
+    }
+  };
+
+  const cancelPriceCurrencyRepair = () => {
+    setPriceCurrencyRepairMode(false);
+  };
+
+  const confirmPriceCurrencyRepair = async () => {
+    if (!selectedTicker) return;
+    const target = priceCurrencyRepairTarget as Currency;
+    if (!target) return;
+    setPriceCurrencyRepairBusy(true);
+    setPriceCurrencyRepairFeedback(null);
+    try {
+      const rows = await db.prices
+        .where('portfolioId')
+        .equals(currentPortfolioId)
+        .and(p => p.ticker === selectedTicker)
+        .toArray();
+
+      if (!rows.length) {
+        setPriceCurrencyRepairFeedback({
+          tone: 'warn',
+          lines: [`Nessuna riga prezzo trovata per ${selectedTicker}.`]
+        });
+        return;
+      }
+
+      const currencySet = new Set<string>();
+      rows.forEach(row => {
+        if (row.currency) currencySet.add(String(row.currency));
+      });
+      const currentLabel = currencySet.size === 1 ? Array.from(currencySet.values())[0] : 'VARIE';
+
+      if (currencySet.size === 1 && currencySet.has(target)) {
+        setPriceCurrencyRepairFeedback({
+          tone: 'warn',
+          lines: [`Valuta serie gia impostata a ${target}.`, 'Nessun aggiornamento eseguito.']
+        });
+        return;
+      }
+
+      const ok = window.confirm(
+        `Questa azione corregge solo il metadato valuta della serie storica. `
+        + `I prezzi numerici non verranno convertiti. `
+        + `Usare solo se i valori sono gia nella valuta corretta.\n\n`
+        + `Valuta attuale: ${currentLabel}\nNuova valuta: ${target}\n\nConfermi l'aggiornamento?`
+      );
+      if (!ok) return;
+
+      const updated = await db.prices
+        .where('portfolioId')
+        .equals(currentPortfolioId)
+        .and(p => p.ticker === selectedTicker)
+        .modify({ currency: target });
+
+      setPriceCurrencyRepairFeedback({
+        tone: 'success',
+        lines: [
+          `Valuta serie corretta da ${currentLabel} a ${target}`,
+          `Righe aggiornate: ${updated}`,
+          'Nessuna conversione numerica applicata'
+        ]
+      });
+      setPriceCurrencyRepairMode(false);
+    } finally {
+      setPriceCurrencyRepairBusy(false);
+    }
+  };
+
   const parsePriceImport = async (file: File) => {
     const text = await file.text();
     const errors: string[] = [];
@@ -678,6 +876,99 @@ export const Data: React.FC = () => {
     });
     const deduped = dedupeByKey(rows, row => `${row.ticker}|${row.date}`);
     return { rows: deduped, errors };
+  };
+
+  const parsePriceRepairCsv = async (file: File) => {
+    const text = await file.text();
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const expectedCurrency = (priceSeriesCurrency as Currency) || selectedCurrency || Currency.CHF;
+
+    if (!text.trim()) {
+      return { rows: [] as PricePoint[], errors: ['CSV vuoto o non valido.'], warnings, currencyUsed: expectedCurrency };
+    }
+
+    if (text.trim().startsWith('{') || text.trim().startsWith('[')) {
+      return { rows: [] as PricePoint[], errors: ['Formato non supportato: usa CSV con date/close.'], warnings, currencyUsed: expectedCurrency };
+    }
+
+    const lines = text.trim().split(/\r?\n/);
+    const firstLine = (lines[0] || '').toLowerCase();
+    const hasHeader = firstLine.includes('date') && firstLine.includes('close');
+    const dataLines = hasHeader ? lines.slice(1) : lines;
+    if (dataLines.length === 0) {
+      return { rows: [] as PricePoint[], errors: ['CSV senza righe dati.'], warnings, currencyUsed: expectedCurrency };
+    }
+
+    const rawRows: { date: string; close: number; currency?: string; ticker?: string }[] = [];
+    dataLines.forEach((line, idx) => {
+      if (!line.trim()) return;
+      const parts = line.split(',').map(p => p.trim());
+      const date = parts[0];
+      const close = Number(parts[1]);
+      const currency = parts[2] || '';
+      const ticker = parts[3] || '';
+      const rowNumber = hasHeader ? idx + 2 : idx + 1;
+      if (!isValidDate(date)) errors.push(`Riga ${rowNumber}: data non valida`);
+      if (!Number.isFinite(close) || close <= 0) errors.push(`Riga ${rowNumber}: close non valido`);
+      if (isValidDate(date) && Number.isFinite(close) && close > 0) {
+        rawRows.push({ date, close, currency, ticker });
+      }
+    });
+
+    if (!rawRows.length) {
+      if (errors.length === 0) errors.push('Nessuna riga valida trovata nel CSV.');
+      return { rows: [] as PricePoint[], errors, warnings, currencyUsed: expectedCurrency };
+    }
+
+    const csvTickerSet = new Set(rawRows.map(r => r.ticker).filter(Boolean));
+    const csvCurrencySet = new Set(rawRows.map(r => r.currency).filter(Boolean));
+
+    if (csvTickerSet.size > 0) {
+      const tickers = Array.from(csvTickerSet.values()).join(', ');
+      if (csvTickerSet.size > 1) {
+        warnings.push(`CSV contiene ticker multipli: ${tickers}.`);
+      }
+      if (!Array.from(csvTickerSet.values()).every(t => t === selectedTicker)) {
+        warnings.push(`Ticker CSV (${tickers}) diverso dal ticker selezionato ${selectedTicker}. I dati saranno importati per ${selectedTicker}.`);
+      }
+    }
+
+    let currencyUsed: Currency = expectedCurrency;
+
+    if (csvCurrencySet.size === 1) {
+      const csvCurrency = Array.from(csvCurrencySet.values())[0] as Currency;
+      currencyUsed = csvCurrency;
+      if (!Object.values(Currency).includes(csvCurrency)) {
+        errors.push(`Currency non supportata nel CSV: ${csvCurrency}.`);
+      }
+      if (expectedCurrency && csvCurrency !== expectedCurrency) {
+        warnings.push(`Currency CSV (${csvCurrency}) diversa dalla currency attesa (${expectedCurrency}). Nessuna conversione applicata.`);
+      }
+    } else if (csvCurrencySet.size > 1) {
+      const list = Array.from(csvCurrencySet.values()).join(', ');
+      warnings.push(`CSV contiene piu valute (${list}). Verrà usata la currency attesa (${expectedCurrency}).`);
+    } else {
+      warnings.push(`Currency non presente nel CSV. Verrà usata la currency attesa (${expectedCurrency}).`);
+    }
+
+    const dedupedByDate = dedupeByKey(rawRows, row => row.date)
+      .sort((a, b) => a.date.localeCompare(b.date));
+    if (dedupedByDate.length < rawRows.length) {
+      warnings.push(`Date duplicate: ${rawRows.length - dedupedByDate.length}. Tenuta l'ultima riga valida per data.`);
+    }
+
+    const rows: PricePoint[] = dedupedByDate.map(row => ({
+      ticker: selectedTicker,
+      date: row.date,
+      close: row.close,
+      currency: currencyUsed,
+      portfolioId: currentPortfolioId
+    } as PricePoint));
+
+    const firstDate = rows[0]?.date;
+    const lastDate = rows[rows.length - 1]?.date;
+    return { rows, errors, warnings, currencyUsed, firstDate, lastDate };
   };
 
   const parseFxImport = async (file: File) => {
@@ -741,18 +1032,191 @@ export const Data: React.FC = () => {
     setFxImportErrors(errors);
   };
 
+  const handlePriceRepairImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!selectedTicker) {
+      setPriceRepairPreview([]);
+      setPriceRepairErrors(['Seleziona un ticker prima di importare.']);
+      setPriceRepairWarnings([]);
+      setPriceRepairMeta(null);
+      return;
+    }
+    const result = await parsePriceRepairCsv(file);
+    setPriceRepairPreview(result.rows);
+    setPriceRepairErrors(result.errors);
+    setPriceRepairWarnings(result.warnings);
+    setPriceRepairMeta({
+      ticker: selectedTicker,
+      currencyUsed: result.currencyUsed as Currency,
+      firstDate: result.firstDate,
+      lastDate: result.lastDate,
+      validRows: result.rows.length
+    });
+  };
+
+  const clearPriceRepairPreview = () => {
+    setPriceRepairPreview([]);
+    setPriceRepairErrors([]);
+    setPriceRepairWarnings([]);
+    setPriceRepairMeta(null);
+  };
+
   const confirmPriceImport = async () => {
     if (!importPreview.length) return;
-    await db.prices.bulkPut(importPreview.map(p => ({ ...p, portfolioId: currentPortfolioId })));
+    const ok = window.confirm(`Import prezzi: ${importPreview.length} righe in merge sul portfolio corrente. Continuare?`);
+    if (!ok) return;
+    const result = await upsertPriceRowsByNaturalKey(importPreview.map(p => ({ ...p, portfolioId: currentPortfolioId })));
     setImportPreview([]);
     setImportErrors([]);
+    window.alert(`Import prezzi completato: ${result.created} nuove, ${result.updated} aggiornate, ${result.unchanged} invariate.${result.deletedDuplicates ? ` Duplicati rimossi: ${result.deletedDuplicates}.` : ''}`);
   };
 
   const confirmFxImport = async () => {
     if (!fxImportPreview.length) return;
-    await db.fxRates.bulkPut(fxImportPreview);
+    const ok = window.confirm(`Import FX: ${fxImportPreview.length} righe in merge. Continuare?`);
+    if (!ok) return;
+    const result = await upsertFxRowsByNaturalKey(fxImportPreview);
     setFxImportPreview([]);
     setFxImportErrors([]);
+    window.alert(`Import FX completato: ${result.created} nuove, ${result.updated} aggiornate, ${result.unchanged} invariate.${result.deletedDuplicates ? ` Duplicati rimossi: ${result.deletedDuplicates}.` : ''}`);
+  };
+
+  const confirmPriceRepairImport = async () => {
+    if (!selectedTicker) return;
+    if (!priceRepairPreview.length) return;
+    if (priceRepairErrors.length > 0) return;
+    if (!priceRepairMeta) return;
+
+    const warningBlock = priceRepairWarnings.length
+      ? `\n\nWarning:\n- ${priceRepairWarnings.join('\n- ')}`
+      : '';
+
+    const baseMessage = [
+      `Ticker target: ${selectedTicker}`,
+      `Modalita: ${priceRepairMode === 'replace' ? 'sostituzione completa' : 'merge/override'}`,
+      `Righe valide: ${priceRepairMeta.validRows}`,
+      `Range: ${priceRepairMeta.firstDate || 'N/D'} -> ${priceRepairMeta.lastDate || 'N/D'}`,
+      `Currency usata: ${priceRepairMeta.currencyUsed}`,
+      'Nessuna conversione numerica applicata.'
+    ].join('\n');
+
+    const confirmMessage = priceRepairMode === 'replace'
+      ? `Stai per sostituire interamente lo storico locale del ticker selezionato. Operazione non reversibile.\n\n${baseMessage}${warningBlock}`
+      : `Confermi l'aggiornamento delle sole date presenti nel CSV?\n\n${baseMessage}${warningBlock}`;
+
+    const ok = window.confirm(confirmMessage);
+    if (!ok) return;
+
+    const payload = priceRepairPreview.map(row => ({
+      ...row,
+      ticker: selectedTicker,
+      currency: priceRepairMeta.currencyUsed,
+      portfolioId: currentPortfolioId
+    }));
+
+    if (priceRepairMode === 'replace') {
+      await db.prices
+        .where('portfolioId')
+        .equals(currentPortfolioId)
+        .and(p => p.ticker === selectedTicker)
+        .delete();
+      const result = await upsertPriceRowsByNaturalKey(payload);
+      window.alert(`Riparazione storico completata: ${result.created} nuove, ${result.updated} aggiornate, ${result.unchanged} invariate.`);
+    } else {
+      const result = await upsertPriceRowsByNaturalKey(payload);
+      window.alert(`Riparazione storico completata: ${result.created} nuove, ${result.updated} aggiornate, ${result.unchanged} invariate.${result.deletedDuplicates ? ` Duplicati rimossi: ${result.deletedDuplicates}.` : ''}`);
+    }
+
+    clearPriceRepairPreview();
+  };
+
+  const handleManualPriceSelect = (row: PricePoint) => {
+    setManualPriceDate(row.date);
+    setManualPriceClose(String(row.close));
+    setManualPriceCurrency(row.currency as Currency);
+    setManualPriceFeedback(null);
+  };
+
+  const saveManualPriceRow = async () => {
+    if (!selectedTicker) return;
+    if (!manualDateValid || !manualCloseValid || !manualPriceCurrency) {
+      setManualPriceFeedback({ tone: 'error', message: 'Data o close non validi. Controlla i campi richiesti.' });
+      return;
+    }
+
+    const ok = window.confirm(
+      'Stai modificando manualmente lo storico locale del ticker selezionato. Nessuna conversione numerica verra applicata.'
+    );
+    if (!ok) return;
+
+    setManualPriceBusy(true);
+    setManualPriceFeedback(null);
+    try {
+      const existing = await db.prices
+        .where('portfolioId')
+        .equals(currentPortfolioId)
+        .and(p => p.ticker === selectedTicker && p.date === manualPriceDate)
+        .first();
+
+      if (existing) {
+        const sameClose = Number(existing.close) === manualCloseValue;
+        const sameCurrency = String(existing.currency) === String(manualPriceCurrency);
+        if (sameClose && sameCurrency) {
+          setManualPriceFeedback({ tone: 'warn', message: 'Nessuna modifica: riga identica gia presente.' });
+          return;
+        }
+        await upsertPriceRowsByNaturalKey([{
+          ticker: selectedTicker,
+          date: manualPriceDate,
+          close: manualCloseValue,
+          currency: manualPriceCurrency,
+          portfolioId: currentPortfolioId
+        } as PricePoint]);
+        setManualPriceFeedback({ tone: 'success', message: 'Riga aggiornata con successo.' });
+      } else {
+        await upsertPriceRowsByNaturalKey([{
+          ticker: selectedTicker,
+          date: manualPriceDate,
+          close: manualCloseValue,
+          currency: manualPriceCurrency,
+          portfolioId: currentPortfolioId
+        } as PricePoint]);
+        setManualPriceFeedback({ tone: 'success', message: 'Riga inserita con successo.' });
+      }
+    } finally {
+      setManualPriceBusy(false);
+    }
+  };
+
+  const deleteManualPriceRow = async () => {
+    if (!selectedTicker) return;
+    if (!manualDateValid) {
+      setManualPriceFeedback({ tone: 'error', message: 'Data non valida. Seleziona una data esistente.' });
+      return;
+    }
+    const ok = window.confirm(
+      'Stai eliminando una riga storica locale del ticker selezionato. Operazione non reversibile.'
+    );
+    if (!ok) return;
+
+    setManualPriceBusy(true);
+    setManualPriceFeedback(null);
+    try {
+      const existing = await db.prices
+        .where('portfolioId')
+        .equals(currentPortfolioId)
+        .and(p => p.ticker === selectedTicker && p.date === manualPriceDate)
+        .first();
+      if (!existing?.id) {
+        setManualPriceFeedback({ tone: 'warn', message: 'Riga non trovata per la data selezionata.' });
+        return;
+      }
+      await db.prices.delete(existing.id);
+      setManualPriceFeedback({ tone: 'success', message: 'Riga eliminata con successo.' });
+    } finally {
+      setManualPriceBusy(false);
+    }
   };
 
   const removeDuplicatePrices = async () => {
@@ -1333,6 +1797,19 @@ export const Data: React.FC = () => {
             </button>
             <button
               type="button"
+              onClick={() => priceRepairInputRef.current?.click()}
+              className={clsx(
+                'px-3 py-2 rounded-lg text-xs font-bold border',
+                selectedTicker
+                  ? 'bg-amber-50 text-amber-700 border-amber-200'
+                  : 'bg-slate-100 text-slate-400 border-borderSoft cursor-not-allowed'
+              )}
+              disabled={!selectedTicker}
+            >
+              Ripara storico da CSV
+            </button>
+            <button
+              type="button"
               onClick={async () => {
                 if (!selectedTicker) return;
                 const first = window.confirm(`Vuoi eliminare tutti i prezzi per ${selectedTicker}?`);
@@ -1358,6 +1835,7 @@ export const Data: React.FC = () => {
               Reset prezzi
             </button>
             <input ref={importInputRef} type="file" accept=".csv,.json" className="hidden" onChange={handlePriceImport} />
+            <input ref={priceRepairInputRef} type="file" accept=".csv" className="hidden" onChange={handlePriceRepairImport} />
           </div>
 
           {selectedTicker && (
@@ -1391,6 +1869,86 @@ export const Data: React.FC = () => {
                   {hasPriceData && (
                     <div className="mt-1 text-[11px] text-amber-600">
                       Currency bloccata: per cambiarla reimporta lo storico corretto.
+                    </div>
+                  )}
+                  {showPriceCurrencyRepairPanel && (
+                    <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800">
+                      {showPriceCurrencyRepairAction ? (
+                        <>
+                          <div className="font-semibold">Mismatch valuta rilevato</div>
+                          <div className="text-amber-700">
+                            Prezzi: <span className="font-semibold">{priceSeriesCurrencyLabel}</span>
+                            {selectedCurrency && (
+                              <span> · Strumento: <span className="font-semibold">{selectedCurrency}</span></span>
+                            )}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="font-semibold">Riparazione valuta serie</div>
+                      )}
+                      {priceCurrencyRepairMode && (
+                        <div className="mt-2 space-y-2">
+                          <div className="text-amber-700">
+                            Correzione metadato: nessuna conversione numerica.
+                          </div>
+                          <select
+                            value={String(priceCurrencyRepairTarget || '')}
+                            onChange={e => setPriceCurrencyRepairTarget(e.target.value as Currency)}
+                            className="w-full border border-amber-200 bg-white px-2 py-1 rounded text-[11px] font-semibold text-slate-700"
+                          >
+                            <option value="" disabled>Seleziona nuova valuta</option>
+                            {Object.values(Currency).map(cur => (
+                              <option key={cur} value={cur}>{cur}</option>
+                            ))}
+                          </select>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={confirmPriceCurrencyRepair}
+                              disabled={!priceCurrencyRepairTarget || priceCurrencyRepairBusy}
+                              className={clsx(
+                                'px-2.5 py-1 rounded text-[11px] font-bold',
+                                priceCurrencyRepairTarget && !priceCurrencyRepairBusy
+                                  ? 'bg-amber-700 text-white'
+                                  : 'bg-amber-100 text-amber-400 cursor-not-allowed'
+                              )}
+                            >
+                              Applica riparazione
+                            </button>
+                            <button
+                              type="button"
+                              onClick={cancelPriceCurrencyRepair}
+                              disabled={priceCurrencyRepairBusy}
+                              className="px-2.5 py-1 rounded text-[11px] font-bold bg-white text-amber-700 border border-amber-200"
+                            >
+                              Annulla
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {!priceCurrencyRepairMode && showPriceCurrencyRepairAction && (
+                        <button
+                          type="button"
+                          onClick={openPriceCurrencyRepair}
+                          className="mt-2 px-2.5 py-1 rounded bg-amber-600 text-white text-[11px] font-bold"
+                        >
+                          Correggi valuta serie
+                        </button>
+                      )}
+                      {priceCurrencyRepairFeedback && (
+                        <div
+                          className={clsx(
+                            'mt-2 rounded border px-2 py-1',
+                            priceCurrencyRepairFeedback.tone === 'success'
+                              ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                              : 'border-amber-200 bg-amber-100 text-amber-800'
+                          )}
+                        >
+                          {priceCurrencyRepairFeedback.lines.map((line, idx) => (
+                            <div key={`${line}-${idx}`}>{line}</div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1476,8 +2034,13 @@ export const Data: React.FC = () => {
                       </tr>
                     </thead>
                     <tbody>
-                      {priceChartData.slice(-40).map((row, idx) => (
-                        <tr key={`${row.date}-${idx}`}>
+                      {priceTableRows.slice(-40).map((row, idx) => (
+                        <tr
+                          key={`${row.date}-${idx}`}
+                          className="cursor-pointer hover:bg-slate-50"
+                          onClick={() => handleManualPriceSelect(row)}
+                          title="Clic per correggere questa riga"
+                        >
                           <td className="py-1">{row.date}</td>
                           <td className="py-1 text-right font-mono text-slate-800">{row.close}</td>
                         </tr>
@@ -1500,6 +2063,151 @@ export const Data: React.FC = () => {
                   >
                     Conferma import
                   </button>
+                </div>
+              )}
+              {(priceRepairPreview.length > 0 || priceRepairErrors.length > 0) && (
+                <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-3 text-xs">
+                  <div className="font-bold text-amber-800">Riparazione storico ticker da CSV (avanzato)</div>
+                  <div className="text-amber-700">Ticker target: {selectedTicker || 'N/D'}</div>
+                  <div className="text-amber-700">
+                    Modalita:
+                    <select
+                      value={priceRepairMode}
+                      onChange={e => setPriceRepairMode(e.target.value as 'merge' | 'replace')}
+                      className="ml-2 border border-amber-200 bg-white px-2 py-1 rounded text-xs font-semibold text-slate-700"
+                    >
+                      <option value="merge">Merge / override date CSV</option>
+                      <option value="replace">Sostituzione completa storico</option>
+                    </select>
+                  </div>
+                  <div className="text-amber-700">Righe valide: {priceRepairMeta?.validRows ?? 0}</div>
+                  <div className="text-amber-700">
+                    Range: {priceRepairMeta?.firstDate || 'N/D'} {'->'} {priceRepairMeta?.lastDate || 'N/D'}
+                  </div>
+                  <div className="text-amber-700">Currency usata: {priceRepairMeta?.currencyUsed || 'N/D'}</div>
+                  <div className="text-amber-700">Nessuna conversione numerica applicata.</div>
+                  {priceRepairWarnings.length > 0 && (
+                    <div className="text-amber-700 mt-1">Warning: {priceRepairWarnings.slice(0, 5).join(' | ')}</div>
+                  )}
+                  {priceRepairErrors.length > 0 && (
+                    <div className="text-red-700 mt-1">Errori: {priceRepairErrors.slice(0, 5).join(' | ')}</div>
+                  )}
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      onClick={confirmPriceRepairImport}
+                      disabled={priceRepairErrors.length > 0 || priceRepairPreview.length === 0}
+                      className={clsx(
+                        'px-3 py-1 rounded text-xs font-bold',
+                        priceRepairErrors.length === 0 && priceRepairPreview.length > 0
+                          ? 'bg-amber-600 text-white'
+                          : 'bg-amber-100 text-amber-400 cursor-not-allowed'
+                      )}
+                    >
+                      Applica riparazione
+                    </button>
+                    <button
+                      onClick={clearPriceRepairPreview}
+                      className="px-3 py-1 rounded text-xs font-bold bg-white text-amber-700 border border-amber-200"
+                    >
+                      Annulla
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {selectedTicker && (
+                <div className="ui-panel-subtle border-slate-200 bg-white p-3 text-xs">
+                  <div className="font-bold text-slate-700">Correzione manuale</div>
+                  <div className="text-slate-500 mt-1">
+                    Usa questa funzione per correzioni verificate su singole date. Per riparazioni piu ampie, usa CSV.
+                  </div>
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-4 gap-2 items-end">
+                    <div>
+                      <label className="block text-[10px] uppercase font-bold text-slate-500 mb-1">Data</label>
+                      <input
+                        type="date"
+                        value={manualPriceDate}
+                        onChange={e => setManualPriceDate(e.target.value)}
+                        className="w-full border border-borderSoft bg-slate-50 p-2 rounded text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] uppercase font-bold text-slate-500 mb-1">Close</label>
+                      <input
+                        type="number"
+                        step="0.0001"
+                        value={manualPriceClose}
+                        onChange={e => setManualPriceClose(e.target.value)}
+                        className="w-full border border-borderSoft bg-slate-50 p-2 rounded text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] uppercase font-bold text-slate-500 mb-1">Currency</label>
+                      <select
+                        value={String(manualPriceCurrency || '')}
+                        onChange={e => setManualPriceCurrency(e.target.value as Currency)}
+                        className="w-full border border-borderSoft bg-white p-2 rounded text-xs font-semibold text-slate-700"
+                      >
+                        <option value="" disabled>Seleziona</option>
+                        {Object.values(Currency).map(cur => (
+                          <option key={cur} value={cur}>{cur}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={saveManualPriceRow}
+                        disabled={!manualCanSave || manualPriceBusy}
+                        className={clsx(
+                          'px-3 py-2 rounded text-xs font-bold',
+                          manualCanSave && !manualPriceBusy
+                            ? 'bg-slate-900 text-white'
+                            : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                        )}
+                      >
+                        Salva / Aggiorna riga
+                      </button>
+                      <button
+                        type="button"
+                        onClick={deleteManualPriceRow}
+                        disabled={!manualDateValid || manualPriceBusy}
+                        className={clsx(
+                          'px-3 py-2 rounded text-xs font-bold border',
+                          manualDateValid && !manualPriceBusy
+                            ? 'bg-red-50 text-red-700 border-red-200'
+                            : 'bg-slate-100 text-slate-400 border-borderSoft cursor-not-allowed'
+                        )}
+                      >
+                        Elimina riga
+                      </button>
+                    </div>
+                  </div>
+                  {(Boolean(manualPriceDate || manualPriceClose) && (!manualDateValid || !manualCloseValid)) && (
+                    <div className="text-amber-600 mt-2">
+                      Inserisci una data valida (YYYY-MM-DD) e un close {'>'} 0.
+                    </div>
+                  )}
+                  {manualCurrencyWarning && (
+                    <div className="text-amber-600 mt-1">{manualCurrencyWarning}</div>
+                  )}
+                  {manualPriceFeedback && (
+                    <div
+                      className={clsx(
+                        'mt-2 rounded border px-2 py-1',
+                        manualPriceFeedback.tone === 'success'
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                          : manualPriceFeedback.tone === 'error'
+                            ? 'border-red-200 bg-red-50 text-red-700'
+                            : 'border-amber-200 bg-amber-50 text-amber-800'
+                      )}
+                    >
+                      {manualPriceFeedback.message}
+                    </div>
+                  )}
+                  <div className="text-[11px] text-slate-500 mt-2">
+                    Suggerimento: clicca una riga nella tabella prezzi per precompilare il form.
+                  </div>
                 </div>
               )}
             </>

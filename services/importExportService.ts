@@ -1,9 +1,30 @@
 import Dexie from 'dexie';
 import { format } from 'date-fns';
 import { db } from '../db';
-import { AppSettings, Currency, Instrument, InstrumentListing, MacroIndicator, PricePoint, Transaction, TransactionType, AssetType, FxRate, PriceTickerConfig } from '../types';
+import {
+  AppSettings,
+  AssetType,
+  BacktestImport,
+  BacktestImportPrice,
+  BacktestScenarioRecord,
+  Currency,
+  FxRate,
+  InflationAnnualPoint,
+  InflationPoint,
+  Instrument,
+  InstrumentListing,
+  MacroIndicator,
+  PricePoint,
+  PriceProviderType,
+  PriceTickerConfig,
+  RebalancePlan,
+  Transaction,
+  TransactionType
+} from '../types';
 import { isYmd, parseYmdLocal } from './dateUtils';
 import { toNum } from './diagnostics';
+import { upsertFxRowsByNaturalKey, upsertPriceRowsByNaturalKey, type NaturalKeyWriteSummary } from './dataWriteService';
+import { pickDefaultListing } from './listingService';
 
 export type ImportTableName =
   | 'portfolios'
@@ -13,7 +34,13 @@ export type ImportTableName =
   | 'prices'
   | 'macro'
   | 'fxRates'
-  | 'instrumentListings';
+  | 'instrumentListings'
+  | 'inflationRates'
+  | 'inflationAnnualRates'
+  | 'rebalancePlans'
+  | 'backtestImports'
+  | 'backtestImportPrices'
+  | 'backtestScenarios';
 
 export type ImportIssueReason = {
   code: string;
@@ -25,6 +52,10 @@ export type TableImportReport = {
   total: number;
   imported: number;
   discarded: number;
+  created?: number;
+  updated?: number;
+  unchanged?: number;
+  deletedDuplicates?: number;
   reasons: ImportIssueReason[];
   error?: string;
 };
@@ -46,7 +77,15 @@ export type NormalizedPayload = {
   prices: PricePoint[];
   macro: MacroIndicator[];
   fxRates: FxRate[];
+  inflationRates: InflationPoint[];
+  inflationAnnualRates: InflationAnnualPoint[];
+  rebalancePlans: RebalancePlan[];
+  backtestImports: BacktestImport[];
+  backtestImportPrices: BacktestImportPrice[];
+  backtestScenarios: BacktestScenarioRecord[];
 };
+
+export type BackupPayload = NormalizedPayload;
 
 export type DetectFormatResult = {
   version?: number | string;
@@ -66,8 +105,16 @@ const TABLES: ImportTableName[] = [
   'transactions',
   'prices',
   'fxRates',
-  'macro'
+  'macro',
+  'inflationRates',
+  'inflationAnnualRates',
+  'rebalancePlans',
+  'backtestImports',
+  'backtestImportPrices',
+  'backtestScenarios'
 ];
+
+const DEFAULT_PREFERRED_EXCHANGES = ['SW', 'US', 'LSE', 'XETRA', 'MI', 'PA'];
 
 const createEmptyReport = (): ImportReport => {
   const tables = {} as Record<ImportTableName, TableImportReport>;
@@ -97,9 +144,16 @@ const finalizeTable = (report: ImportReport, table: ImportTableName, total: numb
     .slice(0, 3);
 };
 
+const applyWriteSummary = (report: ImportReport, table: ImportTableName, summary: NaturalKeyWriteSummary) => {
+  report.tables[table].created = summary.created;
+  report.tables[table].updated = summary.updated;
+  report.tables[table].unchanged = summary.unchanged;
+  report.tables[table].deletedDuplicates = summary.deletedDuplicates;
+};
+
 const asString = (value: unknown) => typeof value === 'string' ? value : value == null ? '' : String(value);
 
-const normalizeTicker = (value: unknown) => asString(value).trim();
+const normalizeTicker = (value: unknown) => asString(value).trim().toUpperCase();
 
 const normalizeCurrency = (value: unknown): Currency | null => {
   const raw = asString(value).trim().toUpperCase();
@@ -117,6 +171,89 @@ const normalizeTransactionType = (value: unknown): TransactionType | null => {
   const raw = asString(value).trim();
   if ((Object.values(TransactionType) as string[]).includes(raw)) return raw as TransactionType;
   return null;
+};
+
+const normalizePriceProvider = (value: unknown): PriceProviderType | undefined => {
+  const raw = asString(value).trim().toUpperCase();
+  if (raw === 'EODHD' || raw === 'SHEETS' || raw === 'MANUAL') {
+    return raw as PriceProviderType;
+  }
+  return undefined;
+};
+
+const normalizeIsin = (value: unknown): string => asString(value).trim().toUpperCase().replace(/\s+/g, '');
+
+const normalizeInstrumentListing = (value: unknown): InstrumentListing | null => {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  const symbol = normalizeTicker(row.symbol);
+  const exchangeCode = normalizeTicker(row.exchangeCode);
+  const currency = normalizeCurrency(row.currency);
+  if (!symbol || !exchangeCode || !currency) return null;
+  const name = asString(row.name).trim();
+  const type = asString(row.type).trim();
+  return {
+    ...(row as any),
+    symbol,
+    exchangeCode,
+    currency,
+    ...(name ? { name } : {}),
+    ...(type ? { type } : {})
+  };
+};
+
+const dedupeListings = (listings: InstrumentListing[]): InstrumentListing[] => {
+  return Array.from(new Map(listings.map(listing => [listing.symbol, listing])).values());
+};
+
+const hasMeaningfulTickerConfig = (value: PriceTickerConfig | undefined): boolean => {
+  if (!value) return false;
+  return Boolean(
+    value.provider
+    || value.eodhdSymbol
+    || value.sheetSymbol
+    || value.exclude !== undefined
+    || value.needsMapping !== undefined
+  );
+};
+
+const mergeTickerConfig = (
+  base: PriceTickerConfig | undefined,
+  incoming: PriceTickerConfig | undefined
+): PriceTickerConfig | undefined => {
+  if (!base && !incoming) return undefined;
+  if (!base) return { ...incoming };
+  if (!incoming) return { ...base };
+  return {
+    provider: base.provider || incoming.provider,
+    eodhdSymbol: base.eodhdSymbol || incoming.eodhdSymbol,
+    sheetSymbol: base.sheetSymbol || incoming.sheetSymbol,
+    exclude: base.exclude ?? incoming.exclude,
+    needsMapping: base.needsMapping ?? incoming.needsMapping
+  };
+};
+
+const normalizePriceTickerConfigRecord = (
+  value: unknown
+): Record<string, PriceTickerConfig> | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const next: Record<string, PriceTickerConfig> = {};
+  Object.entries(value as Record<string, unknown>).forEach(([rawTicker, rawConfig]) => {
+    const ticker = normalizeTicker(rawTicker);
+    if (!ticker || !rawConfig || typeof rawConfig !== 'object') return;
+    const row = rawConfig as Record<string, unknown>;
+    const entry: PriceTickerConfig = {};
+    const provider = normalizePriceProvider(row.provider);
+    const eodhdSymbol = normalizeTicker(row.eodhdSymbol);
+    const sheetSymbol = asString(row.sheetSymbol).trim();
+    if (provider) entry.provider = provider;
+    if (eodhdSymbol) entry.eodhdSymbol = eodhdSymbol;
+    if (sheetSymbol) entry.sheetSymbol = sheetSymbol;
+    if (row.exclude !== undefined) entry.exclude = Boolean(row.exclude);
+    if (row.needsMapping !== undefined) entry.needsMapping = Boolean(row.needsMapping);
+    next[ticker] = mergeTickerConfig(next[ticker], entry) || {};
+  });
+  return next;
 };
 
 const normalizeYmd = (value: unknown): string | null => {
@@ -161,6 +298,27 @@ export const detectFormat = (payload: unknown): DetectFormatResult => {
   return { version, warnings };
 };
 
+export const buildBackupPayload = async (): Promise<BackupPayload> => {
+  return {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    portfolios: await db.portfolios.toArray(),
+    settings: await db.settings.toArray(),
+    instruments: await db.instruments.toArray(),
+    instrumentListings: await db.instrumentListings.toArray(),
+    transactions: await db.transactions.toArray(),
+    prices: await db.prices.toArray(),
+    macro: await db.macro.toArray(),
+    fxRates: await db.fxRates.toArray(),
+    inflationRates: await db.inflationRates.toArray(),
+    inflationAnnualRates: await db.inflationAnnualRates.toArray(),
+    rebalancePlans: await db.rebalancePlans.toArray(),
+    backtestImports: await db.backtestImports.toArray(),
+    backtestImportPrices: await db.backtestImportPrices.toArray(),
+    backtestScenarios: await db.backtestScenarios.toArray()
+  };
+};
+
 export const validateAndNormalize = (payload: any): { normalized: NormalizedPayload; report: ImportReport; warnings: string[]; errors: string[] } => {
   const report = createEmptyReport();
   const warnings: string[] = [];
@@ -177,7 +335,13 @@ export const validateAndNormalize = (payload: any): { normalized: NormalizedPayl
         transactions: [],
         prices: [],
         macro: [],
-        fxRates: []
+        fxRates: [],
+        inflationRates: [],
+        inflationAnnualRates: [],
+        rebalancePlans: [],
+        backtestImports: [],
+        backtestImportPrices: [],
+        backtestScenarios: []
       },
       report,
       warnings,
@@ -197,6 +361,12 @@ export const validateAndNormalize = (payload: any): { normalized: NormalizedPayl
     : Array.isArray(payload.fx)
       ? payload.fx
       : [];
+  const rawInflationRates = Array.isArray(payload.inflationRates) ? payload.inflationRates : [];
+  const rawInflationAnnualRates = Array.isArray(payload.inflationAnnualRates) ? payload.inflationAnnualRates : [];
+  const rawRebalancePlans = Array.isArray(payload.rebalancePlans) ? payload.rebalancePlans : [];
+  const rawBacktestImports = Array.isArray(payload.backtestImports) ? payload.backtestImports : [];
+  const rawBacktestImportPrices = Array.isArray(payload.backtestImportPrices) ? payload.backtestImportPrices : [];
+  const rawBacktestScenarios = Array.isArray(payload.backtestScenarios) ? payload.backtestScenarios : [];
 
   const rawInstrumentIdToTicker = new Map<string, string>();
   rawInstruments.forEach((inst: any) => {
@@ -231,9 +401,7 @@ export const validateAndNormalize = (payload: any): { normalized: NormalizedPayl
     const preferredExchangesOrder = Array.isArray(row?.preferredExchangesOrder)
       ? row.preferredExchangesOrder.map((v: any) => asString(v).trim()).filter(Boolean)
       : undefined;
-    const priceTickerConfig = row?.priceTickerConfig && typeof row.priceTickerConfig === 'object'
-      ? (row.priceTickerConfig as Record<string, PriceTickerConfig>)
-      : undefined;
+    const priceTickerConfig = normalizePriceTickerConfigRecord(row?.priceTickerConfig);
 
     normalizedSettings.push({
       ...row,
@@ -262,6 +430,21 @@ export const validateAndNormalize = (payload: any): { normalized: NormalizedPayl
     }
     const symbol = normalizeTicker(row?.symbol) || ticker;
     const id = typeof row?.id === 'number' ? row.id : undefined;
+    const isin = normalizeIsin(row?.isin) || undefined;
+    const preferredListing = normalizeInstrumentListing(row?.preferredListing) || undefined;
+    const normalizedListingArray = Array.isArray(row?.listings)
+      ? row.listings.map((listing: any) => normalizeInstrumentListing(listing)).filter(Boolean) as InstrumentListing[]
+      : [];
+    const listings = dedupeListings([
+      ...normalizedListingArray,
+      ...(preferredListing ? [preferredListing] : [])
+    ]);
+    if (row?.preferredListing && !preferredListing) {
+      addReason(report, 'instruments', 'invalid_preferred_listing', ticker);
+    }
+    if (Array.isArray(row?.listings) && listings.length < row.listings.length) {
+      addReason(report, 'instruments', 'invalid_or_duplicate_listings', ticker);
+    }
     normalizedInstruments.push({
       ...row,
       id,
@@ -269,7 +452,10 @@ export const validateAndNormalize = (payload: any): { normalized: NormalizedPayl
       ticker,
       name,
       type,
-      currency
+      currency,
+      isin,
+      preferredListing,
+      listings: listings.length ? listings : undefined
     });
   });
   finalizeTable(report, 'instruments', rawInstruments.length, normalizedInstruments.length);
@@ -382,11 +568,121 @@ export const validateAndNormalize = (payload: any): { normalized: NormalizedPayl
   });
   finalizeTable(report, 'fxRates', rawFx.length, normalizedFx.length);
 
+  const normalizedInflationRates: InflationPoint[] = [];
+  rawInflationRates.forEach((row: any) => {
+    const currency = normalizeCurrency(row?.currency);
+    const date = normalizeYmd(row?.date);
+    const index = normalizeNumber(row?.index);
+    if (!currency || !date || index === null || index <= 0) {
+      addReason(report, 'inflationRates', 'invalid_row', row?.date || row?.currency || 'row');
+      return;
+    }
+    normalizedInflationRates.push({
+      ...row,
+      currency,
+      date,
+      index
+    });
+  });
+  finalizeTable(report, 'inflationRates', rawInflationRates.length, normalizedInflationRates.length);
+
+  const normalizedInflationAnnualRates: InflationAnnualPoint[] = [];
+  rawInflationAnnualRates.forEach((row: any) => {
+    const currency = normalizeCurrency(row?.currency);
+    const year = normalizeNumber(row?.year);
+    const ratePct = normalizeNumber(row?.ratePct);
+    if (!currency || year === null || ratePct === null) {
+      addReason(report, 'inflationAnnualRates', 'invalid_row', row?.year || row?.currency || 'row');
+      return;
+    }
+    normalizedInflationAnnualRates.push({
+      ...row,
+      currency,
+      year: Math.trunc(year),
+      ratePct
+    });
+  });
+  finalizeTable(report, 'inflationAnnualRates', rawInflationAnnualRates.length, normalizedInflationAnnualRates.length);
+
+  const normalizedRebalancePlans: RebalancePlan[] = [];
+  rawRebalancePlans.forEach((row: any) => {
+    const portfolioId = asString(row?.portfolioId).trim();
+    const id = asString(row?.id).trim();
+    if (!portfolioId || !id || !Array.isArray(row?.items)) {
+      addReason(report, 'rebalancePlans', 'invalid_row', id || portfolioId || 'row');
+      return;
+    }
+    normalizedRebalancePlans.push({
+      ...row,
+      id,
+      portfolioId,
+      createdAt: Number(row?.createdAt || 0) || Date.now(),
+      items: row.items
+    });
+  });
+  finalizeTable(report, 'rebalancePlans', rawRebalancePlans.length, normalizedRebalancePlans.length);
+
+  const normalizedBacktestImports: BacktestImport[] = [];
+  rawBacktestImports.forEach((row: any) => {
+    const name = asString(row?.name).trim();
+    const ticker = normalizeTicker(row?.ticker);
+    const currency = asString(row?.currency).trim().toUpperCase();
+    if (!name || !ticker || !currency) {
+      addReason(report, 'backtestImports', 'invalid_row', name || ticker || 'row');
+      return;
+    }
+    normalizedBacktestImports.push({
+      ...row,
+      name,
+      ticker,
+      currency
+    });
+  });
+  finalizeTable(report, 'backtestImports', rawBacktestImports.length, normalizedBacktestImports.length);
+
+  const normalizedBacktestImportPrices: BacktestImportPrice[] = [];
+  rawBacktestImportPrices.forEach((row: any) => {
+    const importId = normalizeNumber(row?.importId);
+    const date = normalizeYmd(row?.date);
+    const close = normalizeNumber(row?.close);
+    if (importId === null || date === null || close === null || close <= 0) {
+      addReason(report, 'backtestImportPrices', 'invalid_row', row?.date || row?.importId || 'row');
+      return;
+    }
+    normalizedBacktestImportPrices.push({
+      ...row,
+      importId: Math.trunc(importId),
+      date,
+      close
+    });
+  });
+  finalizeTable(report, 'backtestImportPrices', rawBacktestImportPrices.length, normalizedBacktestImportPrices.length);
+
+  const normalizedBacktestScenarios: BacktestScenarioRecord[] = [];
+  rawBacktestScenarios.forEach((row: any) => {
+    const title = asString(row?.title).trim();
+    const startDate = normalizeYmd(row?.startDate);
+    const endDate = normalizeYmd(row?.endDate);
+    const initialCapital = normalizeNumber(row?.initialCapital);
+    if (!title || !startDate || !endDate || initialCapital === null || !Array.isArray(row?.assets)) {
+      addReason(report, 'backtestScenarios', 'invalid_row', title || row?.startDate || 'row');
+      return;
+    }
+    normalizedBacktestScenarios.push({
+      ...row,
+      title,
+      startDate,
+      endDate,
+      initialCapital
+    });
+  });
+  finalizeTable(report, 'backtestScenarios', rawBacktestScenarios.length, normalizedBacktestScenarios.length);
+
   const normalizedListings: NormalizedPayload['instrumentListings'] = [];
   rawListings.forEach((row: any) => {
     const symbol = normalizeTicker(row?.symbol);
     const exchangeCode = normalizeTicker(row?.exchangeCode);
-    const isin = normalizeTicker(row?.isin);
+    const isin = normalizeIsin(row?.isin);
     const currency = normalizeCurrency(row?.currency);
     if (!symbol || !exchangeCode || !currency || !isin) {
       addReason(report, 'instrumentListings', 'invalid_row', isin || symbol || exchangeCode || 'row');
@@ -413,7 +709,13 @@ export const validateAndNormalize = (payload: any): { normalized: NormalizedPayl
       transactions: normalizedTransactions,
       prices: normalizedPrices,
       macro: normalizedMacro,
-      fxRates: normalizedFx
+      fxRates: normalizedFx,
+      inflationRates: normalizedInflationRates,
+      inflationAnnualRates: normalizedInflationAnnualRates,
+      rebalancePlans: normalizedRebalancePlans,
+      backtestImports: normalizedBacktestImports,
+      backtestImportPrices: normalizedBacktestImportPrices,
+      backtestScenarios: normalizedBacktestScenarios
     },
     report,
     warnings,
@@ -463,67 +765,240 @@ const attachInstrumentIds = async (rows: Instrument[]) => {
   });
 };
 
-const attachPriceIds = async (rows: PricePoint[]) => {
-  const byKey = new Map<string, PricePoint[]>();
-  rows.forEach(row => {
-    const key = `${row.ticker}|${row.portfolioId || ''}`;
-    const list = byKey.get(key) || [];
-    list.push(row);
-    byKey.set(key, list);
-  });
-
-  const result: PricePoint[] = [];
-  for (const [key, list] of byKey.entries()) {
-    const [ticker, portfolioId] = key.split('|');
-    const dates = list.map(r => r.date).sort();
-    const minDate = dates[0];
-    const maxDate = dates[dates.length - 1];
-    const existing = await db.prices
-      .where('[ticker+date]')
-      .between([ticker, minDate], [ticker, maxDate])
-      .and(p => (p.portfolioId || '') === (portfolioId || ''))
-      .toArray();
-    const existingMap = new Map<string, number>();
-    existing.forEach(row => {
-      if (row.date && row.id) existingMap.set(`${row.ticker}|${row.date}|${row.portfolioId || ''}`, row.id);
-    });
-    list.forEach(row => {
-      const id = existingMap.get(`${row.ticker}|${row.date}|${row.portfolioId || ''}`);
-      result.push(id ? { ...row, id } : row);
-    });
-  }
-  return result;
+const applyPreparedRowStats = <T extends { id?: unknown }>(report: ImportReport, table: ImportTableName, rows: T[]) => {
+  report.tables[table].imported = rows.length;
+  report.tables[table].created = rows.filter(row => row.id === undefined || row.id === null || row.id === '').length;
+  report.tables[table].updated = rows.length - (report.tables[table].created || 0);
+  report.tables[table].unchanged = 0;
+  report.tables[table].deletedDuplicates = 0;
 };
 
-const attachFxIds = async (rows: FxRate[]) => {
-  const byPair = new Map<string, FxRate[]>();
-  rows.forEach(row => {
-    const key = `${row.baseCurrency}|${row.quoteCurrency}`;
-    const list = byPair.get(key) || [];
-    list.push(row);
-    byPair.set(key, list);
+type ListingImportRow = NormalizedPayload['instrumentListings'][number];
+
+type InstrumentListingResolution = {
+  portfolioId: string;
+  ticker: string;
+  canonicalTicker: string;
+  aliases: string[];
+  preferredChanged: boolean;
+  configRekeyedFrom: string[];
+};
+
+export const reconcileImportedListingState = (params: {
+  settings: AppSettings[];
+  instruments: Instrument[];
+  instrumentListings: ListingImportRow[];
+}): {
+  settings: AppSettings[];
+  instruments: Instrument[];
+  instrumentListings: ListingImportRow[];
+  warnings: string[];
+} => {
+  const settingsByPortfolio = new Map<string, AppSettings>();
+  params.settings.forEach(setting => {
+    settingsByPortfolio.set(setting.portfolioId || 'default', setting);
   });
 
-  const result: FxRate[] = [];
-  for (const [key, list] of byPair.entries()) {
-    const [baseCurrency, quoteCurrency] = key.split('|') as [Currency, Currency];
-    const dates = list.map(r => r.date).sort();
-    const minDate = dates[0];
-    const maxDate = dates[dates.length - 1];
-    const existing = await db.fxRates
-      .where('[baseCurrency+quoteCurrency+date]')
-      .between([baseCurrency, quoteCurrency, minDate], [baseCurrency, quoteCurrency, maxDate])
-      .toArray();
-    const existingMap = new Map<string, number>();
-    existing.forEach(row => {
-      if (row.date && row.id) existingMap.set(`${row.baseCurrency}|${row.quoteCurrency}|${row.date}`, row.id);
+  const listingRows = new Map<string, ListingImportRow>();
+  const listingsByPortfolioIsin = new Map<string, ListingImportRow[]>();
+  const listingsByPortfolioSymbol = new Map<string, ListingImportRow[]>();
+  const addListingRow = (row: ListingImportRow) => {
+    const portfolioId = row.portfolioId || 'default';
+    const key = `${portfolioId}|${row.isin}|${row.symbol}`;
+    listingRows.set(key, row);
+
+    const isinKey = `${portfolioId}|${row.isin}`;
+    const byIsin = listingsByPortfolioIsin.get(isinKey) || [];
+    byIsin.push(row);
+    listingsByPortfolioIsin.set(isinKey, byIsin);
+
+    const symbolKey = `${portfolioId}|${row.symbol}`;
+    const bySymbol = listingsByPortfolioSymbol.get(symbolKey) || [];
+    bySymbol.push(row);
+    listingsByPortfolioSymbol.set(symbolKey, bySymbol);
+  };
+
+  params.instrumentListings.forEach(row => {
+    const listing = normalizeInstrumentListing(row);
+    const isin = normalizeIsin(row.isin);
+    if (!listing || !isin) return;
+    addListingRow({
+      ...row,
+      ...listing,
+      isin,
+      portfolioId: row.portfolioId || 'default'
     });
-    list.forEach(row => {
-      const id = existingMap.get(`${row.baseCurrency}|${row.quoteCurrency}|${row.date}`);
-      result.push(id ? { ...row, id } : row);
+  });
+
+  const resolutions: InstrumentListingResolution[] = [];
+
+  const instruments = params.instruments.map(instrument => {
+    const portfolioId = instrument.portfolioId || 'default';
+    const settings = settingsByPortfolio.get(portfolioId);
+    const preferredExchangesOrder = settings?.preferredExchangesOrder || DEFAULT_PREFERRED_EXCHANGES;
+    const baseCurrency = settings?.baseCurrency || instrument.currency || Currency.CHF;
+    const config = settings?.priceTickerConfig || {};
+    const configuredListingSymbols = new Set(
+      Object.entries(config)
+        .filter(([, value]) => hasMeaningfulTickerConfig(value))
+        .map(([ticker]) => ticker)
+    );
+
+    const normalizedIsin = normalizeIsin(instrument.isin) || undefined;
+    const nestedListings = dedupeListings([
+      ...(instrument.preferredListing ? [instrument.preferredListing] : []).map(listing => normalizeInstrumentListing(listing)).filter(Boolean) as InstrumentListing[],
+      ...((instrument.listings || []).map(listing => normalizeInstrumentListing(listing)).filter(Boolean) as InstrumentListing[])
+    ]);
+
+    const aliasSymbols = new Set<string>(
+      [instrument.ticker, instrument.symbol, ...nestedListings.map(listing => listing.symbol)]
+        .map(value => normalizeTicker(value))
+        .filter(Boolean)
+    );
+
+    const repoListingsByIsin = normalizedIsin
+      ? (listingsByPortfolioIsin.get(`${portfolioId}|${normalizedIsin}`) || []).map(row => normalizeInstrumentListing(row)).filter(Boolean) as InstrumentListing[]
+      : [];
+    const repoListingsByAlias = Array.from(aliasSymbols)
+      .flatMap(symbol => listingsByPortfolioSymbol.get(`${portfolioId}|${symbol}`) || [])
+      .map(row => normalizeInstrumentListing(row))
+      .filter(Boolean) as InstrumentListing[];
+
+    const mergedListings = dedupeListings([
+      ...nestedListings,
+      ...repoListingsByIsin,
+      ...repoListingsByAlias
+    ]);
+
+    const configuredListings = mergedListings.filter(listing => configuredListingSymbols.has(listing.symbol));
+    const previousPreferredSymbol = normalizeTicker(instrument.preferredListing?.symbol);
+    const preferredFromPayload = previousPreferredSymbol
+      ? mergedListings.find(listing => listing.symbol === previousPreferredSymbol)
+      : undefined;
+    const explicitSymbolMatch = instrument.symbol
+      ? mergedListings.find(listing => listing.symbol === normalizeTicker(instrument.symbol))
+      : undefined;
+    const tickerMatch = mergedListings.find(listing => listing.symbol === instrument.ticker);
+
+    let preferredListing: InstrumentListing | undefined;
+    if (preferredFromPayload) {
+      preferredListing = preferredFromPayload;
+    } else if (configuredListings.length === 1) {
+      preferredListing = configuredListings[0];
+    } else if (configuredListings.length > 1) {
+      preferredListing = configuredListings.find(listing => listing.symbol === normalizeTicker(instrument.symbol))
+        || configuredListings.find(listing => listing.symbol === instrument.ticker)
+        || configuredListings[0];
+    } else if (explicitSymbolMatch) {
+      preferredListing = explicitSymbolMatch;
+    } else if (tickerMatch) {
+      preferredListing = tickerMatch;
+    } else if (mergedListings.length === 1) {
+      preferredListing = mergedListings[0];
+    } else if (mergedListings.length > 1) {
+      preferredListing = pickDefaultListing(mergedListings, preferredExchangesOrder, baseCurrency) || mergedListings[0];
+    }
+
+    const nextListings = mergedListings.length ? mergedListings : undefined;
+    const canonicalTicker = preferredListing?.symbol || instrument.symbol || instrument.ticker;
+    const aliases = Array.from(new Set([
+      instrument.ticker,
+      instrument.symbol,
+      previousPreferredSymbol,
+      ...mergedListings.map(listing => listing.symbol)
+    ].filter(Boolean) as string[]));
+
+    if (normalizedIsin && nextListings?.length) {
+      nextListings.forEach(listing => {
+        addListingRow({
+          isin: normalizedIsin,
+          exchangeCode: listing.exchangeCode,
+          symbol: listing.symbol,
+          currency: listing.currency,
+          name: listing.name,
+          portfolioId
+        });
+      });
+    }
+
+    resolutions.push({
+      portfolioId,
+      ticker: instrument.ticker,
+      canonicalTicker,
+      aliases,
+      preferredChanged: Boolean(previousPreferredSymbol && preferredListing?.symbol && previousPreferredSymbol !== preferredListing.symbol),
+      configRekeyedFrom: []
     });
+
+    return {
+      ...instrument,
+      portfolioId,
+      isin: normalizedIsin,
+      preferredListing,
+      listings: nextListings
+    };
+  });
+
+  const settings = params.settings.map(setting => {
+    const portfolioId = setting.portfolioId || 'default';
+    const relevantResolutions = resolutions.filter(item => item.portfolioId === portfolioId);
+    if (!relevantResolutions.length) {
+      return {
+        ...setting,
+        portfolioId,
+        priceTickerConfig: normalizePriceTickerConfigRecord(setting.priceTickerConfig) || {}
+      };
+    }
+
+    const nextConfig: Record<string, PriceTickerConfig> = {
+      ...(normalizePriceTickerConfigRecord(setting.priceTickerConfig) || {})
+    };
+
+    relevantResolutions.forEach(resolution => {
+      const presentAliases = resolution.aliases.filter(alias => alias && hasMeaningfulTickerConfig(nextConfig[alias]));
+      if (!presentAliases.length || !resolution.canonicalTicker) return;
+
+      let mergedConfig: PriceTickerConfig | undefined = nextConfig[resolution.canonicalTicker];
+      const consumedAliases = new Set<string>();
+      presentAliases.forEach(alias => {
+        mergedConfig = mergeTickerConfig(mergedConfig, nextConfig[alias]);
+        if (alias !== resolution.canonicalTicker) {
+          delete nextConfig[alias];
+          consumedAliases.add(alias);
+        }
+      });
+      if (mergedConfig) {
+        nextConfig[resolution.canonicalTicker] = mergedConfig;
+      }
+      if (consumedAliases.size > 0) {
+        resolution.configRekeyedFrom.push(...Array.from(consumedAliases));
+      }
+    });
+
+    return {
+      ...setting,
+      portfolioId,
+      priceTickerConfig: nextConfig
+    };
+  });
+
+  const preferredChanges = resolutions.filter(item => item.preferredChanged).length;
+  const configRekeys = resolutions.filter(item => item.configRekeyedFrom.length > 0);
+  const warnings: string[] = [];
+  if (preferredChanges > 0) {
+    warnings.push(`Riallineati ${preferredChanges} preferred listing durante l'import.`);
   }
-  return result;
+  if (configRekeys.length > 0) {
+    const movedEntries = configRekeys.reduce((sum, item) => sum + item.configRekeyedFrom.length, 0);
+    warnings.push(`Riallineate ${movedEntries} chiavi priceTickerConfig sul ticker canonico attivo.`);
+  }
+
+  return {
+    settings,
+    instruments,
+    instrumentListings: Array.from(listingRows.values()),
+    warnings
+  };
 };
 
 export const importToDb = async (
@@ -537,13 +1012,25 @@ export const importToDb = async (
   const fallbackPortfolioId = options?.defaultPortfolioId;
 
   const portfolios = normalized.portfolios.slice();
-  const settings = applyDefaultPortfolioId(normalized.settings.slice(), fallbackPortfolioId);
-  const instruments = applyDefaultPortfolioId(normalized.instruments.slice(), fallbackPortfolioId);
-  const instrumentListings = applyDefaultPortfolioId(normalized.instrumentListings.slice(), fallbackPortfolioId);
+  const listingState = reconcileImportedListingState({
+    settings: applyDefaultPortfolioId(normalized.settings.slice(), fallbackPortfolioId),
+    instruments: applyDefaultPortfolioId(normalized.instruments.slice(), fallbackPortfolioId),
+    instrumentListings: applyDefaultPortfolioId(normalized.instrumentListings.slice(), fallbackPortfolioId)
+  });
+  warnings.push(...listingState.warnings);
+  const settings = listingState.settings;
+  const instruments = listingState.instruments;
+  const instrumentListings = listingState.instrumentListings;
   const transactions = applyDefaultPortfolioId(normalized.transactions.slice(), fallbackPortfolioId);
   const prices = applyDefaultPortfolioId(normalized.prices.slice(), fallbackPortfolioId);
   const macro = applyDefaultPortfolioId(normalized.macro.slice(), fallbackPortfolioId);
   const fxRates = normalized.fxRates.slice();
+  const inflationRates = applyDefaultPortfolioId(normalized.inflationRates.slice(), fallbackPortfolioId);
+  const inflationAnnualRates = applyDefaultPortfolioId(normalized.inflationAnnualRates.slice(), fallbackPortfolioId);
+  const rebalancePlans = applyDefaultPortfolioId(normalized.rebalancePlans.slice(), fallbackPortfolioId);
+  const backtestImports = applyDefaultPortfolioId(normalized.backtestImports.slice(), fallbackPortfolioId);
+  const backtestImportPrices = normalized.backtestImportPrices.slice();
+  const backtestScenarios = applyDefaultPortfolioId(normalized.backtestScenarios.slice(), fallbackPortfolioId);
 
   if (!baseReport) {
     finalizeTable(report, 'portfolios', portfolios.length, portfolios.length);
@@ -554,6 +1041,12 @@ export const importToDb = async (
     finalizeTable(report, 'prices', prices.length, prices.length);
     finalizeTable(report, 'fxRates', fxRates.length, fxRates.length);
     finalizeTable(report, 'macro', macro.length, macro.length);
+    finalizeTable(report, 'inflationRates', inflationRates.length, inflationRates.length);
+    finalizeTable(report, 'inflationAnnualRates', inflationAnnualRates.length, inflationAnnualRates.length);
+    finalizeTable(report, 'rebalancePlans', rebalancePlans.length, rebalancePlans.length);
+    finalizeTable(report, 'backtestImports', backtestImports.length, backtestImports.length);
+    finalizeTable(report, 'backtestImportPrices', backtestImportPrices.length, backtestImportPrices.length);
+    finalizeTable(report, 'backtestScenarios', backtestScenarios.length, backtestScenarios.length);
   }
 
   try {
@@ -561,6 +1054,7 @@ export const importToDb = async (
     await db.transaction('rw', db.portfolios, async () => {
       if (preparedPortfolios.length) await db.portfolios.bulkPut(preparedPortfolios);
     });
+    applyPreparedRowStats(report, 'portfolios', preparedPortfolios);
   } catch (e: any) {
     report.tables.portfolios.error = e?.message || String(e);
     report.tables.portfolios.imported = 0;
@@ -572,6 +1066,7 @@ export const importToDb = async (
     await db.transaction('rw', db.settings, async () => {
       if (preparedSettings.length) await db.settings.bulkPut(preparedSettings);
     });
+    applyPreparedRowStats(report, 'settings', preparedSettings);
   } catch (e: any) {
     report.tables.settings.error = e?.message || String(e);
     report.tables.settings.imported = 0;
@@ -583,6 +1078,7 @@ export const importToDb = async (
     await db.transaction('rw', db.instruments, async () => {
       if (preparedInstruments.length) await db.instruments.bulkPut(preparedInstruments);
     });
+    applyPreparedRowStats(report, 'instruments', preparedInstruments);
   } catch (e: any) {
     report.tables.instruments.error = e?.message || String(e);
     report.tables.instruments.imported = 0;
@@ -593,6 +1089,7 @@ export const importToDb = async (
     await db.transaction('rw', db.instrumentListings, async () => {
       if (instrumentListings.length) await db.instrumentListings.bulkPut(instrumentListings);
     });
+    applyPreparedRowStats(report, 'instrumentListings', instrumentListings);
   } catch (e: any) {
     report.tables.instrumentListings.error = e?.message || String(e);
     report.tables.instrumentListings.imported = 0;
@@ -603,6 +1100,7 @@ export const importToDb = async (
     await db.transaction('rw', db.transactions, async () => {
       if (transactions.length) await db.transactions.bulkPut(transactions);
     });
+    applyPreparedRowStats(report, 'transactions', transactions);
   } catch (e: any) {
     report.tables.transactions.error = e?.message || String(e);
     report.tables.transactions.imported = 0;
@@ -610,10 +1108,9 @@ export const importToDb = async (
   }
 
   try {
-    const preparedPrices = await attachPriceIds(prices);
-    await db.transaction('rw', db.prices, async () => {
-      if (preparedPrices.length) await db.prices.bulkPut(preparedPrices);
-    });
+    const priceSummary = await upsertPriceRowsByNaturalKey(prices);
+    report.tables.prices.imported = priceSummary.deduped;
+    applyWriteSummary(report, 'prices', priceSummary);
   } catch (e: any) {
     report.tables.prices.error = e?.message || String(e);
     report.tables.prices.imported = 0;
@@ -621,10 +1118,9 @@ export const importToDb = async (
   }
 
   try {
-    const preparedFx = await attachFxIds(fxRates);
-    await db.transaction('rw', db.fxRates, async () => {
-      if (preparedFx.length) await db.fxRates.bulkPut(preparedFx);
-    });
+    const fxSummary = await upsertFxRowsByNaturalKey(fxRates);
+    report.tables.fxRates.imported = fxSummary.deduped;
+    applyWriteSummary(report, 'fxRates', fxSummary);
   } catch (e: any) {
     report.tables.fxRates.error = e?.message || String(e);
     report.tables.fxRates.imported = 0;
@@ -635,10 +1131,77 @@ export const importToDb = async (
     await db.transaction('rw', db.macro, async () => {
       if (macro.length) await db.macro.bulkPut(macro);
     });
+    applyPreparedRowStats(report, 'macro', macro);
   } catch (e: any) {
     report.tables.macro.error = e?.message || String(e);
     report.tables.macro.imported = 0;
     errors.push(`Macro: ${report.tables.macro.error}`);
+  }
+
+  try {
+    await db.transaction('rw', db.inflationRates, async () => {
+      if (inflationRates.length) await db.inflationRates.bulkPut(inflationRates);
+    });
+    applyPreparedRowStats(report, 'inflationRates', inflationRates);
+  } catch (e: any) {
+    report.tables.inflationRates.error = e?.message || String(e);
+    report.tables.inflationRates.imported = 0;
+    errors.push(`Inflation monthly: ${report.tables.inflationRates.error}`);
+  }
+
+  try {
+    await db.transaction('rw', db.inflationAnnualRates, async () => {
+      if (inflationAnnualRates.length) await db.inflationAnnualRates.bulkPut(inflationAnnualRates);
+    });
+    applyPreparedRowStats(report, 'inflationAnnualRates', inflationAnnualRates);
+  } catch (e: any) {
+    report.tables.inflationAnnualRates.error = e?.message || String(e);
+    report.tables.inflationAnnualRates.imported = 0;
+    errors.push(`Inflation annual: ${report.tables.inflationAnnualRates.error}`);
+  }
+
+  try {
+    await db.transaction('rw', db.rebalancePlans, async () => {
+      if (rebalancePlans.length) await db.rebalancePlans.bulkPut(rebalancePlans);
+    });
+    applyPreparedRowStats(report, 'rebalancePlans', rebalancePlans);
+  } catch (e: any) {
+    report.tables.rebalancePlans.error = e?.message || String(e);
+    report.tables.rebalancePlans.imported = 0;
+    errors.push(`Rebalance plans: ${report.tables.rebalancePlans.error}`);
+  }
+
+  try {
+    await db.transaction('rw', db.backtestImports, async () => {
+      if (backtestImports.length) await db.backtestImports.bulkPut(backtestImports);
+    });
+    applyPreparedRowStats(report, 'backtestImports', backtestImports);
+  } catch (e: any) {
+    report.tables.backtestImports.error = e?.message || String(e);
+    report.tables.backtestImports.imported = 0;
+    errors.push(`Backtest imports: ${report.tables.backtestImports.error}`);
+  }
+
+  try {
+    await db.transaction('rw', db.backtestImportPrices, async () => {
+      if (backtestImportPrices.length) await db.backtestImportPrices.bulkPut(backtestImportPrices);
+    });
+    applyPreparedRowStats(report, 'backtestImportPrices', backtestImportPrices);
+  } catch (e: any) {
+    report.tables.backtestImportPrices.error = e?.message || String(e);
+    report.tables.backtestImportPrices.imported = 0;
+    errors.push(`Backtest import prices: ${report.tables.backtestImportPrices.error}`);
+  }
+
+  try {
+    await db.transaction('rw', db.backtestScenarios, async () => {
+      if (backtestScenarios.length) await db.backtestScenarios.bulkPut(backtestScenarios);
+    });
+    applyPreparedRowStats(report, 'backtestScenarios', backtestScenarios);
+  } catch (e: any) {
+    report.tables.backtestScenarios.error = e?.message || String(e);
+    report.tables.backtestScenarios.imported = 0;
+    errors.push(`Backtest scenarios: ${report.tables.backtestScenarios.error}`);
   }
 
   console.info('[IMPORT]', {
@@ -649,6 +1212,12 @@ export const importToDb = async (
     prices: report.tables.prices,
     fxRates: report.tables.fxRates,
     macro: report.tables.macro,
+    inflationRates: report.tables.inflationRates,
+    inflationAnnualRates: report.tables.inflationAnnualRates,
+    rebalancePlans: report.tables.rebalancePlans,
+    backtestImports: report.tables.backtestImports,
+    backtestImportPrices: report.tables.backtestImportPrices,
+    backtestScenarios: report.tables.backtestScenarios,
     warnings,
     errors
   });

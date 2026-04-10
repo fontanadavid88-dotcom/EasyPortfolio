@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runGapFill, runLatestSync } from './syncActionsService';
 import { Currency } from '../types';
 import type { AppSettings } from '../types';
@@ -9,7 +9,9 @@ vi.mock('./priceService', () => ({
   backfillPricesForPortfolio: vi.fn(),
   fetchLatestEodhdPrice: vi.fn(),
   buildPointsForSave: vi.fn(),
-  resolvePriceSyncConfig: vi.fn()
+  resolvePriceSyncConfig: vi.fn(),
+  describeLatestPriceFetchError: vi.fn((error: any) => error?.message || 'Errore latest EODHD'),
+  isLatestPriceFetchError: vi.fn((error: any) => Boolean(error?.httpStatus || error?.payloadPreview))
 }));
 
 vi.mock('./fxService', () => ({
@@ -48,10 +50,23 @@ vi.mock('./symbolUtils', () => ({
   resolveEodhdSymbol: (symbol: string) => symbol
 }));
 
+vi.mock('./dataWriteService', () => ({
+  upsertPriceRowsByNaturalKey: vi.fn().mockResolvedValue({
+    received: 0,
+    deduped: 0,
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    deletedDuplicates: 0,
+    written: 0
+  })
+}));
+
 const { syncPrices, getTickersForBackfill, backfillPricesForPortfolio, fetchLatestEodhdPrice, buildPointsForSave, resolvePriceSyncConfig } = await import('./priceService');
 const { backfillFxRatesForPortfolio, getFxPairsForPortfolio } = await import('./fxService');
 const { syncFxRates } = await import('./appsScriptService');
 const { setLastLatestSyncAt, setLastGapFillAt } = await import('./syncStatusService');
+const { upsertPriceRowsByNaturalKey } = await import('./dataWriteService');
 const dbMock = (await import('../db') as any).__mock;
 
 const baseSettings: AppSettings = {
@@ -67,6 +82,10 @@ const baseSettings: AppSettings = {
 };
 
 describe('syncActionsService', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('runLatestSync calls prices then fx and sets timestamp on ok', async () => {
     const calls: string[] = [];
     (syncPrices as unknown as any).mockImplementation(async () => {
@@ -100,9 +119,58 @@ describe('syncActionsService', () => {
 
     const outcome = await runLatestSync({ portfolioId: 'p1', settings: baseSettings });
     expect(fetchLatestEodhdPrice).toHaveBeenCalled();
+    expect(upsertPriceRowsByNaturalKey).toHaveBeenCalled();
     expect(outcome.updatedFallbackTickers).toEqual(['AAA']);
     expect(outcome.ok).toBe(true);
     expect(setLastLatestSyncAt).toHaveBeenCalled();
+  });
+
+  it('runLatestSync returns partial when fallback updates some tickers and others still fail', async () => {
+    (syncPrices as unknown as any).mockResolvedValue({
+      status: 'partial',
+      updatedTickers: ['BBB'],
+      failedTickers: [{ ticker: 'AAA', reason: 'Sheets: prezzo non trovato' }, { ticker: 'CCC', reason: 'Sheets: prezzo non trovato' }],
+      sheet: { enabled: true }
+    });
+    (syncFxRates as unknown as any).mockResolvedValue({ ok: true, count: 0 });
+    (resolvePriceSyncConfig as unknown as any).mockReturnValue({ excluded: false, needsMapping: false, provider: 'SHEETS' });
+    (fetchLatestEodhdPrice as unknown as any)
+      .mockResolvedValueOnce({ date: '2026-03-02', close: 123 })
+      .mockRejectedValueOnce(new Error('Payload latest EODHD non valido: close non numerico'));
+    (buildPointsForSave as unknown as any).mockReturnValue([{ id: 1 }]);
+    (dbMock.toArray as unknown as any).mockResolvedValue([
+      { id: 1, ticker: 'AAA', currency: 'CHF' },
+      { id: 2, ticker: 'BBB', currency: 'CHF' },
+      { id: 3, ticker: 'CCC', currency: 'CHF' }
+    ]);
+
+    const outcome = await runLatestSync({ portfolioId: 'p1', settings: baseSettings });
+    expect(outcome.priceResult.status).toBe('partial');
+    expect(outcome.priceResult.updatedTickers).toEqual(['BBB', 'AAA']);
+    expect(outcome.priceResult.failedTickers).toEqual([
+      { ticker: 'CCC', reason: 'Payload latest EODHD non valido: close non numerico' }
+    ]);
+    expect(outcome.ok).toBe(true);
+  });
+
+  it('runLatestSync returns failed with useful message when zero tickers are updated', async () => {
+    (syncPrices as unknown as any).mockResolvedValue({
+      status: 'failed',
+      updatedTickers: [],
+      failedTickers: [{ ticker: 'AAA', reason: 'Sheets: prezzo non trovato' }],
+      sheet: { enabled: true },
+      message: 'Nessun ticker aggiornato. AAA: Sheets: prezzo non trovato'
+    });
+    (syncFxRates as unknown as any).mockResolvedValue({ ok: true, count: 0 });
+    (resolvePriceSyncConfig as unknown as any).mockReturnValue({ excluded: false, needsMapping: false, provider: 'SHEETS' });
+    (fetchLatestEodhdPrice as unknown as any).mockRejectedValue(new Error('Payload latest EODHD non valido: close non numerico'));
+    (dbMock.toArray as unknown as any).mockResolvedValue([{ id: 1, ticker: 'AAA', currency: 'CHF' }]);
+
+    const outcome = await runLatestSync({ portfolioId: 'p1', settings: baseSettings });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.priceResult.status).toBe('failed');
+    expect(outcome.priceResult.message).toContain('Nessun ticker aggiornato');
+    expect(outcome.priceResult.message).toContain('AAA');
   });
 
   it('runGapFill calls prices then fx and emits progress', async () => {
