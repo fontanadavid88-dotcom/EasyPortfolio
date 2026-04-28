@@ -3564,22 +3564,20 @@ export const Settings: React.FC = () => {
               </div>
             ) : (
               <>
-                {import.meta.env.DEV && (
-                  <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-4">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-xs font-bold uppercase text-amber-700">Dev Tools</div>
-                        <div className="text-sm text-amber-800">Diagnostica dati e controlli qualita.</div>
-                      </div>
-                      <a
-                        href="#/data"
-                        className="px-3 py-2 rounded-lg text-xs font-bold bg-amber-600 text-white hover:bg-amber-700 transition"
-                      >
-                        Apri Data Inspector
-                      </a>
+                <div className="ui-panel-subtle border-amber-200 bg-amber-50 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-bold uppercase text-amber-700">Data Inspector</div>
+                      <div className="text-sm text-amber-800">Diagnostica dati, gap e controlli sul database locale del browser.</div>
                     </div>
+                    <a
+                      href="#/data"
+                      className="px-3 py-2 rounded-lg text-xs font-bold bg-amber-600 text-white hover:bg-amber-700 transition whitespace-nowrap"
+                    >
+                      Apri Data Inspector
+                    </a>
                   </div>
-                )}
+                </div>
 
                 <div className="ui-panel-dense p-6 space-y-3">
                   <div className="flex items-center justify-between">
